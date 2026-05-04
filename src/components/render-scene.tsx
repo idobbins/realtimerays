@@ -22,13 +22,11 @@ type PaneRect = {
 
 type PaneStats = PaneRect & {
   id: string;
-  label: string;
-  samples: number;
-  toneMap: ToneMap;
+  frameMs: number;
+  frameMsHistory: number[];
 };
 
 type Stats = {
-  fps: number;
   supported: boolean;
   width: number;
   height: number;
@@ -72,6 +70,11 @@ type PaneGpuState = {
 const uniformBufferSize = 112;
 const displayUniformBufferSize = 16;
 const autoOrbitRadiansPerSecond = 0.22;
+const paneTimingAverageLimit = 12;
+const paneTimingGraphLimit = 48;
+const paneFrameTimeColors = ["oklch(0.88 0.17 86)", "oklch(0.79 0.18 206)"] as const;
+const timingGraphHeight = 96;
+const frameTimeLabelOffset = timingGraphHeight + 12;
 
 const materialTypeIds: Record<SphereMaterial, number> = {
   diffuse: 0,
@@ -92,6 +95,375 @@ const toneMapIds: Record<ToneMap, number> = {
   linear: 2,
   none: 3,
 };
+
+function getPaneFrameTimeColor(index: number) {
+  return paneFrameTimeColors[index % paneFrameTimeColors.length];
+}
+
+function getTimingRange(histories: number[][]) {
+  const values = histories.flat();
+
+  if (values.length === 0) {
+    return { min: 0, max: 1 };
+  }
+
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+
+  return { min, max: max === min ? min + 1 : max };
+}
+
+function historyToPoints(
+  values: number[],
+  width: number,
+  height: number,
+  range: { min: number; max: number },
+) {
+  const span = range.max - range.min || 1;
+  const lastIndex = Math.max(1, values.length - 1);
+
+  return values.map((value, index) => {
+    const x = (index / lastIndex) * width;
+    const y = ((value - range.min) / span) * height;
+    return { x, y };
+  });
+}
+
+function buildSmoothLinePath(points: Array<{ x: number; y: number }>) {
+  if (points.length === 0) {
+    return "";
+  }
+
+  if (points.length === 1) {
+    return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
+  }
+
+  const [firstPoint, ...restPoints] = points;
+  const commands = [`M ${firstPoint.x.toFixed(2)} ${firstPoint.y.toFixed(2)}`];
+
+  restPoints.forEach((point, index) => {
+    const previous = points[index];
+    const controlX = (previous.x + point.x) / 2;
+
+    commands.push(
+      `C ${controlX.toFixed(2)} ${previous.y.toFixed(2)}, ${controlX.toFixed(2)} ${point.y.toFixed(2)}, ${point.x.toFixed(2)} ${point.y.toFixed(2)}`,
+    );
+  });
+
+  return commands.join(" ");
+}
+
+function buildTopAreaPath(
+  values: number[],
+  width: number,
+  height: number,
+  range: { min: number; max: number },
+) {
+  if (values.length === 0) {
+    return { areaPath: "", linePath: "" };
+  }
+
+  const points = historyToPoints(values, width, height, range);
+  const linePath = buildSmoothLinePath(points);
+
+  return { areaPath: `${linePath} L ${width} 0 L 0 0 Z`, linePath };
+}
+
+function ComparisonTimingGraph({ panes }: { panes: PaneStats[] }) {
+  const range = getTimingRange(panes.map((pane) => pane.frameMsHistory));
+
+  if (panes.length < 2) {
+    return null;
+  }
+
+  return (
+    <div className="absolute inset-x-0 top-0 h-24 drop-shadow-[0_1px_1px_rgba(0,0,0,0.32)]">
+      <svg
+        aria-label="Comparative frame time history"
+        role="img"
+        viewBox={`0 0 100 ${timingGraphHeight}`}
+        className="size-full"
+        preserveAspectRatio="none"
+      >
+        {panes.map((pane, index) => {
+          const { areaPath, linePath } = buildTopAreaPath(
+            pane.frameMsHistory,
+            100,
+            timingGraphHeight,
+            range,
+          );
+          const color = getPaneFrameTimeColor(index);
+
+          return areaPath ? (
+            <g key={pane.id}>
+              <path d={areaPath} fill={color} fillOpacity="0.2" />
+              <path
+                d={linePath}
+                fill="none"
+                stroke={color}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeOpacity="0.9"
+                strokeWidth="1.8"
+                vectorEffect="non-scaling-stroke"
+              />
+            </g>
+          ) : null;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function RenderDivider() {
+  return (
+    <div aria-hidden="true" className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2">
+      <div className="absolute inset-y-0 left-0 w-px bg-white" />
+    </div>
+  );
+}
+
+function PaneHud({ pane, stats, index }: { pane: PaneStats; stats: Stats; index: number }) {
+  const color = getPaneFrameTimeColor(index);
+  const alignRight = index % 2 === 1;
+
+  return (
+    <div
+      className="absolute min-w-0"
+      style={{
+        left: `${(pane.x / Math.max(1, stats.width)) * 100}%`,
+        top: `${(pane.y / Math.max(1, stats.height)) * 100}%`,
+        width: `${(pane.width / Math.max(1, stats.width)) * 100}%`,
+        height: `${(pane.height / Math.max(1, stats.height)) * 100}%`,
+      }}
+    >
+      <div
+        className={cn(
+          "absolute max-w-[calc(100%-1.5rem)] font-sans text-[24px] leading-7 font-extrabold tracking-normal tabular-nums drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]",
+          alignRight ? "right-3 text-right" : "left-3",
+        )}
+        style={{ top: `${frameTimeLabelOffset}px`, color }}
+      >
+        <span className="truncate">{pane.frameMs.toFixed(1)} ms</span>
+      </div>
+    </div>
+  );
+}
+
+function RenderOverlay({ stats, paneCount }: { stats: Stats; paneCount: number }) {
+  return (
+    <div className="pointer-events-none absolute inset-0">
+      <ComparisonTimingGraph panes={stats.panes} />
+      {paneCount > 1 ? <RenderDivider /> : null}
+      {stats.panes.map((pane, index) => (
+        <PaneHud key={pane.id} pane={pane} stats={stats} index={index} />
+      ))}
+    </div>
+  );
+}
+
+const recordingHudFont = '800 24px "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif';
+
+function drawRecordingText(
+  context: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  color: string,
+  align: CanvasTextAlign = "left",
+) {
+  context.save();
+  context.font = recordingHudFont;
+  context.textAlign = align;
+  context.textBaseline = "top";
+  context.fillStyle = color;
+  context.shadowColor = "rgba(0, 0, 0, 0.5)";
+  context.shadowBlur = 1;
+  context.shadowOffsetY = 1;
+  context.fillText(text, x, y);
+  context.restore();
+}
+
+function drawRecordingTopArea(
+  context: CanvasRenderingContext2D,
+  values: number[],
+  width: number,
+  color: string,
+  range: { min: number; max: number },
+) {
+  if (values.length === 0) {
+    return;
+  }
+
+  const height = timingGraphHeight;
+  const points = historyToPoints(values, width, height, range);
+
+  context.save();
+  context.fillStyle = color;
+  context.globalAlpha = 0.2;
+  context.beginPath();
+  drawSmoothCanvasPath(context, points);
+
+  context.lineTo(width, 0);
+  context.lineTo(0, 0);
+  context.closePath();
+  context.fill();
+  context.restore();
+
+  context.save();
+  context.strokeStyle = color;
+  context.globalAlpha = 0.9;
+  context.lineWidth = 1.8;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  context.shadowColor = "rgba(0, 0, 0, 0.32)";
+  context.shadowBlur = 1;
+  context.shadowOffsetY = 1;
+  context.beginPath();
+  drawSmoothCanvasPath(context, points);
+  context.stroke();
+  context.restore();
+}
+
+function drawSmoothCanvasPath(
+  context: CanvasRenderingContext2D,
+  points: Array<{ x: number; y: number }>,
+) {
+  if (points.length === 0) {
+    return;
+  }
+
+  context.moveTo(points[0].x, points[0].y);
+
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const point = points[index];
+    const controlX = (previous.x + point.x) / 2;
+
+    context.bezierCurveTo(controlX, previous.y, controlX, point.y, point.x, point.y);
+  }
+}
+
+function average(values: number[]) {
+  if (values.length === 0) {
+    return 0;
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function appendTimingSample(history: number[], sample: number, limit: number) {
+  return [...history, sample].slice(-limit);
+}
+
+function ensureTimingHistory(history: number[] | undefined, sample: number) {
+  return history && history.length > 0 ? history : [sample];
+}
+
+function drawRecordingHud(
+  context: CanvasRenderingContext2D,
+  stats: Stats,
+  paneCount: number,
+  width: number,
+  height: number,
+) {
+  if (stats.panes.length > 1) {
+    const range = getTimingRange(stats.panes.map((pane) => pane.frameMsHistory));
+
+    stats.panes.forEach((pane, index) => {
+      drawRecordingTopArea(
+        context,
+        pane.frameMsHistory,
+        width,
+        getPaneFrameTimeColor(index),
+        range,
+      );
+    });
+  }
+
+  if (paneCount > 1) {
+    const x = Math.round(width / 2) + 0.5;
+
+    context.save();
+    context.strokeStyle = "rgb(255, 255, 255)";
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+    context.restore();
+  }
+
+  stats.panes.forEach((pane, index) => {
+    const color = getPaneFrameTimeColor(index);
+    const text = `${pane.frameMs.toFixed(1)} ms`;
+    const alignRight = index % 2 === 1;
+    const x = alignRight ? pane.x + pane.width - 12 : pane.x + 12;
+    const y = pane.y + frameTimeLabelOffset;
+
+    context.font = recordingHudFont;
+    drawRecordingText(context, text, x, y, color, alignRight ? "right" : "left");
+  });
+}
+
+function createCompositedCaptureStream(
+  sourceCanvas: HTMLCanvasElement,
+  fps: number,
+  getStats: () => Stats,
+  getPaneCount: () => number,
+) {
+  const compositeCanvas = document.createElement("canvas");
+  const context = compositeCanvas.getContext("2d", { alpha: false });
+
+  if (!context) {
+    return sourceCanvas.captureStream(fps);
+  }
+
+  let raf = 0;
+  let stopped = false;
+
+  const draw = () => {
+    if (stopped) {
+      return;
+    }
+
+    const width = Math.max(1, sourceCanvas.width);
+    const height = Math.max(1, sourceCanvas.height);
+
+    if (compositeCanvas.width !== width || compositeCanvas.height !== height) {
+      compositeCanvas.width = width;
+      compositeCanvas.height = height;
+    }
+
+    const stats = getStats();
+
+    context.drawImage(sourceCanvas, 0, 0, width, height);
+    drawRecordingHud(context, stats, getPaneCount(), width, height);
+    raf = requestAnimationFrame(draw);
+  };
+
+  draw();
+
+  const stream = compositeCanvas.captureStream(fps);
+  const stop = () => {
+    if (stopped) {
+      return;
+    }
+
+    stopped = true;
+    cancelAnimationFrame(raf);
+  };
+
+  stream.getTracks().forEach((track) => {
+    const stopTrack = track.stop.bind(track);
+    track.stop = () => {
+      stop();
+      stopTrack();
+    };
+  });
+
+  return stream;
+}
 
 function packSpheres(spheres: RenderSphere[]) {
   const buffer = new Float32Array(spheres.length * 12);
@@ -240,12 +612,12 @@ export const RenderScene = forwardRef<
 >(function RenderScene({ viewports, autoOrbit = false, renderEnabled = true }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [stats, setStats] = useState<Stats>({
-    fps: 0,
     supported: true,
     width: 0,
     height: 0,
     panes: [],
   });
+  const statsRef = useRef(stats);
   const cameraRef = useRef({ yaw: 0.6, pitch: 0.15, dist: 7.5 });
   const viewportsRef = useRef(viewports);
   const viewportSignatureRef = useRef(new Map<string, string>());
@@ -282,11 +654,20 @@ export const RenderScene = forwardRef<
           throw new Error("Render canvas is not ready.");
         }
 
-        return canvas.captureStream(fps);
+        return createCompositedCaptureStream(
+          canvas,
+          fps,
+          () => statsRef.current,
+          () => statsRef.current.panes.length || viewportsRef.current.length,
+        );
       },
     }),
     [],
   );
+
+  useEffect(() => {
+    statsRef.current = stats;
+  }, [stats]);
 
   useEffect(() => {
     viewportsRef.current = viewports;
@@ -331,7 +712,6 @@ export const RenderScene = forwardRef<
 
       if (!("gpu" in navigator)) {
         setStats({
-          fps: 0,
           supported: false,
           width: 0,
           height: 0,
@@ -346,7 +726,6 @@ export const RenderScene = forwardRef<
 
       if (!adapter) {
         setStats({
-          fps: 0,
           supported: false,
           width: 0,
           height: 0,
@@ -356,7 +735,10 @@ export const RenderScene = forwardRef<
         return;
       }
 
-      const device = await adapter.requestDevice();
+      const supportsTimestampQueries = adapter.features.has("timestamp-query" as GPUFeatureName);
+      const device = await adapter.requestDevice({
+        requiredFeatures: supportsTimestampQueries ? (["timestamp-query"] as GPUFeatureName[]) : [],
+      });
 
       if (cancelled) {
         device.destroy();
@@ -367,7 +749,6 @@ export const RenderScene = forwardRef<
 
       if (!context) {
         setStats({
-          fps: 0,
           supported: false,
           width: 0,
           height: 0,
@@ -641,9 +1022,12 @@ export const RenderScene = forwardRef<
       const uniformFloats = new Float32Array(uniformData);
       const uniformInts = new Uint32Array(uniformData);
       const displayUniformData = new Uint32Array(4);
-      let fpsFrames = 0;
-      let fpsTimer = performance.now();
-      let previousFrameTime = fpsTimer;
+      let statsFrames = 0;
+      let statsTimer = performance.now();
+      let previousFrameTime = statsTimer;
+      let timingReadPending = false;
+      const paneGpuFrameMs = new Map<string, number>();
+      const paneTimingHistories = new Map<string, number[]>();
 
       const writePaneUniforms = (
         pane: PaneGpuState,
@@ -686,6 +1070,87 @@ export const RenderScene = forwardRef<
         device.queue.writeBuffer(pane.displayUniformBuffer, 0, displayUniformData);
       };
 
+      const collectPaneStats = (currentViewports: RenderViewport[], fallbackFrameMs: number) =>
+        currentViewports.flatMap((viewport) => {
+          const pane = paneStates.get(viewport.id);
+          if (!pane) {
+            return [];
+          }
+
+          return [
+            {
+              id: pane.id,
+              frameMs: paneGpuFrameMs.get(pane.id) ?? fallbackFrameMs,
+              frameMsHistory: ensureTimingHistory(
+                paneTimingHistories.get(pane.id),
+                fallbackFrameMs,
+              ),
+              x: pane.displayRect.x,
+              y: pane.displayRect.y,
+              width: pane.displayRect.width,
+              height: pane.displayRect.height,
+            },
+          ];
+        });
+
+      const readGpuTimings = async ({
+        querySet,
+        resolveBuffer,
+        readBuffer,
+        paneIds,
+      }: {
+        querySet: GPUQuerySet;
+        resolveBuffer: GPUBuffer;
+        readBuffer: GPUBuffer;
+        paneIds: string[];
+      }) => {
+        try {
+          await readBuffer.mapAsync(GPUMapMode.READ);
+          const timestamps = new BigUint64Array(readBuffer.getMappedRange());
+
+          paneIds.forEach((paneId, index) => {
+            const queryIndex = index * 4;
+            const computeStart = timestamps[queryIndex];
+            const computeEnd = timestamps[queryIndex + 1];
+            const blitStart = timestamps[queryIndex + 2];
+            const blitEnd = timestamps[queryIndex + 3];
+
+            if (computeEnd <= computeStart || blitEnd <= blitStart) {
+              return;
+            }
+
+            const elapsedNanoseconds = computeEnd - computeStart + (blitEnd - blitStart);
+            const sampleMs = Number(elapsedNanoseconds) / 1_000_000;
+            const graphHistory = appendTimingSample(
+              paneTimingHistories.get(paneId) ?? [],
+              sampleMs,
+              paneTimingGraphLimit,
+            );
+            const averageHistory = graphHistory.slice(-paneTimingAverageLimit);
+
+            paneTimingHistories.set(paneId, graphHistory);
+            paneGpuFrameMs.set(paneId, average(averageHistory));
+          });
+
+          readBuffer.unmap();
+          setStats((current) => ({
+            ...current,
+            panes: current.panes.map((pane) => ({
+              ...pane,
+              frameMs: paneGpuFrameMs.get(pane.id) ?? pane.frameMs,
+              frameMsHistory: paneTimingHistories.get(pane.id) ?? pane.frameMsHistory,
+            })),
+          }));
+        } catch (error) {
+          console.warn("Could not read WebGPU timestamp query results.", error);
+        } finally {
+          querySet.destroy();
+          resolveBuffer.destroy();
+          readBuffer.destroy();
+          timingReadPending = false;
+        }
+      };
+
       const render = () => {
         if (cancelled) {
           return;
@@ -701,10 +1166,9 @@ export const RenderScene = forwardRef<
         }
 
         if (!renderEnabledRef.current) {
-          if (now - fpsTimer > 500) {
-            setStats((current) => ({ ...current, fps: 0 }));
-            fpsTimer = now;
-            fpsFrames = 0;
+          if (now - statsTimer > 500) {
+            statsFrames = 0;
+            statsTimer = now;
           }
 
           raf = requestAnimationFrame(render);
@@ -734,10 +1198,42 @@ export const RenderScene = forwardRef<
           device.queue.writeBuffer(sphereBuffer, 0, sphereData);
         }
 
+        const shouldCollectStats = now - statsTimer > 500;
+        const timedPaneIds =
+          supportsTimestampQueries && shouldCollectStats && !timingReadPending
+            ? currentViewports
+                .map((viewport) => viewport.id)
+                .filter((viewportId) => paneStates.has(viewportId))
+            : [];
+        const queryIndexByPaneId = new Map(
+          timedPaneIds.map((paneId, index) => [paneId, index * 4]),
+        );
+        const timingQueryCount = timedPaneIds.length * 4;
+        const timingQuerySet =
+          timingQueryCount > 0
+            ? device.createQuerySet({ type: "timestamp", count: timingQueryCount })
+            : null;
+        const timingResolveBuffer =
+          timingQueryCount > 0
+            ? device.createBuffer({
+                size: timingQueryCount * BigUint64Array.BYTES_PER_ELEMENT,
+                usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+              })
+            : null;
+        const timingReadBuffer =
+          timingQueryCount > 0
+            ? device.createBuffer({
+                size: timingQueryCount * BigUint64Array.BYTES_PER_ELEMENT,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+              })
+            : null;
+
+        if (timingQueryCount > 0) {
+          timingReadPending = true;
+        }
+
         const camera = buildCameraBasis(cameraRef.current);
         const encoder = device.createCommandEncoder();
-        const computePass = encoder.beginComputePass();
-        computePass.setPipeline(computePipeline);
 
         currentViewports.forEach((viewport) => {
           const pane = paneStates.get(viewport.id);
@@ -753,26 +1249,27 @@ export const RenderScene = forwardRef<
           }
 
           writePaneUniforms(pane, viewport.settings, camera);
+          const queryIndex = queryIndexByPaneId.get(viewport.id);
+          const computePassDescriptor: GPUComputePassDescriptor = {};
+          if (timingQuerySet && queryIndex !== undefined) {
+            computePassDescriptor.timestampWrites = {
+              querySet: timingQuerySet,
+              beginningOfPassWriteIndex: queryIndex,
+              endOfPassWriteIndex: queryIndex + 1,
+            };
+          }
+          const computePass = encoder.beginComputePass(computePassDescriptor);
+          computePass.setPipeline(computePipeline);
           computePass.setBindGroup(0, pane.pingPong === 0 ? pane.bindGroupAB : pane.bindGroupBA);
           computePass.dispatchWorkgroups(Math.ceil(pane.width / 8), Math.ceil(pane.height / 8));
+          computePass.end();
           pane.pingPong = pane.pingPong === 0 ? 1 : 0;
           pane.sampleIndex += 1;
           pane.frame += 1;
         });
 
-        computePass.end();
-
-        const renderPass = encoder.beginRenderPass({
-          colorAttachments: [
-            {
-              view: context.getCurrentTexture().createView(),
-              clearValue: { r: 0, g: 0, b: 0, a: 1 },
-              loadOp: "clear",
-              storeOp: "store",
-            },
-          ],
-        });
-        renderPass.setPipeline(blitPipeline);
+        const frameTextureView = context.getCurrentTexture().createView();
+        let shouldClearRenderTarget = true;
         currentViewports.forEach((viewport) => {
           const pane = paneStates.get(viewport.id);
           const blitBindGroup = pane?.pingPong === 0 ? pane.blitBindGroupA : pane?.blitBindGroupB;
@@ -781,6 +1278,27 @@ export const RenderScene = forwardRef<
             return;
           }
 
+          const queryIndex = queryIndexByPaneId.get(viewport.id);
+          const renderPassDescriptor: GPURenderPassDescriptor = {
+            colorAttachments: [
+              {
+                view: frameTextureView,
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                loadOp: shouldClearRenderTarget ? "clear" : "load",
+                storeOp: "store",
+              },
+            ],
+          };
+          if (timingQuerySet && queryIndex !== undefined) {
+            renderPassDescriptor.timestampWrites = {
+              querySet: timingQuerySet,
+              beginningOfPassWriteIndex: queryIndex + 2,
+              endOfPassWriteIndex: queryIndex + 3,
+            };
+          }
+          const renderPass = encoder.beginRenderPass(renderPassDescriptor);
+          shouldClearRenderTarget = false;
+          renderPass.setPipeline(blitPipeline);
           if (pane.splitPresentation) {
             renderPass.setViewport(0, 0, width, height, 0, 1);
           } else {
@@ -801,42 +1319,43 @@ export const RenderScene = forwardRef<
           );
           renderPass.setBindGroup(0, blitBindGroup);
           renderPass.draw(3);
+          renderPass.end();
         });
-        renderPass.end();
+
+        if (timingQuerySet && timingResolveBuffer && timingReadBuffer) {
+          encoder.resolveQuerySet(timingQuerySet, 0, timingQueryCount, timingResolveBuffer, 0);
+          encoder.copyBufferToBuffer(
+            timingResolveBuffer,
+            0,
+            timingReadBuffer,
+            0,
+            timingQueryCount * BigUint64Array.BYTES_PER_ELEMENT,
+          );
+        }
+
         device.queue.submit([encoder.finish()]);
+        statsFrames += 1;
 
-        fpsFrames += 1;
+        if (timingQuerySet && timingResolveBuffer && timingReadBuffer) {
+          void readGpuTimings({
+            querySet: timingQuerySet,
+            resolveBuffer: timingResolveBuffer,
+            readBuffer: timingReadBuffer,
+            paneIds: timedPaneIds,
+          });
+        }
 
-        if (now - fpsTimer > 500) {
+        if (shouldCollectStats) {
+          const measuredFrameMs = (now - statsTimer) / Math.max(1, statsFrames);
+
           setStats({
-            fps: (fpsFrames * 1000) / (now - fpsTimer),
             supported: true,
             width,
             height,
-            panes: currentViewports.flatMap((viewport) => {
-              const pane = paneStates.get(viewport.id);
-              if (!pane) {
-                return [];
-              }
-
-              return [
-                {
-                  id: pane.id,
-                  label: pane.label,
-                  samples: viewport.settings.temporalAccumulation
-                    ? pane.sampleIndex * viewport.settings.samplesPerDispatch
-                    : viewport.settings.samplesPerDispatch,
-                  toneMap: viewport.settings.toneMap,
-                  x: pane.displayRect.x,
-                  y: pane.displayRect.y,
-                  width: pane.displayRect.width,
-                  height: pane.displayRect.height,
-                },
-              ];
-            }),
+            panes: collectPaneStats(currentViewports, measuredFrameMs),
           });
-          fpsTimer = now;
-          fpsFrames = 0;
+          statsFrames = 0;
+          statsTimer = now;
         }
 
         raf = requestAnimationFrame(render);
@@ -854,7 +1373,6 @@ export const RenderScene = forwardRef<
 
     setup().catch((error: unknown) => {
       setStats({
-        fps: 0,
         supported: false,
         width: 0,
         height: 0,
@@ -870,14 +1388,6 @@ export const RenderScene = forwardRef<
     };
   }, []);
 
-  const fpsTone =
-    stats.fps >= 50
-      ? "text-emerald-400"
-      : stats.fps >= 30
-        ? "text-yellow-300"
-        : stats.fps >= 15
-          ? "text-orange-400"
-          : "text-red-400";
   const paneCount = stats.panes.length || viewports.length;
   const showRenderSurface = stats.supported && renderEnabled;
 
@@ -904,48 +1414,7 @@ export const RenderScene = forwardRef<
           </div>
         </div>
       ) : showRenderSurface ? (
-        <div className="pointer-events-none absolute inset-0">
-          {paneCount > 1 ? (
-            <div className="absolute inset-y-0 left-1/2 w-px bg-white/25 shadow-[0_0_0_1px_rgba(0,0,0,0.25)]" />
-          ) : null}
-          {stats.panes.map((pane) => (
-            <div
-              key={pane.id}
-              className="absolute"
-              style={{
-                left: `${(pane.x / Math.max(1, stats.width)) * 100}%`,
-                top: `${(pane.y / Math.max(1, stats.height)) * 100}%`,
-                width: `${(pane.width / Math.max(1, stats.width)) * 100}%`,
-                height: `${(pane.height / Math.max(1, stats.height)) * 100}%`,
-              }}
-            >
-              <div className="absolute top-3 left-3 font-mono text-[11px] leading-4 font-medium tracking-wide text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)] uppercase tabular-nums">
-                {paneCount > 1 ? (
-                  <div className="mb-1 inline-flex rounded-sm bg-black/30 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-sm">
-                    {pane.label}
-                  </div>
-                ) : null}
-                <div>
-                  FPS <span className={fpsTone}>{stats.fps.toFixed(1)}</span>
-                </div>
-                <div className="text-white/85">Samples {pane.samples}</div>
-                <div className="text-white/85">{pane.toneMap}</div>
-                {pane.width > 0 && pane.height > 0 ? (
-                  <div className="text-white/85">
-                    Render {pane.width} x {pane.height}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ))}
-          {stats.panes.length === 0 ? (
-            <div className="absolute top-3 left-3 font-mono text-[11px] leading-4 font-medium tracking-wide text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)] uppercase tabular-nums">
-              <div>
-                FPS <span className={fpsTone}>{stats.fps.toFixed(1)}</span>
-              </div>
-            </div>
-          ) : null}
-        </div>
+        <RenderOverlay stats={stats} paneCount={paneCount} />
       ) : null}
       <div
         aria-hidden="true"

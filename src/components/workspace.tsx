@@ -79,6 +79,18 @@ function getRecordingMimeType(profile: RecordingProfile) {
   );
 }
 
+function getRecordingExtension(mimeType: string) {
+  if (mimeType.includes("mp4")) {
+    return "mp4";
+  }
+
+  if (mimeType.includes("webm")) {
+    return "webm";
+  }
+
+  return "webm";
+}
+
 function withSharedSettings(settings: RenderSettings, shared: RenderSettings): RenderSettings {
   return {
     ...settings,
@@ -241,7 +253,7 @@ export function Workspace() {
       setRecordingState("idle");
 
       if (chunks.length > 0) {
-        downloadBlob(new Blob(chunks, { type }), createExportFilename("webm"));
+        downloadBlob(new Blob(chunks, { type }), createExportFilename(getRecordingExtension(type)));
       }
     });
 

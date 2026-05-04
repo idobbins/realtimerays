@@ -10,6 +10,13 @@ export type RecordingProfile = {
   preferredMimeTypes: string[];
 };
 
+const mp4MimeTypes = [
+  "video/mp4;codecs=avc1.64003E",
+  "video/mp4;codecs=avc1.4D402A",
+  "video/mp4;codecs=avc1.42E01E",
+  "video/mp4",
+];
+
 export const recordingProfiles: RecordingProfile[] = [
   {
     id: "preview",
@@ -18,7 +25,7 @@ export const recordingProfiles: RecordingProfile[] = [
     detail: "small files for quick captures",
     fps: 30,
     videoBitsPerSecond: 5_000_000,
-    preferredMimeTypes: ["video/webm;codecs=vp8", "video/webm"],
+    preferredMimeTypes: [...mp4MimeTypes, "video/webm;codecs=vp8", "video/webm"],
   },
   {
     id: "balanced",
@@ -27,7 +34,12 @@ export const recordingProfiles: RecordingProfile[] = [
     detail: "default quality with manageable file sizes",
     fps: 30,
     videoBitsPerSecond: 10_000_000,
-    preferredMimeTypes: ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"],
+    preferredMimeTypes: [
+      ...mp4MimeTypes,
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
+    ],
   },
   {
     id: "high",
@@ -36,7 +48,12 @@ export const recordingProfiles: RecordingProfile[] = [
     detail: "smooth motion with cleaner gradients",
     fps: 60,
     videoBitsPerSecond: 24_000_000,
-    preferredMimeTypes: ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"],
+    preferredMimeTypes: [
+      ...mp4MimeTypes,
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
+    ],
   },
   {
     id: "near-lossless",
@@ -45,7 +62,12 @@ export const recordingProfiles: RecordingProfile[] = [
     detail: "very large files, visually conservative encode",
     fps: 60,
     videoBitsPerSecond: 80_000_000,
-    preferredMimeTypes: ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"],
+    preferredMimeTypes: [
+      ...mp4MimeTypes,
+      "video/webm;codecs=vp9",
+      "video/webm;codecs=vp8",
+      "video/webm",
+    ],
   },
 ];
 
