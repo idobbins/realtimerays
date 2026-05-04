@@ -28,6 +28,9 @@ export type RenderSettings = {
   scenePresetId: ScenePresetId;
   sceneMaterialSeed: number;
   sceneSpheres: RenderSphere[];
+  samplesPerDispatch: number;
+  maxBounces: number;
+  temporalAccumulation: boolean;
   maxPixels: number;
 };
 
@@ -45,5 +48,8 @@ export const defaultRenderSettings: RenderSettings = {
   scenePresetId: defaultScenePresetId,
   sceneMaterialSeed: defaultSceneMaterialSeed,
   sceneSpheres: defaultSceneSpheres,
+  samplesPerDispatch: 1,
+  maxBounces: 4,
+  temporalAccumulation: true,
   maxPixels: 1_600_000,
 };

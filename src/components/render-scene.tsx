@@ -11,6 +11,7 @@ import type {
 } from "@/lib/render-settings";
 
 type Stats = { fps: number; samples: number; supported: boolean; error?: string };
+const uniformBufferSize = 112;
 
 const materialTypeIds: Record<SphereMaterial, number> = {
   diffuse: 0,
@@ -121,7 +122,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
       let pingPong = 0;
 
       const uniformBuffer = device.createBuffer({
-        size: 96,
+        size: uniformBufferSize,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
@@ -294,7 +295,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         canvas.removeEventListener("wheel", onWheel);
       });
 
-      const uniformData = new ArrayBuffer(96);
+      const uniformData = new ArrayBuffer(uniformBufferSize);
       const uniformFloats = new Float32Array(uniformData);
       const uniformInts = new Uint32Array(uniformData);
       let frame = 0;
@@ -350,8 +351,14 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
 
         uniformFloats[0] = width;
         uniformFloats[1] = height;
-        uniformInts[2] = frame >>> 0;
-        uniformInts[3] = sampleIndexRef.current >>> 0;
+        const currentSettings = settingsRef.current;
+        const renderFrame = currentSettings.temporalAccumulation ? frame : 0;
+        const accumulationSampleIndex = currentSettings.temporalAccumulation
+          ? sampleIndexRef.current
+          : 0;
+
+        uniformInts[2] = renderFrame >>> 0;
+        uniformInts[3] = accumulationSampleIndex >>> 0;
         uniformFloats[4] = cameraPosition[0];
         uniformFloats[5] = cameraPosition[1];
         uniformFloats[6] = cameraPosition[2];
@@ -367,12 +374,13 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         uniformFloats[16] = up[0];
         uniformFloats[17] = up[1];
         uniformFloats[18] = up[2];
-        const currentSettings = settingsRef.current;
         uniformFloats[19] = (currentSettings.fovDegrees * Math.PI) / 180;
         uniformInts[20] = cameraTypeIds[currentSettings.cameraType] ?? 0;
         uniformFloats[21] = currentSettings.orthoScale;
         uniformFloats[22] = currentSettings.apertureRadius;
         uniformFloats[23] = currentSettings.focusDistance;
+        uniformInts[24] = currentSettings.samplesPerDispatch >>> 0;
+        uniformInts[25] = currentSettings.maxBounces >>> 0;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData);
         sphereData = packSpheres(currentSettings.sceneSpheres);
 
@@ -417,7 +425,9 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         if (now - fpsTimer > 500) {
           setStats({
             fps: (fpsFrames * 1000) / (now - fpsTimer),
-            samples: sampleIndexRef.current,
+            samples: currentSettings.temporalAccumulation
+              ? sampleIndexRef.current * currentSettings.samplesPerDispatch
+              : currentSettings.samplesPerDispatch,
             supported: true,
           });
           fpsTimer = now;

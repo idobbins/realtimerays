@@ -1,6 +1,6 @@
 "use client";
 
-import { ContrastIcon, GaugeIcon, SparklesIcon } from "lucide-react";
+import { ContrastIcon, GaugeIcon } from "lucide-react";
 
 import { Accordion, AccordionContent, AccordionItem } from "@/components/ui/accordion";
 import {
@@ -15,8 +15,9 @@ import {
 import type { RenderSettings } from "@/lib/render-settings";
 
 import { CameraSettings } from "./camera-settings";
+import { SamplingSettings } from "./sampling-settings";
 import { SceneSettings } from "./scene-settings";
-import { Readout, SettingRow } from "./setting-row";
+import { SettingRow } from "./setting-row";
 import { SidebarSectionTrigger, type RenderSettingChange } from "./sidebar-section";
 
 const pixelBudgetOptions = [
@@ -25,27 +26,6 @@ const pixelBudgetOptions = [
   { label: "1.6 MP", value: 1_600_000 },
   { label: "2.4 MP", value: 2_400_000 },
 ];
-
-function SamplingSection() {
-  return (
-    <AccordionItem value="sampling" className="border-b border-sidebar-border/70">
-      <SidebarSectionTrigger icon={SparklesIcon} title="Sampling" value="progressive" />
-      <AccordionContent className="space-y-3 px-2 pb-3">
-        <div className="grid gap-2">
-          <SettingRow label="samples per dispatch">
-            <Readout>1 spp</Readout>
-          </SettingRow>
-          <SettingRow label="max bounces">
-            <Readout>4</Readout>
-          </SettingRow>
-          <SettingRow label="accumulation">
-            <Readout>progressive average</Readout>
-          </SettingRow>
-        </div>
-      </AccordionContent>
-    </AccordionItem>
-  );
-}
 
 function RenderOutputSection({
   settings,
@@ -106,7 +86,7 @@ export function RenderPipelineAccordion({
     <Accordion multiple defaultValue={["scene", "camera", "render"]}>
       <SceneSettings settings={settings} onSettingChange={onSettingChange} />
       <CameraSettings settings={settings} onSettingChange={onSettingChange} />
-      <SamplingSection />
+      <SamplingSettings settings={settings} onSettingChange={onSettingChange} />
       <RenderOutputSection settings={settings} onSettingChange={onSettingChange} />
     </Accordion>
   );

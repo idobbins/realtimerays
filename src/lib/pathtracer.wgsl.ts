@@ -16,6 +16,9 @@ struct Uniforms {
   orthoScale : f32,
   apertureRadius : f32,
   focusDistance : f32,
+  samplesPerDispatch : u32,
+  maxBounces : u32,
+  _pad3 : vec2<u32>,
 };
 
 struct Sphere {
@@ -145,7 +148,7 @@ fn trace(roIn : vec3<f32>, rdIn : vec3<f32>, rng : ptr<function, u32>) -> vec3<f
   var rd = rdIn;
   var throughput = vec3<f32>(1.0);
   var radiance = vec3<f32>(0.0);
-  let maxBounces = 4u;
+  let maxBounces = clamp(U.maxBounces, 1u, 12u);
   for (var b = 0u; b < maxBounces; b = b + 1u) {
     let h = sceneHit(ro, rd);
     if (h.t >= 1e29) {
@@ -250,7 +253,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var rng = gid.x * 1973u + gid.y * 9277u + U.frame * 26699u + 1u;
   pcg(&rng);
 
-  let spp = 1u;
+  let spp = clamp(U.samplesPerDispatch, 1u, 8u);
   var col = vec3<f32>(0.0);
   for (var s = 0u; s < spp; s = s + 1u) {
     let jx = rand(&rng);
