@@ -31,7 +31,6 @@ import {
 } from "@/components/ui/accordion";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -53,7 +52,6 @@ import {
 import {
   Sidebar,
   SidebarContent,
-  SidebarGroupContent,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
@@ -1182,6 +1180,261 @@ const pipelineSections: PipelineSection[] = [
   },
 ];
 
+const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
+  geometry: [
+    {
+      title: "Placement",
+      settings: [
+        { id: "geometry-transform", label: "transform", control: "text", defaultValue: "0, 0, 0" },
+        { id: "geometry-scale", label: "scale", control: "number", defaultValue: 1, min: 0.01, step: 0.1 },
+        {
+          id: "geometry-motion",
+          label: "motion",
+          control: "select",
+          defaultValue: "static",
+          options: ["static", "animated", "instanced"],
+        },
+      ],
+    },
+    {
+      title: "Shape",
+      settings: [
+        { id: "geometry-radius", label: "radius / extent", control: "number", defaultValue: 1, min: 0, step: 0.1 },
+        { id: "geometry-segments", label: "segments", control: "number", defaultValue: 32, min: 3, step: 1 },
+        { id: "geometry-visible-to-camera", label: "visible to camera", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+  material: [
+    {
+      title: "Surface",
+      settings: [
+        {
+          id: "material-base-color",
+          label: "base color",
+          control: "select",
+          defaultValue: "neutral gray",
+          options: ["neutral gray", "warm white", "copper", "glass blue", "emissive white"],
+        },
+        { id: "material-roughness", label: "roughness", control: "number", defaultValue: 0.45, min: 0, max: 1, step: 0.01 },
+        { id: "material-metallic", label: "metallic", control: "number", defaultValue: 0, min: 0, max: 1, step: 0.01 },
+      ],
+    },
+    {
+      title: "Transport",
+      settings: [
+        { id: "material-ior", label: "index of refraction", control: "number", defaultValue: 1.5, min: 1, step: 0.01 },
+        { id: "material-emission", label: "emission strength", control: "number", defaultValue: 0, min: 0, step: 0.1 },
+      ],
+    },
+  ],
+  light: [
+    {
+      title: "Emission",
+      settings: [
+        { id: "light-intensity", label: "intensity", control: "number", defaultValue: 4, min: 0, step: 0.1 },
+        {
+          id: "light-color",
+          label: "color",
+          control: "select",
+          defaultValue: "white",
+          options: ["white", "warm", "cool", "sky", "custom"],
+        },
+        { id: "light-size", label: "size / radius", control: "number", defaultValue: 1, min: 0, step: 0.1 },
+      ],
+    },
+    {
+      title: "Sampling",
+      settings: [
+        { id: "light-samples", label: "samples", control: "number", defaultValue: 1, min: 1, step: 1 },
+        { id: "light-cast-shadows", label: "cast shadows", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+  "scene-loader": [
+    {
+      title: "Source",
+      settings: [
+        { id: "loader-path", label: "asset path", control: "text", defaultValue: "/scenes/demo.glb" },
+        {
+          id: "loader-units",
+          label: "units",
+          control: "select",
+          defaultValue: "meters",
+          options: ["meters", "centimeters", "scene units"],
+        },
+      ],
+    },
+    {
+      title: "Import",
+      settings: [
+        { id: "loader-generate-normals", label: "generate normals", control: "toggle", defaultValue: false },
+        { id: "loader-merge-materials", label: "merge materials", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+  tracer: [
+    {
+      title: "Acceleration",
+      settings: [
+        {
+          id: "tracer-build-quality",
+          label: "build quality",
+          control: "select",
+          defaultValue: "balanced",
+          options: ["fast", "balanced", "high quality"],
+        },
+        { id: "tracer-leaf-size", label: "leaf size", control: "number", defaultValue: 4, min: 1, step: 1 },
+        { id: "tracer-refit", label: "refit dynamic geometry", control: "toggle", defaultValue: true },
+      ],
+    },
+    {
+      title: "Traversal",
+      settings: [
+        { id: "tracer-max-steps", label: "max steps", control: "number", defaultValue: 256, min: 1, step: 1 },
+        { id: "tracer-any-hit", label: "any-hit shadows", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+  sampler: [
+    {
+      title: "Image Sampling",
+      settings: [
+        { id: "sampler-spp", label: "samples per pixel", control: "number", defaultValue: 1, min: 1, step: 1 },
+        {
+          id: "sampler-sequence",
+          label: "sequence",
+          control: "select",
+          defaultValue: "per-frame",
+          options: ["per-frame", "persistent", "scrambled"],
+        },
+        { id: "sampler-jitter", label: "pixel jitter", control: "toggle", defaultValue: true },
+      ],
+    },
+    {
+      title: "Randomness",
+      settings: [
+        { id: "sampler-seed", label: "seed", control: "number", defaultValue: 1337, min: 0, step: 1 },
+        { id: "sampler-dimensions", label: "dimensions", control: "number", defaultValue: 8, min: 1, step: 1 },
+      ],
+    },
+  ],
+  integrator: [
+    {
+      title: "Path Limits",
+      settings: [
+        { id: "integrator-max-bounces", label: "max bounces", control: "number", defaultValue: 6, min: 0, step: 1 },
+        { id: "integrator-min-bounces", label: "min bounces", control: "number", defaultValue: 2, min: 0, step: 1 },
+        { id: "integrator-russian-roulette", label: "russian roulette", control: "toggle", defaultValue: true },
+      ],
+    },
+    {
+      title: "Lighting",
+      settings: [
+        { id: "integrator-nee", label: "next-event estimation", control: "toggle", defaultValue: true },
+        { id: "integrator-mis", label: "multiple importance sampling", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+  denoiser: [
+    {
+      title: "Filter",
+      settings: [
+        { id: "denoiser-strength", label: "strength", control: "number", defaultValue: 0.65, min: 0, max: 1, step: 0.01 },
+        { id: "denoiser-radius", label: "radius", control: "number", defaultValue: 2, min: 0, step: 1 },
+        { id: "denoiser-temporal", label: "temporal history", control: "toggle", defaultValue: true },
+      ],
+    },
+    {
+      title: "Guides",
+      settings: [
+        { id: "denoiser-depth-guide", label: "depth guide", control: "toggle", defaultValue: true },
+        { id: "denoiser-normal-guide", label: "normal guide", control: "toggle", defaultValue: true },
+        { id: "denoiser-albedo-guide", label: "albedo guide", control: "toggle", defaultValue: false },
+      ],
+    },
+  ],
+  tonemapper: [
+    {
+      title: "Exposure",
+      settings: [
+        { id: "tonemapper-exposure", label: "exposure", control: "number", defaultValue: 0, step: 0.1, suffix: "EV" },
+        { id: "tonemapper-gamma", label: "gamma", control: "number", defaultValue: 2.2, min: 0.1, step: 0.1 },
+        { id: "tonemapper-white-point", label: "white point", control: "number", defaultValue: 1, min: 0.1, step: 0.1 },
+      ],
+    },
+    {
+      title: "Output",
+      settings: [
+        {
+          id: "tonemapper-color-space",
+          label: "color space",
+          control: "select",
+          defaultValue: "sRGB",
+          options: ["sRGB", "display P3", "Rec.709", "linear RGB"],
+        },
+        { id: "tonemapper-dither", label: "dither", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+  "render-target": [
+    {
+      title: "Resolution",
+      settings: [
+        {
+          id: "target-resolution",
+          label: "resolution",
+          control: "select",
+          defaultValue: "1280 x 720",
+          options: ["800 x 800", "1280 x 720", "1920 x 1080", "custom"],
+        },
+        { id: "target-scale", label: "scale", control: "number", defaultValue: 1, min: 0.1, max: 2, step: 0.1 },
+      ],
+    },
+    {
+      title: "Accumulation",
+      settings: [
+        { id: "target-progressive", label: "progressive accumulation", control: "toggle", defaultValue: true },
+        { id: "target-max-samples", label: "sample budget", control: "number", defaultValue: 256, min: 1, step: 1 },
+      ],
+    },
+  ],
+  display: [
+    {
+      title: "Viewport",
+      settings: [
+        { id: "display-fit", label: "fit mode", control: "select", defaultValue: "contain", options: ["contain", "cover", "1:1"] },
+        { id: "display-zoom", label: "zoom", control: "number", defaultValue: 1, min: 0.1, step: 0.1 },
+      ],
+    },
+    {
+      title: "Overlays",
+      settings: [
+        { id: "display-sample-count", label: "sample count", control: "toggle", defaultValue: true },
+        { id: "display-frame-time", label: "frame time", control: "toggle", defaultValue: true },
+        { id: "display-pixel-inspector", label: "pixel inspector", control: "toggle", defaultValue: false },
+      ],
+    },
+  ],
+  "debug-views": [
+    {
+      title: "Inspection",
+      settings: [
+        { id: "debug-range-min", label: "range min", control: "number", defaultValue: 0, step: 0.1 },
+        { id: "debug-range-max", label: "range max", control: "number", defaultValue: 1, step: 0.1 },
+        { id: "debug-normalize", label: "normalize", control: "toggle", defaultValue: true },
+      ],
+    },
+    {
+      title: "Overlay",
+      settings: [
+        { id: "debug-opacity", label: "opacity", control: "number", defaultValue: 1, min: 0, max: 1, step: 0.01 },
+        { id: "debug-legend", label: "legend", control: "toggle", defaultValue: true },
+      ],
+    },
+  ],
+};
+
 function getInitialActiveOptions() {
   return Object.fromEntries(
     pipelineSections.map((section) => [
@@ -1192,30 +1445,64 @@ function getInitialActiveOptions() {
   );
 }
 
-function getInitialEnabledOptions() {
+function getInitialSettingValues() {
   return Object.fromEntries(
-    pipelineSections.map((section) => {
-      if (section.id === "camera") {
-        return [section.id, []];
-      }
-
-      return [
-        section.id,
-        section.groups
-          .flatMap((group) => group.options)
-          .filter((option) => section.minimum.includes(option)),
-      ];
-    }),
+    [
+      ...cameraModes.flatMap((mode) => mode.settingGroups),
+      ...Object.values(pipelineSectionSettingGroups).flat(),
+    ].flatMap((group) =>
+      group.settings.map((setting) => [setting.id, setting.defaultValue]),
+    ),
   );
 }
 
-function getInitialCameraSettingValues() {
-  return Object.fromEntries(
-    cameraModes.flatMap((mode) =>
-      mode.settingGroups.flatMap((group) =>
-        group.settings.map((setting) => [setting.id, setting.defaultValue]),
-      ),
-    ),
+function SettingGroups({
+  groups,
+  values,
+  onSettingChange,
+}: {
+  groups: CameraSettingGroup[];
+  values: Record<string, CameraSettingValue>;
+  onSettingChange: (settingId: string, value: CameraSettingValue) => void;
+}) {
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+          Settings
+        </span>
+        <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
+          {groups.flatMap((group) => group.settings).length}
+        </Badge>
+      </div>
+      {groups.map((group) => (
+        <div
+          key={group.title}
+          className="grid gap-1 border-t border-sidebar-border/50 pt-2 first:border-t-0 first:pt-0"
+        >
+          <div className="flex items-center justify-between gap-2 px-0.5">
+            <span className="text-[12px] text-sidebar-foreground/75">{group.title}</span>
+          </div>
+          <div className="grid gap-1">
+            {group.settings.map((setting) => (
+              <div
+                key={setting.id}
+                className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/60"
+              >
+                <span className="min-w-0 flex-1 truncate" title={setting.label}>
+                  {setting.label}
+                </span>
+                <CameraSettingInput
+                  setting={setting}
+                  value={values[setting.id] ?? setting.defaultValue}
+                  onChange={(value) => onSettingChange(setting.id, value)}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -1301,30 +1588,14 @@ function CameraSettingInput({
 export function AppSidebar() {
   const [activeOptions, setActiveOptions] =
     useState<Record<string, string>>(getInitialActiveOptions);
-  const [enabledOptions, setEnabledOptions] =
-    useState<Record<string, string[]>>(getInitialEnabledOptions);
-  const [cameraSettingValues, setCameraSettingValues] =
-    useState<Record<string, CameraSettingValue>>(getInitialCameraSettingValues);
+  const [settingValues, setSettingValues] =
+    useState<Record<string, CameraSettingValue>>(getInitialSettingValues);
 
-  const updateCameraSetting = (settingId: string, value: CameraSettingValue) => {
-    setCameraSettingValues((current) => ({
+  const updateSetting = (settingId: string, value: CameraSettingValue) => {
+    setSettingValues((current) => ({
       ...current,
       [settingId]: value,
     }));
-  };
-
-  const toggleEnabledOption = (sectionId: string, option: string, checked: boolean) => {
-    setEnabledOptions((current) => {
-      const values = current[sectionId] ?? [];
-      const nextValues = checked
-        ? Array.from(new Set([...values, option]))
-        : values.filter((value) => value !== option);
-
-      return {
-        ...current,
-        [sectionId]: nextValues,
-      };
-    });
   };
 
   return (
@@ -1379,11 +1650,12 @@ export function AppSidebar() {
           <Accordion multiple defaultValue={["camera"]}>
             {pipelineSections.map((section) => {
               const activeOption = activeOptions[section.id];
-              const enabledValues = enabledOptions[section.id] ?? [];
               const activeCameraMode =
                 section.id === "camera"
                   ? cameraModes.find((mode) => mode.label === activeOption) ?? cameraModes[0]
                   : undefined;
+              const settingGroups =
+                activeCameraMode?.settingGroups ?? pipelineSectionSettingGroups[section.id] ?? [];
 
               return (
                 <AccordionItem
@@ -1460,60 +1732,11 @@ export function AppSidebar() {
                           </DropdownMenu>
                         </div>
 
-                        <div className="grid gap-2">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-                              Settings
-                            </span>
-                            <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
-                              {
-                                activeCameraMode.settingGroups
-                                  .flatMap((group) => group.settings)
-                                  .length
-                              }
-                            </Badge>
-                          </div>
-                          {activeCameraMode.settingGroups.map((group) => {
-                            return (
-                              <div
-                                key={group.title}
-                                className="grid gap-1 border-t border-sidebar-border/50 pt-2 first:border-t-0 first:pt-0"
-                              >
-                                <div className="flex items-center justify-between gap-2 px-0.5">
-                                  <span className="text-[12px] text-sidebar-foreground/75">
-                                    {group.title}
-                                  </span>
-                                </div>
-                                <div className="grid gap-1">
-                                  {group.settings.map((setting) => {
-                                    return (
-                                      <div
-                                        key={setting.id}
-                                        className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/60"
-                                      >
-                                        <span
-                                          className="min-w-0 flex-1 truncate"
-                                          title={setting.label}
-                                        >
-                                          {setting.label}
-                                        </span>
-                                        <CameraSettingInput
-                                          setting={setting}
-                                          value={
-                                            cameraSettingValues[setting.id] ?? setting.defaultValue
-                                          }
-                                          onChange={(value) =>
-                                            updateCameraSetting(setting.id, value)
-                                          }
-                                        />
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
+                        <SettingGroups
+                          groups={settingGroups}
+                          values={settingValues}
+                          onSettingChange={updateSetting}
+                        />
                       </>
                     ) : (
                       <>
@@ -1550,77 +1773,11 @@ export function AppSidebar() {
                           </Select>
                         </div>
 
-                        <div className="grid gap-1 rounded-md bg-muted/40 px-2 py-1.5">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-                              Minimum
-                            </span>
-                            <Badge variant="outline" className="h-4 px-1.5 text-[10px]">
-                              {section.minimum.length}
-                            </Badge>
-                          </div>
-                          <p className="text-[11px] leading-4 text-muted-foreground">
-                            {section.minimum.join(", ")}
-                          </p>
-                        </div>
-
-                        <SidebarGroupContent>
-                          <Accordion multiple className="gap-0">
-                            {section.groups.map((group) => {
-                              const enabledCount = group.options.filter((option) =>
-                                enabledValues.includes(option),
-                              ).length;
-
-                              return (
-                                <AccordionItem
-                                  key={group.title}
-                                  value={group.title}
-                                  className="border-b border-sidebar-border/50 last:border-b-0"
-                                >
-                                  <AccordionTrigger className="min-h-8 rounded-md px-0.5 py-1.5 text-[12px] text-sidebar-foreground/75 hover:bg-sidebar-accent hover:no-underline">
-                                    <span className="flex min-w-0 flex-1 items-center gap-2">
-                                      <span className="min-w-0 flex-1 truncate">
-                                        {group.title}
-                                      </span>
-                                      <span className="shrink-0 text-[11px] font-normal text-muted-foreground">
-                                        {enabledCount}/{group.options.length}
-                                      </span>
-                                    </span>
-                                  </AccordionTrigger>
-                                  <AccordionContent className="grid gap-1 pb-2">
-                                    {group.options.map((option) => {
-                                      const checked = enabledValues.includes(option);
-
-                                      return (
-                                        <label
-                                          key={option}
-                                          data-selected={checked}
-                                          className="flex min-h-7 cursor-pointer items-center gap-2 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground data-[selected=true]:bg-sidebar-accent/70 data-[selected=true]:text-sidebar-accent-foreground"
-                                        >
-                                          <Checkbox
-                                            checked={checked}
-                                            onCheckedChange={(nextChecked) =>
-                                              toggleEnabledOption(
-                                                section.id,
-                                                option,
-                                                nextChecked === true,
-                                              )
-                                            }
-                                            className="size-3.5 rounded-[3px]"
-                                            aria-label={option}
-                                          />
-                                          <span className="min-w-0 flex-1 truncate" title={option}>
-                                            {option}
-                                          </span>
-                                        </label>
-                                      );
-                                    })}
-                                  </AccordionContent>
-                                </AccordionItem>
-                              );
-                            })}
-                          </Accordion>
-                        </SidebarGroupContent>
+                        <SettingGroups
+                          groups={settingGroups}
+                          values={settingValues}
+                          onSettingChange={updateSetting}
+                        />
                       </>
                     )}
                   </AccordionContent>
