@@ -18,7 +18,7 @@ struct Uniforms {
   focusDistance : f32,
   samplesPerDispatch : u32,
   maxBounces : u32,
-  toneMap : u32, // 0 = Reinhard, 1 = ACES, 2 = linear, 3 = none
+  _displayMode : u32,
   _pad3 : u32,
 };
 
@@ -35,7 +35,6 @@ struct Sphere {
 @group(0) @binding(1) var<storage, read> spheres : array<Sphere>;
 @group(0) @binding(2) var accumPrev : texture_storage_2d<rgba32float, read>;
 @group(0) @binding(3) var accumNext : texture_storage_2d<rgba32float, write>;
-@group(0) @binding(4) var outTex    : texture_storage_2d<rgba8unorm, write>;
 
 // ---------- RNG ----------
 fn pcg(state : ptr<function, u32>) -> u32 {
@@ -246,31 +245,6 @@ fn makeCameraRay(uv : vec2<f32>, aspect : f32, rng : ptr<function, u32>) -> Came
   return ray;
 }
 
-fn acesFitted(c : vec3<f32>) -> vec3<f32> {
-  let a = 2.51;
-  let b = 0.03;
-  let cc = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  return clamp((c * (a * c + vec3<f32>(b))) / (c * (cc * c + vec3<f32>(d)) + vec3<f32>(e)), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-fn applyToneMap(cIn : vec3<f32>) -> vec3<f32> {
-  var c = max(cIn, vec3<f32>(0.0));
-  if (U.toneMap == 0u) {
-    c = c / (c + vec3<f32>(1.0));
-  } else if (U.toneMap == 1u) {
-    c = acesFitted(c);
-  } else if (U.toneMap == 2u) {
-    c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
-  }
-
-  if (U.toneMap != 3u) {
-    c = pow(c, vec3<f32>(1.0 / 2.2));
-  }
-  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dims = vec2<u32>(u32(U.resolution.x), u32(U.resolution.y));
@@ -301,15 +275,19 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     accum = vec4<f32>((prev.rgb * n + col) / (n + 1.0), 1.0);
   }
   textureStore(accumNext, coord, accum);
-
-  let c = applyToneMap(accum.rgb);
-  textureStore(outTex, coord, vec4<f32>(c, 1.0));
 }
 `;
 
 export const blitWGSL = /* wgsl */ `
 @group(0) @binding(0) var srcTex : texture_2d<f32>;
-@group(0) @binding(1) var samp   : sampler;
+@group(0) @binding(1) var<uniform> D : DisplayUniforms;
+
+struct DisplayUniforms {
+  toneMap : u32, // 0 = Reinhard, 1 = ACES, 2 = linear, 3 = none
+  _pad0 : u32,
+  _pad1 : u32,
+  _pad2 : u32,
+};
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -331,8 +309,37 @@ fn vs(@builtin(vertex_index) vi : u32) -> VsOut {
   return o;
 }
 
+fn acesFitted(c : vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let cc = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((c * (a * c + vec3<f32>(b))) / (c * (cc * c + vec3<f32>(d)) + vec3<f32>(e)), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn applyToneMap(cIn : vec3<f32>) -> vec3<f32> {
+  var c = max(cIn, vec3<f32>(0.0));
+  if (D.toneMap == 0u) {
+    c = c / (c + vec3<f32>(1.0));
+  } else if (D.toneMap == 1u) {
+    c = acesFitted(c);
+  } else if (D.toneMap == 2u) {
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+
+  if (D.toneMap != 3u) {
+    c = pow(c, vec3<f32>(1.0 / 2.2));
+  }
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs(in : VsOut) -> @location(0) vec4<f32> {
-  return textureSample(srcTex, samp, in.uv);
+  let dims = textureDimensions(srcTex);
+  let maxCoord = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+  let coord = clamp(vec2<i32>(in.uv * vec2<f32>(dims)), vec2<i32>(0), maxCoord);
+  let hdr = textureLoad(srcTex, coord, 0).rgb;
+  return vec4<f32>(applyToneMap(hdr), 1.0);
 }
 `;

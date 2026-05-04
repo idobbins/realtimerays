@@ -53,6 +53,17 @@ export type RenderSettings = {
   maxPixels: number;
 };
 
+export type RenderViewport = {
+  id: string;
+  label: string;
+  settings: RenderSettings;
+  presentation?: "full" | "split-left" | "split-right";
+};
+
+export type RenderSession = {
+  viewports: RenderViewport[];
+};
+
 export const defaultSceneSpheres: RenderSphere[] = createSceneSpheres(
   defaultScenePresetId,
   defaultSceneMaterialSeed,
