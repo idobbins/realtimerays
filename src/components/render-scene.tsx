@@ -8,9 +8,17 @@ import type {
   RenderSettings,
   RenderSphere,
   SphereMaterial,
+  ToneMap,
 } from "@/lib/render-settings";
 
-type Stats = { fps: number; samples: number; supported: boolean; error?: string };
+type Stats = {
+  fps: number;
+  samples: number;
+  supported: boolean;
+  width: number;
+  height: number;
+  error?: string;
+};
 const uniformBufferSize = 112;
 
 const materialTypeIds: Record<SphereMaterial, number> = {
@@ -48,9 +56,22 @@ const cameraTypeIds: Record<CameraType, number> = {
   "thin-lens": 2,
 };
 
+const toneMapIds: Record<ToneMap, number> = {
+  reinhard: 0,
+  aces: 1,
+  linear: 2,
+  none: 3,
+};
+
 export function RenderScene({ settings }: { settings: RenderSettings }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [stats, setStats] = useState<Stats>({ fps: 0, samples: 0, supported: true });
+  const [stats, setStats] = useState<Stats>({
+    fps: 0,
+    samples: 0,
+    supported: true,
+    width: 0,
+    height: 0,
+  });
   const cameraRef = useRef({ yaw: 0.6, pitch: 0.15, dist: 7.5 });
   const settingsRef = useRef(settings);
   const resizeRef = useRef<(() => void) | null>(null);
@@ -80,6 +101,8 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
           fps: 0,
           samples: 0,
           supported: false,
+          width: 0,
+          height: 0,
           error: "WebGPU is not available in this browser.",
         });
         return;
@@ -89,7 +112,14 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
       const adapter = await gpu.requestAdapter();
 
       if (!adapter) {
-        setStats({ fps: 0, samples: 0, supported: false, error: "No GPU adapter found." });
+        setStats({
+          fps: 0,
+          samples: 0,
+          supported: false,
+          width: 0,
+          height: 0,
+          error: "No GPU adapter found.",
+        });
         return;
       }
 
@@ -103,7 +133,14 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
       const context = canvas.getContext("webgpu");
 
       if (!context) {
-        setStats({ fps: 0, samples: 0, supported: false, error: "WebGPU context unavailable." });
+        setStats({
+          fps: 0,
+          samples: 0,
+          supported: false,
+          width: 0,
+          height: 0,
+          error: "WebGPU context unavailable.",
+        });
         device.destroy();
         return;
       }
@@ -381,6 +418,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         uniformFloats[23] = currentSettings.focusDistance;
         uniformInts[24] = currentSettings.samplesPerDispatch >>> 0;
         uniformInts[25] = currentSettings.maxBounces >>> 0;
+        uniformInts[26] = toneMapIds[currentSettings.toneMap] ?? 0;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData);
         sphereData = packSpheres(currentSettings.sceneSpheres);
 
@@ -429,6 +467,8 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
               ? sampleIndexRef.current * currentSettings.samplesPerDispatch
               : currentSettings.samplesPerDispatch,
             supported: true,
+            width,
+            height,
           });
           fpsTimer = now;
           fpsFrames = 0;
@@ -454,6 +494,8 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         fps: 0,
         samples: 0,
         supported: false,
+        width: 0,
+        height: 0,
         error: error instanceof Error ? error.message : String(error),
       });
     });
@@ -499,6 +541,11 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
             FPS <span className={fpsTone}>{stats.fps.toFixed(1)}</span>
           </div>
           <div className="text-white/85">Samples {stats.samples}</div>
+          {stats.width > 0 && stats.height > 0 ? (
+            <div className="text-white/85">
+              Render {stats.width} x {stats.height}
+            </div>
+          ) : null}
         </div>
       )}
     </div>

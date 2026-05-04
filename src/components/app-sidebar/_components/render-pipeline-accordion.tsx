@@ -12,7 +12,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { RenderSettings } from "@/lib/render-settings";
+import {
+  renderAspectRatioProfiles,
+  toneMapOptions,
+  type RenderAspectRatio,
+  type RenderQuality,
+  type RenderSettings,
+  type ToneMap,
+} from "@/lib/render-settings";
 
 import { CameraSettings } from "./camera-settings";
 import { SamplingSettings } from "./sampling-settings";
@@ -20,11 +27,21 @@ import { SceneSettings } from "./scene-settings";
 import { SettingRow } from "./setting-row";
 import { SidebarSectionTrigger, type RenderSettingChange } from "./sidebar-section";
 
-const pixelBudgetOptions = [
-  { label: "0.4 MP", value: 400_000 },
-  { label: "0.8 MP", value: 800_000 },
-  { label: "1.6 MP", value: 1_600_000 },
-  { label: "2.4 MP", value: 2_400_000 },
+const previewQualityOptions: Array<{
+  label: string;
+  value: RenderQuality;
+  maxPixels: number;
+  detail: string;
+}> = [
+  { label: "Draft", value: "draft", maxPixels: 400_000, detail: "fastest preview" },
+  { label: "Balanced", value: "balanced", maxPixels: 1_600_000, detail: "default preview" },
+  { label: "High", value: "high", maxPixels: 2_400_000, detail: "sharper preview" },
+  {
+    label: "Native",
+    value: "native",
+    maxPixels: Number.MAX_SAFE_INTEGER,
+    detail: "full viewport",
+  },
 ];
 
 function RenderOutputSection({
@@ -34,28 +51,48 @@ function RenderOutputSection({
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
 }) {
-  const activePixelBudget =
-    pixelBudgetOptions.find((option) => option.value === settings.maxPixels)?.label ??
+  const activeQualityLabel =
+    previewQualityOptions.find((option) => option.value === settings.renderQuality)?.label ??
     `${Math.round(settings.maxPixels / 1000)}k px`;
+  const activeAspectRatio =
+    renderAspectRatioProfiles.find((profile) => profile.value === settings.renderAspectRatio) ??
+    renderAspectRatioProfiles[0];
+  const sectionValue = `${activeQualityLabel} / ${activeAspectRatio.label}`;
+
+  const setPreviewQuality = (quality: RenderQuality) => {
+    const option = previewQualityOptions.find((candidate) => candidate.value === quality);
+
+    if (!option) {
+      return;
+    }
+
+    onSettingChange("renderQuality", option.value);
+    onSettingChange("maxPixels", option.maxPixels);
+  };
 
   return (
     <AccordionItem value="render" className="border-b border-sidebar-border/70 last:border-b-0">
-      <SidebarSectionTrigger icon={GaugeIcon} title="Render Output" value={activePixelBudget} />
+      <SidebarSectionTrigger icon={GaugeIcon} title="Preview Quality" value={sectionValue} />
       <AccordionContent className="space-y-3 px-2 pb-3">
         <div className="grid gap-2">
-          <SettingRow label="render pixel budget">
+          <SettingRow label="quality">
             <Select
-              value={String(settings.maxPixels)}
-              onValueChange={(value) => onSettingChange("maxPixels", Number(value))}
+              value={settings.renderQuality}
+              onValueChange={(value) => setPreviewQuality(value as RenderQuality)}
             >
-              <SelectTrigger size="sm" className="h-7 w-24 bg-background/60 text-[11px]">
+              <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
                 <SelectGroup>
-                  <SelectLabel>Render pixel budget</SelectLabel>
-                  {pixelBudgetOptions.map((option) => (
-                    <SelectItem key={option.value} value={String(option.value)} className="text-xs">
+                  <SelectLabel>Preview quality</SelectLabel>
+                  {previewQualityOptions.map((option) => (
+                    <SelectItem
+                      key={option.value}
+                      value={option.value}
+                      title={option.detail}
+                      className="text-xs"
+                    >
                       {option.label}
                     </SelectItem>
                   ))}
@@ -63,11 +100,48 @@ function RenderOutputSection({
               </SelectContent>
             </Select>
           </SettingRow>
+          <SettingRow label="aspect ratio">
+            <Select
+              value={settings.renderAspectRatio}
+              onValueChange={(value) =>
+                onSettingChange("renderAspectRatio", value as RenderAspectRatio)
+              }
+            >
+              <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                <SelectGroup>
+                  <SelectLabel>Aspect ratio</SelectLabel>
+                  {renderAspectRatioProfiles.map((profile) => (
+                    <SelectItem key={profile.value} value={profile.value} className="text-xs">
+                      {profile.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </SettingRow>
           <SettingRow label="tone map">
-            <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-              <ContrastIcon className="size-3" />
-              Reinhard + gamma
-            </span>
+            <Select
+              value={settings.toneMap}
+              onValueChange={(value) => onSettingChange("toneMap", value as ToneMap)}
+            >
+              <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
+                <ContrastIcon className="size-3" />
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                <SelectGroup>
+                  <SelectLabel>Tone map</SelectLabel>
+                  {toneMapOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value} className="text-xs">
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
           </SettingRow>
         </div>
       </AccordionContent>

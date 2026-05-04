@@ -18,7 +18,8 @@ struct Uniforms {
   focusDistance : f32,
   samplesPerDispatch : u32,
   maxBounces : u32,
-  _pad3 : vec2<u32>,
+  toneMap : u32, // 0 = Reinhard, 1 = ACES, 2 = linear, 3 = none
+  _pad3 : u32,
 };
 
 struct Sphere {
@@ -245,6 +246,31 @@ fn makeCameraRay(uv : vec2<f32>, aspect : f32, rng : ptr<function, u32>) -> Came
   return ray;
 }
 
+fn acesFitted(c : vec3<f32>) -> vec3<f32> {
+  let a = 2.51;
+  let b = 0.03;
+  let cc = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((c * (a * c + vec3<f32>(b))) / (c * (cc * c + vec3<f32>(d)) + vec3<f32>(e)), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn applyToneMap(cIn : vec3<f32>) -> vec3<f32> {
+  var c = max(cIn, vec3<f32>(0.0));
+  if (U.toneMap == 0u) {
+    c = c / (c + vec3<f32>(1.0));
+  } else if (U.toneMap == 1u) {
+    c = acesFitted(c);
+  } else if (U.toneMap == 2u) {
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  }
+
+  if (U.toneMap != 3u) {
+    c = pow(c, vec3<f32>(1.0 / 2.2));
+  }
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dims = vec2<u32>(u32(U.resolution.x), u32(U.resolution.y));
@@ -276,10 +302,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   textureStore(accumNext, coord, accum);
 
-  // tone map (Reinhard) + gamma
-  var c = accum.rgb;
-  c = c / (c + vec3<f32>(1.0));
-  c = pow(c, vec3<f32>(1.0 / 2.2));
+  let c = applyToneMap(accum.rgb);
   textureStore(outTex, coord, vec4<f32>(c, 1.0));
 }
 `;

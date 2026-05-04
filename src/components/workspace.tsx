@@ -5,14 +5,23 @@ import { PlusIcon } from "lucide-react";
 
 import { AppSidebar } from "@/components/app-sidebar";
 import { RenderScene } from "@/components/render-scene";
+import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { defaultRenderSettings, type RenderSettings } from "@/lib/render-settings";
+import {
+  defaultRenderSettings,
+  renderAspectRatioProfiles,
+  type RenderSettings,
+} from "@/lib/render-settings";
+import { cn } from "@/lib/utils";
 
 const workspaceTabs = [{ value: "active", label: "Active" }];
 
 export function Workspace() {
   const [renderSettings, setRenderSettings] = useState<RenderSettings>(defaultRenderSettings);
+  const activeAspectRatio =
+    renderAspectRatioProfiles.find((profile) => profile.value === renderSettings.renderAspectRatio) ??
+    renderAspectRatioProfiles[0];
 
   return (
     <SidebarProvider
@@ -47,10 +56,32 @@ export function Workspace() {
             <PlusIcon className="size-3.5" />
           </button>
         </div>
-        <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/70">
-          <section className="min-h-0 flex-1">
-            <RenderScene settings={renderSettings} />
-          </section>
+        <div
+          className={cn(
+            "min-h-0 w-full flex-1",
+            activeAspectRatio.ratio && "flex items-center justify-center p-2 md:p-3",
+          )}
+          style={activeAspectRatio.ratio ? { containerType: "size" } : undefined}
+        >
+          {activeAspectRatio.ratio ? (
+            <AspectRatio
+              ratio={activeAspectRatio.ratio}
+              className="max-h-full max-w-full overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/70"
+              style={{
+                width: `min(100cqw, calc(100cqh * ${activeAspectRatio.ratio}))`,
+              }}
+            >
+              <section className="size-full min-h-0 overflow-hidden">
+                <RenderScene settings={renderSettings} />
+              </section>
+            </AspectRatio>
+          ) : (
+            <div className="flex size-full min-h-0 flex-col overflow-hidden rounded-xl bg-background shadow-sm ring-1 ring-border/70">
+              <section className="min-h-0 flex-1 overflow-hidden">
+                <RenderScene settings={renderSettings} />
+              </section>
+            </div>
+          )}
         </div>
       </SidebarInset>
     </SidebarProvider>
