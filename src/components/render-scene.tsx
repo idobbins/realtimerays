@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { blitWGSL, pathTracerWGSL } from "@/lib/pathtracer.wgsl";
-import type { RenderSettings } from "@/lib/render-settings";
+import type { CameraType, RenderSettings } from "@/lib/render-settings";
 
 type Stats = { fps: number; samples: number; supported: boolean; error?: string };
 
@@ -89,6 +89,12 @@ function packSpheres() {
   return buffer;
 }
 
+const cameraTypeIds: Record<CameraType, number> = {
+  perspective: 0,
+  orthographic: 1,
+  "thin-lens": 2,
+};
+
 export function RenderScene({ settings }: { settings: RenderSettings }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [stats, setStats] = useState<Stats>({ fps: 0, samples: 0, supported: true });
@@ -163,7 +169,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
       let pingPong = 0;
 
       const uniformBuffer = device.createBuffer({
-        size: 80,
+        size: 96,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
@@ -176,12 +182,19 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
 
       const computePipeline = device.createComputePipeline({
         layout: "auto",
-        compute: { module: device.createShaderModule({ code: pathTracerWGSL }), entryPoint: "main" },
+        compute: {
+          module: device.createShaderModule({ code: pathTracerWGSL }),
+          entryPoint: "main",
+        },
       });
       const blitPipeline = device.createRenderPipeline({
         layout: "auto",
         vertex: { module: device.createShaderModule({ code: blitWGSL }), entryPoint: "vs" },
-        fragment: { module: device.createShaderModule({ code: blitWGSL }), entryPoint: "fs", targets: [{ format }] },
+        fragment: {
+          module: device.createShaderModule({ code: blitWGSL }),
+          entryPoint: "fs",
+          targets: [{ format }],
+        },
         primitive: { topology: "triangle-list" },
       });
       const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
@@ -291,7 +304,10 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         lastX = event.clientX;
         lastY = event.clientY;
         cameraRef.current.yaw -= dx * 0.005;
-        cameraRef.current.pitch = Math.max(-1.3, Math.min(1.3, cameraRef.current.pitch + dy * 0.005));
+        cameraRef.current.pitch = Math.max(
+          -1.3,
+          Math.min(1.3, cameraRef.current.pitch + dy * 0.005),
+        );
         dirtyRef.current = true;
       };
       const onPointerUp = (event: PointerEvent) => {
@@ -302,7 +318,10 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
       };
       const onWheel = (event: WheelEvent) => {
         event.preventDefault();
-        cameraRef.current.dist = Math.max(2.5, Math.min(20, cameraRef.current.dist * (1 + event.deltaY * 0.001)));
+        cameraRef.current.dist = Math.max(
+          2.5,
+          Math.min(20, cameraRef.current.dist * (1 + event.deltaY * 0.001)),
+        );
         dirtyRef.current = true;
       };
 
@@ -319,7 +338,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         canvas.removeEventListener("wheel", onWheel);
       });
 
-      const uniformData = new ArrayBuffer(80);
+      const uniformData = new ArrayBuffer(96);
       const uniformFloats = new Float32Array(uniformData);
       const uniformInts = new Uint32Array(uniformData);
       let frame = 0;
@@ -392,7 +411,12 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         uniformFloats[16] = up[0];
         uniformFloats[17] = up[1];
         uniformFloats[18] = up[2];
-        uniformFloats[19] = (settingsRef.current.fovDegrees * Math.PI) / 180;
+        const currentSettings = settingsRef.current;
+        uniformFloats[19] = (currentSettings.fovDegrees * Math.PI) / 180;
+        uniformInts[20] = cameraTypeIds[currentSettings.cameraType] ?? 0;
+        uniformFloats[21] = currentSettings.orthoScale;
+        uniformFloats[22] = currentSettings.apertureRadius;
+        uniformFloats[23] = currentSettings.focusDistance;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData);
 
         const encoder = device.createCommandEncoder();
@@ -425,7 +449,11 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
 
         const now = performance.now();
         if (now - fpsTimer > 500) {
-          setStats({ fps: (fpsFrames * 1000) / (now - fpsTimer), samples: sampleIndexRef.current, supported: true });
+          setStats({
+            fps: (fpsFrames * 1000) / (now - fpsTimer),
+            samples: sampleIndexRef.current,
+            supported: true,
+          });
           fpsTimer = now;
           fpsFrames = 0;
         }
@@ -470,7 +498,10 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
           : "text-red-400";
 
   return (
-    <div className="relative size-full overflow-hidden" aria-label="WebGPU path tracing render preview">
+    <div
+      className="relative size-full overflow-hidden"
+      aria-label="WebGPU path tracing render preview"
+    >
       <canvas
         ref={canvasRef}
         className="block size-full cursor-grab touch-none active:cursor-grabbing"
@@ -480,7 +511,8 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
           <div className="max-w-md rounded-lg border border-border bg-card p-6 text-center text-card-foreground shadow-lg">
             <h2 className="mb-2 text-lg font-semibold">WebGPU not available</h2>
             <p className="text-sm text-muted-foreground">
-              {stats.error ?? "This browser/device does not expose a WebGPU adapter."} Try the latest Chrome or Edge on a desktop with a GPU.
+              {stats.error ?? "This browser/device does not expose a WebGPU adapter."} Try the
+              latest Chrome or Edge on a desktop with a GPU.
             </p>
           </div>
         </div>

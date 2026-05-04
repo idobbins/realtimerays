@@ -12,6 +12,10 @@ struct Uniforms {
   _pad2      : f32,
   camUp      : vec3<f32>,
   fov        : f32,
+  cameraType : u32, // 0 = perspective, 1 = orthographic, 2 = thin lens
+  orthoScale : f32,
+  apertureRadius : f32,
+  focusDistance : f32,
 };
 
 struct Sphere {
@@ -44,6 +48,11 @@ fn randInUnitSphere(state : ptr<function, u32>) -> vec3<f32> {
   let a = rand(state) * 6.2831853;
   let r = sqrt(max(0.0, 1.0 - z * z));
   return vec3<f32>(r * cos(a), r * sin(a), z);
+}
+fn randInUnitDisk(state : ptr<function, u32>) -> vec2<f32> {
+  let a = rand(state) * 6.2831853;
+  let r = sqrt(rand(state));
+  return vec2<f32>(r * cos(a), r * sin(a));
 }
 
 // ---------- Ray / hit ----------
@@ -194,6 +203,45 @@ fn trace(roIn : vec3<f32>, rdIn : vec3<f32>, rng : ptr<function, u32>) -> vec3<f
   return radiance;
 }
 
+struct CameraRay {
+  ro : vec3<f32>,
+  rd : vec3<f32>,
+};
+
+fn makeCameraRay(uv : vec2<f32>, aspect : f32, rng : ptr<function, u32>) -> CameraRay {
+  let scale = tan(U.fov * 0.5);
+  var ray : CameraRay;
+
+  if (U.cameraType == 1u) {
+    let originOffset =
+      U.camRight * (uv.x * aspect * U.orthoScale) -
+      U.camUp * (uv.y * U.orthoScale);
+    ray.ro = U.camPos + originOffset;
+    ray.rd = normalize(U.camForward);
+    return ray;
+  }
+
+  let perspectiveDir = normalize(
+    U.camForward +
+    U.camRight * (uv.x * aspect * scale) -
+    U.camUp    * (uv.y * scale)
+  );
+
+  if (U.cameraType == 2u && U.apertureRadius > 0.0) {
+    let focusT = U.focusDistance / max(dot(perspectiveDir, U.camForward), 0.001);
+    let focusPoint = U.camPos + perspectiveDir * focusT;
+    let lens = randInUnitDisk(rng) * U.apertureRadius;
+    let originOffset = U.camRight * lens.x + U.camUp * lens.y;
+    ray.ro = U.camPos + originOffset;
+    ray.rd = normalize(focusPoint - ray.ro);
+    return ray;
+  }
+
+  ray.ro = U.camPos;
+  ray.rd = perspectiveDir;
+  return ray;
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dims = vec2<u32>(u32(U.resolution.x), u32(U.resolution.y));
@@ -209,13 +257,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let jy = rand(&rng);
     let uv = (vec2<f32>(f32(gid.x) + jx, f32(gid.y) + jy) / U.resolution) * 2.0 - 1.0;
     let aspect = U.resolution.x / U.resolution.y;
-    let scale = tan(U.fov * 0.5);
-    let dir = normalize(
-      U.camForward +
-      U.camRight * (uv.x * aspect * scale) -
-      U.camUp    * (uv.y * scale)
-    );
-    col = col + trace(U.camPos, dir, &rng);
+    let ray = makeCameraRay(uv, aspect, &rng);
+    col = col + trace(ray.ro, ray.rd, &rng);
   }
   col = col / f32(spp);
 
