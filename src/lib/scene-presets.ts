@@ -1,11 +1,5 @@
 import type { ComponentType } from "react";
-import {
-  BoxesIcon,
-  CircleDotIcon,
-  Layers3Icon,
-  OrbitIcon,
-  SparklesIcon,
-} from "lucide-react";
+import { BoxesIcon, CircleDotIcon, Layers3Icon, OrbitIcon, SparklesIcon } from "lucide-react";
 
 import type { RenderSphere, SphereMaterial } from "@/lib/render-settings";
 
@@ -45,8 +39,8 @@ export const scenePresets = [
       {
         id: "key-light",
         name: "Key light",
-        center: [0, 3.5, -1],
-        radius: 1.2,
+        center: [0, 6.2, -2.4],
+        radius: 0.8,
         role: "light",
       },
     ],
@@ -70,8 +64,8 @@ export const scenePresets = [
       {
         id: "top-light",
         name: "Top light",
-        center: [0, 3.4, -0.9],
-        radius: 1.1,
+        center: [0, 6.1, -2.2],
+        radius: 0.75,
         role: "light",
       },
     ],
@@ -92,8 +86,8 @@ export const scenePresets = [
       {
         id: "side-light",
         name: "Side light",
-        center: [-2.4, 3.1, -1.4],
-        radius: 1,
+        center: [-2.8, 5.9, -2.6],
+        radius: 0.72,
         role: "light",
       },
     ],
@@ -116,8 +110,8 @@ export const scenePresets = [
       {
         id: "field-light",
         name: "Field light",
-        center: [0.4, 3.2, -1.5],
-        radius: 1.15,
+        center: [0.6, 6, -2.7],
+        radius: 0.78,
         role: "light",
       },
     ],
@@ -138,8 +132,8 @@ export const scenePresets = [
       {
         id: "strip-light",
         name: "Strip light",
-        center: [0, 2.9, -1.8],
-        radius: 0.95,
+        center: [0, 5.8, -3],
+        radius: 0.68,
         role: "light",
       },
     ],
