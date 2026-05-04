@@ -32,41 +32,7 @@ type SidebarHeaderActionsProps = {
   onTakeScreenshot: () => void | Promise<void>;
 };
 
-export function SidebarHeaderActions({
-  recordingState,
-  onToggleRecording,
-  onTakeScreenshot,
-}: SidebarHeaderActionsProps) {
-  const [screenshotFlashKey, setScreenshotFlashKey] = useState(0);
-  const [isScreenshotting, setIsScreenshotting] = useState(false);
-  const isRecording = recordingState === "recording";
-  const isRecordingBusy = recordingState === "starting" || recordingState === "stopping";
-  const recordLabel =
-    recordingState === "starting"
-      ? "Starting recording"
-      : recordingState === "stopping"
-        ? "Stopping recording"
-        : isRecording
-          ? "Stop recording"
-          : "Record";
-
-  const handleScreenshot = async () => {
-    if (isScreenshotting) {
-      return;
-    }
-
-    setIsScreenshotting(true);
-
-    try {
-      await onTakeScreenshot();
-      setScreenshotFlashKey((key) => key + 1);
-    } catch (error) {
-      console.error("Could not save screenshot.", error);
-    } finally {
-      setIsScreenshotting(false);
-    }
-  };
-
+export function SidebarUserMenu() {
   return (
     <SidebarMenu className="flex-row items-center gap-1">
       <SidebarMenuItem className="min-w-0">
@@ -110,7 +76,48 @@ export function SidebarHeaderActions({
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarMenuItem>
-      <SidebarMenuItem className="ml-auto shrink-0">
+    </SidebarMenu>
+  );
+}
+
+export function SidebarCaptureActions({
+  recordingState,
+  onToggleRecording,
+  onTakeScreenshot,
+}: SidebarHeaderActionsProps) {
+  const [screenshotFlashKey, setScreenshotFlashKey] = useState(0);
+  const [isScreenshotting, setIsScreenshotting] = useState(false);
+  const isRecording = recordingState === "recording";
+  const isRecordingBusy = recordingState === "starting" || recordingState === "stopping";
+  const recordLabel =
+    recordingState === "starting"
+      ? "Starting recording"
+      : recordingState === "stopping"
+        ? "Stopping recording"
+        : isRecording
+          ? "Stop recording"
+          : "Record";
+
+  const handleScreenshot = async () => {
+    if (isScreenshotting) {
+      return;
+    }
+
+    setIsScreenshotting(true);
+
+    try {
+      await onTakeScreenshot();
+      setScreenshotFlashKey((key) => key + 1);
+    } catch (error) {
+      console.error("Could not save screenshot.", error);
+    } finally {
+      setIsScreenshotting(false);
+    }
+  };
+
+  return (
+    <SidebarMenu className="flex-row items-center gap-1">
+      <SidebarMenuItem className="shrink-0">
         <Button
           type="button"
           variant="outline"
@@ -158,5 +165,14 @@ export function SidebarHeaderActions({
         </Button>
       </SidebarMenuItem>
     </SidebarMenu>
+  );
+}
+
+export function SidebarHeaderActions(props: SidebarHeaderActionsProps) {
+  return (
+    <div className="flex items-center gap-1">
+      <SidebarUserMenu />
+      <SidebarCaptureActions {...props} />
+    </div>
   );
 }

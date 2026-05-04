@@ -24,7 +24,6 @@ import {
 import { cn } from "@/lib/utils";
 
 const comparisonDefaults: Partial<RenderSettings> = {
-  toneMap: "aces",
   samplesPerDispatch: 4,
   temporalAccumulation: false,
 };
@@ -32,7 +31,6 @@ const defaultVariantSettings = {
   samplesPerDispatch: defaultRenderSettings.samplesPerDispatch,
   maxBounces: defaultRenderSettings.maxBounces,
   temporalAccumulation: defaultRenderSettings.temporalAccumulation,
-  toneMap: defaultRenderSettings.toneMap,
 } satisfies Partial<RenderSettings>;
 const sharedSettingKeys = new Set<keyof RenderSettings>([
   "cameraType",
@@ -45,6 +43,7 @@ const sharedSettingKeys = new Set<keyof RenderSettings>([
   "sceneSpheres",
   "renderQuality",
   "renderAspectRatio",
+  "toneMap",
   "maxPixels",
 ]);
 
@@ -94,6 +93,7 @@ function withSharedSettings(settings: RenderSettings, shared: RenderSettings): R
     sceneSpheres: shared.sceneSpheres,
     renderQuality: shared.renderQuality,
     renderAspectRatio: shared.renderAspectRatio,
+    toneMap: shared.toneMap,
     maxPixels: shared.maxPixels,
   };
 }

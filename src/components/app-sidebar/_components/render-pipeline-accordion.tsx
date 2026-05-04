@@ -12,6 +12,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { recordingProfiles, type RecordingProfileId } from "@/lib/recording-settings";
 import {
   renderAspectRatioProfiles,
   toneMapOptions,
@@ -24,6 +26,10 @@ import {
 import { CameraSettings } from "./camera-settings";
 import { SamplingSettings } from "./sampling-settings";
 import { SceneSettings } from "./scene-settings";
+import {
+  SidebarCaptureActions,
+  type RecordingState,
+} from "./sidebar-header-actions";
 import { SettingRow } from "./setting-row";
 import { SidebarSectionTrigger, type RenderSettingChange } from "./sidebar-section";
 
@@ -47,11 +53,27 @@ const previewQualityOptions: Array<{
 function RenderOutputSection({
   settings,
   onSettingChange,
-  includeToneMap = true,
+  recordingState,
+  onToggleRecording,
+  onTakeScreenshot,
+  recordingProfileId,
+  onRecordingProfileChange,
+  autoOrbit,
+  onAutoOrbitChange,
+  renderEnabled,
+  onRenderEnabledChange,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
-  includeToneMap?: boolean;
+  recordingState: RecordingState;
+  onToggleRecording: () => void | Promise<void>;
+  onTakeScreenshot: () => void | Promise<void>;
+  recordingProfileId: RecordingProfileId;
+  onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  autoOrbit: boolean;
+  onAutoOrbitChange: (enabled: boolean) => void;
+  renderEnabled: boolean;
+  onRenderEnabledChange: (enabled: boolean) => void;
 }) {
   const activeQualityLabel =
     previewQualityOptions.find((option) => option.value === settings.renderQuality)?.label ??
@@ -74,9 +96,104 @@ function RenderOutputSection({
 
   return (
     <AccordionItem value="render" className="border-b border-sidebar-border/70 last:border-b-0">
-      <SidebarSectionTrigger icon={GaugeIcon} title="Preview Quality" value={sectionValue} />
+      <SidebarSectionTrigger icon={GaugeIcon} title="Render Output" value={sectionValue} />
       <AccordionContent className="space-y-3 px-2 pb-3">
+        <div className="flex items-center justify-end">
+          <SidebarCaptureActions
+            recordingState={recordingState}
+            onToggleRecording={onToggleRecording}
+            onTakeScreenshot={onTakeScreenshot}
+          />
+        </div>
+
         <div className="grid gap-2">
+          <label
+            htmlFor="render-enabled"
+            className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50"
+          >
+            <span className="grid min-w-0 gap-0.5">
+              <span className="truncate">Rendering</span>
+              <span className="truncate text-[10px] text-muted-foreground">
+                {renderEnabled ? "active" : "paused"}
+              </span>
+            </span>
+            <Switch
+              id="render-enabled"
+              size="sm"
+              checked={renderEnabled}
+              onCheckedChange={onRenderEnabledChange}
+              aria-label="Rendering"
+            />
+          </label>
+
+          <label
+            htmlFor="auto-orbit-camera"
+            className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50"
+          >
+            <span className="grid min-w-0 gap-0.5">
+              <span className="truncate">Auto orbit camera</span>
+              <span className="truncate text-[10px] text-muted-foreground">
+                {autoOrbit ? "rotating view" : "manual view"}
+              </span>
+            </span>
+            <Switch
+              id="auto-orbit-camera"
+              size="sm"
+              checked={autoOrbit}
+              onCheckedChange={onAutoOrbitChange}
+              aria-label="Auto orbit camera"
+            />
+          </label>
+
+          <SettingRow label="recording quality">
+            <Select
+              value={recordingProfileId}
+              onValueChange={(value) => onRecordingProfileChange(value as RecordingProfileId)}
+              disabled={recordingState !== "idle"}
+            >
+              <SelectTrigger size="sm" className="h-7 w-36 bg-background/60 text-[11px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                <SelectGroup>
+                  <SelectLabel>Recording quality</SelectLabel>
+                  {recordingProfiles.map((profile) => (
+                    <SelectItem
+                      key={profile.id}
+                      value={profile.id}
+                      title={profile.detail}
+                      className="text-xs"
+                    >
+                      {profile.menuLabel}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </SettingRow>
+
+          <SettingRow label="tone map">
+            <Select
+              value={settings.toneMap}
+              onValueChange={(value) => onSettingChange("toneMap", value as ToneMap)}
+            >
+              <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
+                <ContrastIcon className="size-3" />
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                <SelectGroup>
+                  <SelectLabel>Tone map</SelectLabel>
+                  {toneMapOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value} className="text-xs">
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </SettingRow>
+
           <SettingRow label="quality">
             <Select
               value={settings.renderQuality}
@@ -124,71 +241,6 @@ function RenderOutputSection({
               </SelectContent>
             </Select>
           </SettingRow>
-          {includeToneMap ? (
-            <SettingRow label="tone map">
-              <Select
-                value={settings.toneMap}
-                onValueChange={(value) => onSettingChange("toneMap", value as ToneMap)}
-              >
-                <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
-                  <ContrastIcon className="size-3" />
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
-                  <SelectGroup>
-                    <SelectLabel>Tone map</SelectLabel>
-                    {toneMapOptions.map((option) => (
-                      <SelectItem key={option.value} value={option.value} className="text-xs">
-                        {option.label}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </SettingRow>
-          ) : null}
-        </div>
-      </AccordionContent>
-    </AccordionItem>
-  );
-}
-
-function ToneMapSection({
-  settings,
-  onSettingChange,
-}: {
-  settings: RenderSettings;
-  onSettingChange: RenderSettingChange<RenderSettings>;
-}) {
-  const activeToneMapLabel =
-    toneMapOptions.find((option) => option.value === settings.toneMap)?.label ?? settings.toneMap;
-
-  return (
-    <AccordionItem value="display" className="border-b border-sidebar-border/70">
-      <SidebarSectionTrigger icon={ContrastIcon} title="Display" value={activeToneMapLabel} />
-      <AccordionContent className="space-y-3 px-2 pb-3">
-        <div className="grid gap-2">
-          <SettingRow label="tone map">
-            <Select
-              value={settings.toneMap}
-              onValueChange={(value) => onSettingChange("toneMap", value as ToneMap)}
-            >
-              <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
-                <ContrastIcon className="size-3" />
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
-                <SelectGroup>
-                  <SelectLabel>Tone map</SelectLabel>
-                  {toneMapOptions.map((option) => (
-                    <SelectItem key={option.value} value={option.value} className="text-xs">
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-          </SettingRow>
         </div>
       </AccordionContent>
     </AccordionItem>
@@ -198,9 +250,27 @@ function ToneMapSection({
 export function SharedSessionAccordion({
   settings,
   onSettingChange,
+  recordingState,
+  onToggleRecording,
+  onTakeScreenshot,
+  recordingProfileId,
+  onRecordingProfileChange,
+  autoOrbit,
+  onAutoOrbitChange,
+  renderEnabled,
+  onRenderEnabledChange,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
+  recordingState: RecordingState;
+  onToggleRecording: () => void | Promise<void>;
+  onTakeScreenshot: () => void | Promise<void>;
+  recordingProfileId: RecordingProfileId;
+  onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  autoOrbit: boolean;
+  onAutoOrbitChange: (enabled: boolean) => void;
+  renderEnabled: boolean;
+  onRenderEnabledChange: (enabled: boolean) => void;
 }) {
   return (
     <Accordion multiple defaultValue={["scene", "camera", "render"]}>
@@ -209,7 +279,15 @@ export function SharedSessionAccordion({
       <RenderOutputSection
         settings={settings}
         onSettingChange={onSettingChange}
-        includeToneMap={false}
+        recordingState={recordingState}
+        onToggleRecording={onToggleRecording}
+        onTakeScreenshot={onTakeScreenshot}
+        recordingProfileId={recordingProfileId}
+        onRecordingProfileChange={onRecordingProfileChange}
+        autoOrbit={autoOrbit}
+        onAutoOrbitChange={onAutoOrbitChange}
+        renderEnabled={renderEnabled}
+        onRenderEnabledChange={onRenderEnabledChange}
       />
     </Accordion>
   );
@@ -223,9 +301,8 @@ export function VariantPipelineAccordion({
   onSettingChange: RenderSettingChange<RenderSettings>;
 }) {
   return (
-    <Accordion multiple defaultValue={["sampling", "display"]}>
+    <Accordion multiple defaultValue={["sampling"]}>
       <SamplingSettings settings={settings} onSettingChange={onSettingChange} />
-      <ToneMapSection settings={settings} onSettingChange={onSettingChange} />
     </Accordion>
   );
 }
