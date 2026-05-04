@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 
 function Label({ className, ...props }: React.ComponentProps<"label">) {
   return (
+    // oxlint-disable-next-line jsx-a11y/label-has-associated-control: Generic label primitive; callers provide htmlFor or wrap controls.
     <label
       data-slot="label"
       className={cn(
