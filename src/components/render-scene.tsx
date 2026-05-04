@@ -501,9 +501,6 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
           <div className="text-white/85">Samples {stats.samples}</div>
         </div>
       )}
-      <div className="pointer-events-none absolute right-4 bottom-4 rounded-md border border-border/60 bg-card/70 px-3 py-2 text-xs text-muted-foreground backdrop-blur-md">
-        Drag to orbit · Scroll to zoom
-      </div>
     </div>
   );
 }

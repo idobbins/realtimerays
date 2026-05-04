@@ -35,7 +35,7 @@ function SamplingOptionButton({
       className={cn(
         "h-8 min-w-0 bg-background/60 px-2 text-[11px] text-muted-foreground shadow-none",
         selected &&
-          "border-sky-400/50 bg-sidebar-accent/70 text-sidebar-accent-foreground shadow-[0_1px_8px_rgba(56,189,248,0.14)]",
+          "border-sidebar-border bg-sidebar-accent text-sidebar-accent-foreground shadow-[inset_0_0_0_1px_var(--sidebar-border)]",
       )}
     >
       <span className="truncate">{label}</span>

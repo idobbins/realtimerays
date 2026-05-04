@@ -16,6 +16,7 @@ export function Workspace() {
 
   return (
     <SidebarProvider
+      className="h-svh w-screen overflow-hidden"
       style={
         {
           "--sidebar-width": "20rem",
@@ -23,7 +24,7 @@ export function Workspace() {
       }
     >
       <AppSidebar settings={renderSettings} onSettingsChange={setRenderSettings} />
-      <SidebarInset className="bg-muted/60 p-2 pl-0 md:p-3 md:pt-2 md:pl-0">
+      <SidebarInset className="min-w-0 bg-muted/60 p-2 pl-0 md:p-3 md:pt-2 md:pl-0">
         <div className="mb-2 flex h-10 shrink-0 items-center gap-1 pr-2">
           <Tabs
             defaultValue={workspaceTabs[0].value}
