@@ -1,13 +1,11 @@
 "use client";
 
-import { useMemo } from "react";
 import {
   BoxesIcon,
   DicesIcon,
   HashIcon,
   RefreshCcwIcon,
   ShuffleIcon,
-  SparklesIcon,
 } from "lucide-react";
 
 import { AccordionContent, AccordionItem } from "@/components/ui/accordion";
@@ -22,29 +20,14 @@ import {
   scenePresets,
   type ScenePresetId,
 } from "@/lib/scene-presets";
-import type { RenderSettings, RenderSphere, SphereMaterial } from "@/lib/render-settings";
+import type { RenderSettings, RenderSphere } from "@/lib/render-settings";
 import { cn } from "@/lib/utils";
 
-import { Readout, SettingRow } from "./setting-row";
 import {
   SidebarSectionMeta,
   SidebarSectionTrigger,
   type RenderSettingChange,
 } from "./sidebar-section";
-
-const materialLabels: Record<SphereMaterial, string> = {
-  diffuse: "Diffuse",
-  metal: "Metal",
-  glass: "Glass",
-  light: "Light",
-};
-
-const materialAccent: Record<SphereMaterial, string> = {
-  diffuse: "bg-red-500",
-  metal: "bg-zinc-400",
-  glass: "bg-cyan-300",
-  light: "bg-amber-300",
-};
 
 function clampSeed(value: number) {
   return Math.max(0, Math.min(999, Math.round(value)));
@@ -55,16 +38,6 @@ function swatchColor(value: [number, number, number], scale = 1) {
     Math.max(0, Math.min(255, Math.round((channel / scale) * 255))),
   );
   return `rgb(${r} ${g} ${b})`;
-}
-
-function materialCounts(spheres: RenderSphere[]) {
-  return spheres.reduce(
-    (counts, sphere) => {
-      counts[sphere.material] += 1;
-      return counts;
-    },
-    { diffuse: 0, metal: 0, glass: 0, light: 0 } satisfies Record<SphereMaterial, number>,
-  );
 }
 
 function sceneBounds(spheres: RenderSphere[]) {
@@ -146,7 +119,7 @@ function PresetButton({
       className={cn(
         "grid min-h-14 grid-cols-[3.25rem_1fr_auto] items-center gap-2 rounded-md border border-transparent px-2 py-1.5 text-left text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1 focus-visible:outline-ring",
         selected &&
-          "border-sidebar-border/70 bg-sidebar-accent text-sidebar-accent-foreground shadow-[inset_2px_0_0_var(--sidebar-ring)]",
+          "border-sky-400/50 bg-sidebar-accent/70 text-sidebar-accent-foreground shadow-[0_1px_8px_rgba(56,189,248,0.14)]",
       )}
     >
       <SceneMiniMap
@@ -224,70 +197,6 @@ function SeedControl({
   );
 }
 
-function MaterialSummary({ spheres }: { spheres: RenderSphere[] }) {
-  const counts = materialCounts(spheres);
-
-  return (
-    <div className="grid gap-1.5">
-      <SidebarSectionMeta label="Materials" value="assigned by seed" />
-      <div className="grid grid-cols-2 gap-1.5">
-        {(["diffuse", "metal", "glass", "light"] as const).map((material) => (
-          <div
-            key={material}
-            className="flex min-h-7 items-center justify-between gap-2 rounded-md px-2 text-[11px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/60"
-          >
-            <span className="flex min-w-0 items-center gap-1.5">
-              <span
-                className={cn(
-                  "size-2 rounded-full border border-sidebar-border",
-                  materialAccent[material],
-                )}
-              />
-              <span className="truncate">{materialLabels[material]}</span>
-            </span>
-            <span className="text-[10px] text-muted-foreground">{counts[material]}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SceneSummary({
-  presetId,
-  spheres,
-}: {
-  presetId: ScenePresetId;
-  spheres: RenderSphere[];
-}) {
-  const preset = getScenePreset(presetId);
-  const emissiveCount = spheres.filter((sphere) => sphere.material === "light").length;
-  const reflectiveCount = spheres.filter(
-    (sphere) => sphere.material === "metal" || sphere.material === "glass",
-  ).length;
-
-  return (
-    <div className="grid gap-2 border-t border-sidebar-border/60 pt-2">
-      <SceneMiniMap spheres={spheres} />
-      <div className="grid gap-1">
-        <SettingRow label="arrangement">
-          <Readout>{preset.label}</Readout>
-        </SettingRow>
-        <SettingRow label="object count">
-          <Readout>{spheres.length} spheres</Readout>
-        </SettingRow>
-        <SettingRow label="surface mix">
-          <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-            <SparklesIcon className="size-3" />
-            {reflectiveCount} glossy / {emissiveCount} light
-          </span>
-        </SettingRow>
-      </div>
-      <MaterialSummary spheres={spheres} />
-    </div>
-  );
-}
-
 export function SceneSettings({
   settings,
   onSettingChange,
@@ -298,10 +207,6 @@ export function SceneSettings({
   const presetId = settings.scenePresetId ?? defaultScenePresetId;
   const materialSeed = settings.sceneMaterialSeed ?? defaultSceneMaterialSeed;
   const preset = getScenePreset(presetId);
-  const activeSpheres = useMemo(
-    () => createSceneSpheres(presetId, materialSeed),
-    [presetId, materialSeed],
-  );
 
   const applyScene = (nextPresetId: ScenePresetId, nextSeed: number) => {
     onSettingChange("scenePresetId", nextPresetId);
@@ -329,19 +234,6 @@ export function SceneSettings({
         </div>
 
         <SeedControl seed={materialSeed} onChange={(nextSeed) => applyScene(presetId, nextSeed)} />
-
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => applyScene(defaultScenePresetId, defaultSceneMaterialSeed)}
-          className="w-full justify-start rounded-md border-sidebar-border bg-sidebar text-xs text-sidebar-foreground/75 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-        >
-          <RefreshCcwIcon className="size-3.5" />
-          Reset scene preset
-        </Button>
-
-        <SceneSummary presetId={presetId} spheres={settings.sceneSpheres ?? activeSpheres} />
       </AccordionContent>
     </AccordionItem>
   );
