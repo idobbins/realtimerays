@@ -5,6 +5,8 @@ import { useRef, useState } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { RenderScene, type RenderSceneHandle } from "@/components/render-scene";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
+import { Button } from "@/components/ui/button";
+import { ButtonGroup } from "@/components/ui/button-group";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import type { RecordingState } from "@/components/app-sidebar/_components/sidebar-header-actions";
 import {
@@ -46,6 +48,15 @@ const sharedSettingKeys = new Set<keyof RenderSettings>([
   "toneMap",
   "maxPixels",
 ]);
+const comparisonModeOptions: Array<{
+  value: ComparisonMode;
+  label: string;
+  detail: string;
+}> = [
+  { value: "inline-split", label: "Inline", detail: "one framed view cut in half" },
+  { value: "side-by-side", label: "Side", detail: "two independent panes" },
+  { value: "swap", label: "Swap", detail: "show the selected pane" },
+];
 
 type ActiveRecording = {
   recorder: MediaRecorder;
@@ -98,6 +109,46 @@ function withSharedSettings(settings: RenderSettings, shared: RenderSettings): R
   };
 }
 
+function RenderViewToolbar({
+  comparisonMode,
+  onComparisonModeChange,
+}: {
+  comparisonMode: ComparisonMode;
+  onComparisonModeChange: (mode: ComparisonMode) => void;
+}) {
+  return (
+    <div className="absolute top-3 right-3 z-20 flex items-center gap-2 rounded-md border border-border/70 bg-background/85 p-1 shadow-sm backdrop-blur-sm">
+      <span className="px-1.5 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+        View
+      </span>
+      <ButtonGroup className="grid grid-cols-3">
+        {comparisonModeOptions.map((option) => {
+          const selected = option.value === comparisonMode;
+
+          return (
+            <Button
+              key={option.value}
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-pressed={selected}
+              title={option.detail}
+              onClick={() => onComparisonModeChange(option.value)}
+              className={cn(
+                "h-7 min-w-14 bg-background/60 px-2 text-[11px] text-muted-foreground shadow-none",
+                selected &&
+                  "border-border bg-accent text-accent-foreground shadow-[inset_0_0_0_1px_var(--border)]",
+              )}
+            >
+              <span className="truncate">{option.label}</span>
+            </Button>
+          );
+        })}
+      </ButtonGroup>
+    </div>
+  );
+}
+
 export function Workspace() {
   const renderSceneRef = useRef<RenderSceneHandle>(null);
   const recordingRef = useRef<ActiveRecording | null>(null);
@@ -116,7 +167,6 @@ export function Workspace() {
     renderSettings,
   );
   const sidebarSettings = activeComparePane === "b" ? comparisonSettings : renderSettings;
-  const sidebarContextLabel = `Pane ${activeComparePane.toUpperCase()}`;
   const activeAspectRatio =
     renderAspectRatioProfiles.find(
       (profile) => profile.value === renderSettings.renderAspectRatio,
@@ -284,10 +334,7 @@ export function Workspace() {
       <AppSidebar
         sharedSettings={renderSettings}
         variantSettings={sidebarSettings}
-        contextLabel={sidebarContextLabel}
-        comparisonMode={comparisonMode}
         activePaneId={activeComparePane}
-        onComparisonModeChange={setComparisonMode}
         onActivePaneChange={setActiveComparePane}
         onSharedSettingChange={updateSharedSetting}
         onVariantSettingChange={updateVariantSetting}
@@ -302,7 +349,11 @@ export function Workspace() {
         renderEnabled={renderEnabled}
         onRenderEnabledChange={setRenderEnabled}
       />
-      <SidebarInset className="min-w-0 bg-muted/60 p-2 pl-0 md:p-3 md:pt-2 md:pl-0">
+      <SidebarInset className="relative min-w-0 bg-muted/60 p-2 pl-0 md:p-3 md:pt-2 md:pl-0">
+        <RenderViewToolbar
+          comparisonMode={comparisonMode}
+          onComparisonModeChange={setComparisonMode}
+        />
         <div
           className={cn(
             "min-h-0 w-full flex-1",

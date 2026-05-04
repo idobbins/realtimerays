@@ -7,6 +7,9 @@ import {
   CircleDotIcon,
   Layers3Icon,
   LogOutIcon,
+  PauseIcon,
+  PlayIcon,
+  RotateCwIcon,
   SettingsIcon,
   UserPlusIcon,
 } from "lucide-react";
@@ -30,6 +33,13 @@ type SidebarHeaderActionsProps = {
   recordingState: RecordingState;
   onToggleRecording: () => void | Promise<void>;
   onTakeScreenshot: () => void | Promise<void>;
+};
+
+type SidebarRuntimeActionsProps = SidebarHeaderActionsProps & {
+  autoOrbit: boolean;
+  onAutoOrbitChange: (enabled: boolean) => void;
+  renderEnabled: boolean;
+  onRenderEnabledChange: (enabled: boolean) => void;
 };
 
 export function SidebarUserMenu() {
@@ -173,6 +183,62 @@ export function SidebarHeaderActions(props: SidebarHeaderActionsProps) {
     <div className="flex items-center gap-1">
       <SidebarUserMenu />
       <SidebarCaptureActions {...props} />
+    </div>
+  );
+}
+
+export function SidebarRuntimeActions({
+  recordingState,
+  onToggleRecording,
+  onTakeScreenshot,
+  autoOrbit,
+  onAutoOrbitChange,
+  renderEnabled,
+  onRenderEnabledChange,
+}: SidebarRuntimeActionsProps) {
+  return (
+    <div className="flex w-full items-center justify-between gap-2">
+      <SidebarUserMenu />
+      <div className="flex items-center gap-1">
+        <SidebarCaptureActions
+          recordingState={recordingState}
+          onToggleRecording={onToggleRecording}
+          onTakeScreenshot={onTakeScreenshot}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          aria-label={renderEnabled ? "Pause rendering" : "Resume rendering"}
+          aria-pressed={renderEnabled}
+          title={renderEnabled ? "Pause rendering" : "Resume rendering"}
+          data-playing={renderEnabled}
+          onClick={() => onRenderEnabledChange(!renderEnabled)}
+          className={cn(
+            "render-play-button relative overflow-hidden rounded-md border-sidebar-border bg-sidebar text-sidebar-foreground/70 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+            renderEnabled &&
+              "border-success/40 bg-success/10 text-success hover:bg-success/15 hover:text-success",
+          )}
+        >
+          {renderEnabled ? <PauseIcon className="size-3.5" /> : <PlayIcon className="size-3.5" />}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          aria-label={autoOrbit ? "Stop auto orbit" : "Start auto orbit"}
+          aria-pressed={autoOrbit}
+          title={autoOrbit ? "Stop auto orbit" : "Start auto orbit"}
+          onClick={() => onAutoOrbitChange(!autoOrbit)}
+          className={cn(
+            "rounded-md border-sidebar-border bg-sidebar text-sidebar-foreground/70 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+            autoOrbit &&
+              "border-sidebar-border bg-sidebar-accent text-sidebar-accent-foreground shadow-[inset_0_0_0_1px_var(--sidebar-border)]",
+          )}
+        >
+          <RotateCwIcon className={cn("size-3.5", autoOrbit && "text-sky-500")} />
+        </Button>
+      </div>
     </div>
   );
 }

@@ -12,7 +12,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import { recordingProfiles, type RecordingProfileId } from "@/lib/recording-settings";
 import {
   renderAspectRatioProfiles,
@@ -26,10 +25,7 @@ import {
 import { CameraSettings } from "./camera-settings";
 import { SamplingSettings } from "./sampling-settings";
 import { SceneSettings } from "./scene-settings";
-import {
-  SidebarCaptureActions,
-  type RecordingState,
-} from "./sidebar-header-actions";
+import type { RecordingState } from "./sidebar-header-actions";
 import { SettingRow } from "./setting-row";
 import { SidebarSectionTrigger, type RenderSettingChange } from "./sidebar-section";
 
@@ -54,26 +50,14 @@ function RenderOutputSection({
   settings,
   onSettingChange,
   recordingState,
-  onToggleRecording,
-  onTakeScreenshot,
   recordingProfileId,
   onRecordingProfileChange,
-  autoOrbit,
-  onAutoOrbitChange,
-  renderEnabled,
-  onRenderEnabledChange,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
   recordingState: RecordingState;
-  onToggleRecording: () => void | Promise<void>;
-  onTakeScreenshot: () => void | Promise<void>;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
-  autoOrbit: boolean;
-  onAutoOrbitChange: (enabled: boolean) => void;
-  renderEnabled: boolean;
-  onRenderEnabledChange: (enabled: boolean) => void;
 }) {
   const activeQualityLabel =
     previewQualityOptions.find((option) => option.value === settings.renderQuality)?.label ??
@@ -98,53 +82,7 @@ function RenderOutputSection({
     <AccordionItem value="render" className="border-b border-sidebar-border/70 last:border-b-0">
       <SidebarSectionTrigger icon={GaugeIcon} title="Render Output" value={sectionValue} />
       <AccordionContent className="space-y-3 px-2 pb-3">
-        <div className="flex items-center justify-end">
-          <SidebarCaptureActions
-            recordingState={recordingState}
-            onToggleRecording={onToggleRecording}
-            onTakeScreenshot={onTakeScreenshot}
-          />
-        </div>
-
         <div className="grid gap-2">
-          <label
-            htmlFor="render-enabled"
-            className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50"
-          >
-            <span className="grid min-w-0 gap-0.5">
-              <span className="truncate">Rendering</span>
-              <span className="truncate text-[10px] text-muted-foreground">
-                {renderEnabled ? "active" : "paused"}
-              </span>
-            </span>
-            <Switch
-              id="render-enabled"
-              size="sm"
-              checked={renderEnabled}
-              onCheckedChange={onRenderEnabledChange}
-              aria-label="Rendering"
-            />
-          </label>
-
-          <label
-            htmlFor="auto-orbit-camera"
-            className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50"
-          >
-            <span className="grid min-w-0 gap-0.5">
-              <span className="truncate">Auto orbit camera</span>
-              <span className="truncate text-[10px] text-muted-foreground">
-                {autoOrbit ? "rotating view" : "manual view"}
-              </span>
-            </span>
-            <Switch
-              id="auto-orbit-camera"
-              size="sm"
-              checked={autoOrbit}
-              onCheckedChange={onAutoOrbitChange}
-              aria-label="Auto orbit camera"
-            />
-          </label>
-
           <SettingRow label="recording quality">
             <Select
               value={recordingProfileId}
@@ -251,26 +189,14 @@ export function SharedSessionAccordion({
   settings,
   onSettingChange,
   recordingState,
-  onToggleRecording,
-  onTakeScreenshot,
   recordingProfileId,
   onRecordingProfileChange,
-  autoOrbit,
-  onAutoOrbitChange,
-  renderEnabled,
-  onRenderEnabledChange,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
   recordingState: RecordingState;
-  onToggleRecording: () => void | Promise<void>;
-  onTakeScreenshot: () => void | Promise<void>;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
-  autoOrbit: boolean;
-  onAutoOrbitChange: (enabled: boolean) => void;
-  renderEnabled: boolean;
-  onRenderEnabledChange: (enabled: boolean) => void;
 }) {
   return (
     <Accordion multiple defaultValue={["scene", "camera", "render"]}>
@@ -280,14 +206,8 @@ export function SharedSessionAccordion({
         settings={settings}
         onSettingChange={onSettingChange}
         recordingState={recordingState}
-        onToggleRecording={onToggleRecording}
-        onTakeScreenshot={onTakeScreenshot}
         recordingProfileId={recordingProfileId}
         onRecordingProfileChange={onRecordingProfileChange}
-        autoOrbit={autoOrbit}
-        onAutoOrbitChange={onAutoOrbitChange}
-        renderEnabled={renderEnabled}
-        onRenderEnabledChange={onRenderEnabledChange}
       />
     </Accordion>
   );
