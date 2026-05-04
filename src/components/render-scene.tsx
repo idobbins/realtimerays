@@ -125,11 +125,15 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
-      const sphereData = packSpheres(settingsRef.current.sceneSpheres);
-      const sphereBuffer = device.createBuffer({
-        size: sphereData.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      const createSphereBuffer = (sphereData: Float32Array) =>
+        device.createBuffer({
+          size: sphereData.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+      let sphereData = packSpheres(settingsRef.current.sceneSpheres);
+      let sphereBufferByteLength = sphereData.byteLength;
+      let sphereBuffer = createSphereBuffer(sphereData);
       device.queue.writeBuffer(sphereBuffer, 0, sphereData);
 
       const computePipeline = device.createComputePipeline({
@@ -370,7 +374,16 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         uniformFloats[22] = currentSettings.apertureRadius;
         uniformFloats[23] = currentSettings.focusDistance;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData);
-        device.queue.writeBuffer(sphereBuffer, 0, packSpheres(currentSettings.sceneSpheres));
+        sphereData = packSpheres(currentSettings.sceneSpheres);
+
+        if (sphereData.byteLength !== sphereBufferByteLength) {
+          sphereBuffer.destroy();
+          sphereBuffer = createSphereBuffer(sphereData);
+          sphereBufferByteLength = sphereData.byteLength;
+          allocateTextures(width, height);
+        }
+
+        device.queue.writeBuffer(sphereBuffer, 0, sphereData);
 
         const encoder = device.createCommandEncoder();
         const computePass = encoder.beginComputePass();
@@ -421,6 +434,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         accumA?.destroy();
         accumB?.destroy();
         outTex?.destroy();
+        sphereBuffer.destroy();
         device.destroy();
       });
     };
