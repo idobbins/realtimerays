@@ -3,74 +3,26 @@
 import { useEffect, useRef, useState } from "react";
 
 import { blitWGSL, pathTracerWGSL } from "@/lib/pathtracer.wgsl";
-import type { CameraType, RenderSettings } from "@/lib/render-settings";
+import type {
+  CameraType,
+  RenderSettings,
+  RenderSphere,
+  SphereMaterial,
+} from "@/lib/render-settings";
 
 type Stats = { fps: number; samples: number; supported: boolean; error?: string };
 
-type Sphere = {
-  center: [number, number, number];
-  radius: number;
-  albedo: [number, number, number];
-  matType: number;
-  emission: [number, number, number];
-  fuzz: number;
+const materialTypeIds: Record<SphereMaterial, number> = {
+  diffuse: 0,
+  metal: 1,
+  light: 2,
+  glass: 3,
 };
 
-const SCENE: Sphere[] = [
-  {
-    center: [0, 0, 0],
-    radius: 1,
-    albedo: [0.9, 0.3, 0.3],
-    matType: 0,
-    emission: [0, 0, 0],
-    fuzz: 0,
-  },
-  {
-    center: [-2.2, 0, -0.5],
-    radius: 1,
-    albedo: [0.95, 0.95, 0.95],
-    matType: 1,
-    emission: [0, 0, 0],
-    fuzz: 0.02,
-  },
-  {
-    center: [2.2, 0, -0.5],
-    radius: 1,
-    albedo: [0.95, 0.95, 1],
-    matType: 3,
-    emission: [0, 0, 0],
-    fuzz: 0,
-  },
-  {
-    center: [0.6, -0.6, 1.6],
-    radius: 0.4,
-    albedo: [0.2, 0.8, 0.4],
-    matType: 0,
-    emission: [0, 0, 0],
-    fuzz: 0,
-  },
-  {
-    center: [-0.8, -0.7, 1.4],
-    radius: 0.3,
-    albedo: [0.95, 0.7, 0.2],
-    matType: 1,
-    emission: [0, 0, 0],
-    fuzz: 0.3,
-  },
-  {
-    center: [0, 3.5, -1],
-    radius: 1.2,
-    albedo: [1, 1, 1],
-    matType: 2,
-    emission: [6, 5, 4],
-    fuzz: 0,
-  },
-];
+function packSpheres(spheres: RenderSphere[]) {
+  const buffer = new Float32Array(spheres.length * 12);
 
-function packSpheres() {
-  const buffer = new Float32Array(SCENE.length * 12);
-
-  SCENE.forEach((sphere, index) => {
+  spheres.forEach((sphere, index) => {
     const offset = index * 12;
     buffer[offset] = sphere.center[0];
     buffer[offset + 1] = sphere.center[1];
@@ -79,7 +31,7 @@ function packSpheres() {
     buffer[offset + 4] = sphere.albedo[0];
     buffer[offset + 5] = sphere.albedo[1];
     buffer[offset + 6] = sphere.albedo[2];
-    buffer[offset + 7] = sphere.matType;
+    buffer[offset + 7] = materialTypeIds[sphere.material];
     buffer[offset + 8] = sphere.emission[0];
     buffer[offset + 9] = sphere.emission[1];
     buffer[offset + 10] = sphere.emission[2];
@@ -173,7 +125,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
-      const sphereData = packSpheres();
+      const sphereData = packSpheres(settingsRef.current.sceneSpheres);
       const sphereBuffer = device.createBuffer({
         size: sphereData.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -418,6 +370,7 @@ export function RenderScene({ settings }: { settings: RenderSettings }) {
         uniformFloats[22] = currentSettings.apertureRadius;
         uniformFloats[23] = currentSettings.focusDistance;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+        device.queue.writeBuffer(sphereBuffer, 0, packSpheres(currentSettings.sceneSpheres));
 
         const encoder = device.createCommandEncoder();
         const computePass = encoder.beginComputePass();

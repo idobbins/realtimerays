@@ -1,6 +1,6 @@
 "use client";
 
-import { BoxesIcon, ContrastIcon, GaugeIcon, SparklesIcon } from "lucide-react";
+import { ContrastIcon, GaugeIcon, SparklesIcon } from "lucide-react";
 
 import { Accordion, AccordionContent, AccordionItem } from "@/components/ui/accordion";
 import {
@@ -15,12 +15,9 @@ import {
 import type { RenderSettings } from "@/lib/render-settings";
 
 import { CameraSettings } from "./camera-settings";
+import { SceneSettings } from "./scene-settings";
 import { Readout, SettingRow } from "./setting-row";
-import {
-  SidebarSectionMeta,
-  SidebarSectionTrigger,
-  type RenderSettingChange,
-} from "./sidebar-section";
+import { SidebarSectionTrigger, type RenderSettingChange } from "./sidebar-section";
 
 const pixelBudgetOptions = [
   { label: "0.4 MP", value: 400_000 },
@@ -29,35 +26,12 @@ const pixelBudgetOptions = [
   { label: "2.4 MP", value: 2_400_000 },
 ];
 
-function SceneSection() {
-  return (
-    <AccordionItem value="scene" className="border-b border-sidebar-border/70">
-      <SidebarSectionTrigger icon={BoxesIcon} title="Scene" value="fixed spheres" />
-      <AccordionContent className="space-y-3 px-2 pb-3">
-        <div className="grid gap-2">
-          <SidebarSectionMeta label="Shader storage" value="read-only" />
-          <SettingRow label="geometry">
-            <Readout>6 spheres + plane</Readout>
-          </SettingRow>
-          <SettingRow label="materials">
-            <Readout>diffuse, metal, glass, emissive</Readout>
-          </SettingRow>
-          <SettingRow label="sky light">
-            <Readout>fixed gradient sun</Readout>
-          </SettingRow>
-        </div>
-      </AccordionContent>
-    </AccordionItem>
-  );
-}
-
 function SamplingSection() {
   return (
     <AccordionItem value="sampling" className="border-b border-sidebar-border/70">
       <SidebarSectionTrigger icon={SparklesIcon} title="Sampling" value="progressive" />
       <AccordionContent className="space-y-3 px-2 pb-3">
         <div className="grid gap-2">
-          <SidebarSectionMeta label="Path tracer" value="hardcoded" />
           <SettingRow label="samples per dispatch">
             <Readout>1 spp</Readout>
           </SettingRow>
@@ -89,7 +63,6 @@ function RenderOutputSection({
       <SidebarSectionTrigger icon={GaugeIcon} title="Render Output" value={activePixelBudget} />
       <AccordionContent className="space-y-3 px-2 pb-3">
         <div className="grid gap-2">
-          <SidebarSectionMeta label="Target" value="renderer config" />
           <SettingRow label="render pixel budget">
             <Select
               value={String(settings.maxPixels)}
@@ -98,7 +71,7 @@ function RenderOutputSection({
               <SelectTrigger size="sm" className="h-7 w-24 bg-background/60 text-[11px]">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent align="end">
+              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
                 <SelectGroup>
                   <SelectLabel>Render pixel budget</SelectLabel>
                   {pixelBudgetOptions.map((option) => (
@@ -130,9 +103,9 @@ export function RenderPipelineAccordion({
   onSettingChange: RenderSettingChange<RenderSettings>;
 }) {
   return (
-    <Accordion multiple defaultValue={["camera", "render"]}>
+    <Accordion multiple defaultValue={["scene", "camera", "render"]}>
+      <SceneSettings settings={settings} onSettingChange={onSettingChange} />
       <CameraSettings settings={settings} onSettingChange={onSettingChange} />
-      <SceneSection />
       <SamplingSection />
       <RenderOutputSection settings={settings} onSettingChange={onSettingChange} />
     </Accordion>
