@@ -7,7 +7,7 @@ export default function Home() {
     <SidebarProvider
       style={
         {
-          "--sidebar-width": "14rem",
+          "--sidebar-width": "24rem",
         } as React.CSSProperties
       }
     >
