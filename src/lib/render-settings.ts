@@ -60,6 +60,9 @@ export type RenderViewport = {
   presentation?: "full" | "split-left" | "split-right";
 };
 
+export type ComparisonMode = "inline-split" | "side-by-side" | "swap";
+export type ComparisonPaneId = "a" | "b";
+
 export type RenderSession = {
   viewports: RenderViewport[];
 };

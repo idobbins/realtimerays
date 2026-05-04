@@ -6,27 +6,33 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { RenderScene } from "@/components/render-scene";
 import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   defaultRenderSettings,
   renderAspectRatioProfiles,
+  type ComparisonMode,
+  type ComparisonPaneId,
   type RenderSettings,
   type RenderViewport,
 } from "@/lib/render-settings";
 import { cn } from "@/lib/utils";
 
-type ComparePaneId = "a" | "b";
-
-const comparePaneTabs: Array<{ value: ComparePaneId; label: string }> = [
-  { value: "a", label: "A" },
-  { value: "b", label: "B" },
-];
 const comparisonDefaults: Partial<RenderSettings> = {
   toneMap: "aces",
   samplesPerDispatch: 4,
   temporalAccumulation: false,
 };
+const defaultVariantSettings = {
+  samplesPerDispatch: defaultRenderSettings.samplesPerDispatch,
+  maxBounces: defaultRenderSettings.maxBounces,
+  temporalAccumulation: defaultRenderSettings.temporalAccumulation,
+  toneMap: defaultRenderSettings.toneMap,
+} satisfies Partial<RenderSettings>;
 const sharedSettingKeys = new Set<keyof RenderSettings>([
+  "cameraType",
+  "fovDegrees",
+  "orthoScale",
+  "apertureRadius",
+  "focusDistance",
   "scenePresetId",
   "sceneMaterialSeed",
   "sceneSpheres",
@@ -38,6 +44,11 @@ const sharedSettingKeys = new Set<keyof RenderSettings>([
 function withSharedSettings(settings: RenderSettings, shared: RenderSettings): RenderSettings {
   return {
     ...settings,
+    cameraType: shared.cameraType,
+    fovDegrees: shared.fovDegrees,
+    orthoScale: shared.orthoScale,
+    apertureRadius: shared.apertureRadius,
+    focusDistance: shared.focusDistance,
     scenePresetId: shared.scenePresetId,
     sceneMaterialSeed: shared.sceneMaterialSeed,
     sceneSpheres: shared.sceneSpheres,
@@ -49,7 +60,8 @@ function withSharedSettings(settings: RenderSettings, shared: RenderSettings): R
 
 export function Workspace() {
   const [renderSettings, setRenderSettings] = useState<RenderSettings>(defaultRenderSettings);
-  const [activeComparePane, setActiveComparePane] = useState<ComparePaneId>("a");
+  const [comparisonMode, setComparisonMode] = useState<ComparisonMode>("inline-split");
+  const [activeComparePane, setActiveComparePane] = useState<ComparisonPaneId>("a");
   const [comparisonOverrides, setComparisonOverrides] =
     useState<Partial<RenderSettings>>(comparisonDefaults);
   const comparisonSettings = withSharedSettings(
@@ -59,22 +71,35 @@ export function Workspace() {
   const sidebarSettings = activeComparePane === "b" ? comparisonSettings : renderSettings;
   const sidebarContextLabel = `Pane ${activeComparePane.toUpperCase()}`;
   const activeAspectRatio =
-    renderAspectRatioProfiles.find((profile) => profile.value === renderSettings.renderAspectRatio) ??
-    renderAspectRatioProfiles[0];
-  const renderViewports: RenderViewport[] = [
-    { id: "a", label: "A Reference", settings: renderSettings, presentation: "split-left" },
-    { id: "b", label: "B Variant", settings: comparisonSettings, presentation: "split-right" },
-  ];
+    renderAspectRatioProfiles.find(
+      (profile) => profile.value === renderSettings.renderAspectRatio,
+    ) ?? renderAspectRatioProfiles[0];
+  const renderViewports: RenderViewport[] =
+    comparisonMode === "swap"
+      ? [
+          activeComparePane === "a"
+            ? { id: "a", label: "A Reference", settings: renderSettings }
+            : { id: "b", label: "B Variant", settings: comparisonSettings },
+        ]
+      : comparisonMode === "side-by-side"
+        ? [
+            { id: "a", label: "A Reference", settings: renderSettings },
+            { id: "b", label: "B Variant", settings: comparisonSettings },
+          ]
+        : [
+            { id: "a", label: "A Reference", settings: renderSettings, presentation: "split-left" },
+            {
+              id: "b",
+              label: "B Variant",
+              settings: comparisonSettings,
+              presentation: "split-right",
+            },
+          ];
 
-  const updateActiveSetting = <Key extends keyof RenderSettings>(
+  const updateSharedSetting = <Key extends keyof RenderSettings>(
     key: Key,
     value: RenderSettings[Key],
   ) => {
-    if (activeComparePane === "b" && !sharedSettingKeys.has(key)) {
-      setComparisonOverrides((current) => ({ ...current, [key]: value }));
-      return;
-    }
-
     setRenderSettings((current) => ({ ...current, [key]: value }));
 
     if (sharedSettingKeys.has(key)) {
@@ -86,13 +111,25 @@ export function Workspace() {
     }
   };
 
-  const resetActiveSettings = () => {
+  const updateVariantSetting = <Key extends keyof RenderSettings>(
+    key: Key,
+    value: RenderSettings[Key],
+  ) => {
+    if (activeComparePane === "b") {
+      setComparisonOverrides((current) => ({ ...current, [key]: value }));
+      return;
+    }
+
+    setRenderSettings((current) => ({ ...current, [key]: value }));
+  };
+
+  const resetActiveVariantSettings = () => {
     if (activeComparePane === "b") {
       setComparisonOverrides(comparisonDefaults);
       return;
     }
 
-    setRenderSettings(defaultRenderSettings);
+    setRenderSettings((current) => ({ ...current, ...defaultVariantSettings }));
   };
 
   return (
@@ -105,28 +142,18 @@ export function Workspace() {
       }
     >
       <AppSidebar
-        settings={sidebarSettings}
+        sharedSettings={renderSettings}
+        variantSettings={sidebarSettings}
         contextLabel={sidebarContextLabel}
-        onSettingChange={updateActiveSetting}
-        onResetSettings={resetActiveSettings}
+        comparisonMode={comparisonMode}
+        activePaneId={activeComparePane}
+        onComparisonModeChange={setComparisonMode}
+        onActivePaneChange={setActiveComparePane}
+        onSharedSettingChange={updateSharedSetting}
+        onVariantSettingChange={updateVariantSetting}
+        onResetVariantSettings={resetActiveVariantSettings}
       />
       <SidebarInset className="min-w-0 bg-muted/60 p-2 pl-0 md:p-3 md:pt-2 md:pl-0">
-        <div className="mb-2 flex h-10 shrink-0 items-center justify-end gap-1 pr-2">
-          <Tabs
-            value={activeComparePane}
-            onValueChange={(value) => setActiveComparePane(value as ComparePaneId)}
-            className="gap-0"
-            aria-label="Edited comparison pane"
-          >
-            <TabsList className="h-8">
-              {comparePaneTabs.map((tab) => (
-                <TabsTrigger key={tab.value} value={tab.value} className="w-10 text-xs">
-                  {tab.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        </div>
         <div
           className={cn(
             "min-h-0 w-full flex-1",

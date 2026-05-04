@@ -47,9 +47,11 @@ const previewQualityOptions: Array<{
 function RenderOutputSection({
   settings,
   onSettingChange,
+  includeToneMap = true,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
+  includeToneMap?: boolean;
 }) {
   const activeQualityLabel =
     previewQualityOptions.find((option) => option.value === settings.renderQuality)?.label ??
@@ -122,6 +124,50 @@ function RenderOutputSection({
               </SelectContent>
             </Select>
           </SettingRow>
+          {includeToneMap ? (
+            <SettingRow label="tone map">
+              <Select
+                value={settings.toneMap}
+                onValueChange={(value) => onSettingChange("toneMap", value as ToneMap)}
+              >
+                <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
+                  <ContrastIcon className="size-3" />
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                  <SelectGroup>
+                    <SelectLabel>Tone map</SelectLabel>
+                    {toneMapOptions.map((option) => (
+                      <SelectItem key={option.value} value={option.value} className="text-xs">
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </SettingRow>
+          ) : null}
+        </div>
+      </AccordionContent>
+    </AccordionItem>
+  );
+}
+
+function ToneMapSection({
+  settings,
+  onSettingChange,
+}: {
+  settings: RenderSettings;
+  onSettingChange: RenderSettingChange<RenderSettings>;
+}) {
+  const activeToneMapLabel =
+    toneMapOptions.find((option) => option.value === settings.toneMap)?.label ?? settings.toneMap;
+
+  return (
+    <AccordionItem value="display" className="border-b border-sidebar-border/70">
+      <SidebarSectionTrigger icon={ContrastIcon} title="Display" value={activeToneMapLabel} />
+      <AccordionContent className="space-y-3 px-2 pb-3">
+        <div className="grid gap-2">
           <SettingRow label="tone map">
             <Select
               value={settings.toneMap}
@@ -149,7 +195,7 @@ function RenderOutputSection({
   );
 }
 
-export function RenderPipelineAccordion({
+export function SharedSessionAccordion({
   settings,
   onSettingChange,
 }: {
@@ -160,8 +206,26 @@ export function RenderPipelineAccordion({
     <Accordion multiple defaultValue={["scene", "camera", "render"]}>
       <SceneSettings settings={settings} onSettingChange={onSettingChange} />
       <CameraSettings settings={settings} onSettingChange={onSettingChange} />
+      <RenderOutputSection
+        settings={settings}
+        onSettingChange={onSettingChange}
+        includeToneMap={false}
+      />
+    </Accordion>
+  );
+}
+
+export function VariantPipelineAccordion({
+  settings,
+  onSettingChange,
+}: {
+  settings: RenderSettings;
+  onSettingChange: RenderSettingChange<RenderSettings>;
+}) {
+  return (
+    <Accordion multiple defaultValue={["sampling", "display"]}>
       <SamplingSettings settings={settings} onSettingChange={onSettingChange} />
-      <RenderOutputSection settings={settings} onSettingChange={onSettingChange} />
+      <ToneMapSection settings={settings} onSettingChange={onSettingChange} />
     </Accordion>
   );
 }
