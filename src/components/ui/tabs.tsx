@@ -20,6 +20,8 @@ type IndicatorRect = {
   height: number;
 };
 
+const TabsListVariantContext = React.createContext<IndicatorVariant>("default");
+
 const tabIndicatorTransition = {
   type: "spring",
   duration: 0.35,
@@ -47,8 +49,7 @@ const tabsListVariants = cva(
     variants: {
       variant: {
         default: "bg-muted",
-        chrome:
-          "gap-1 rounded-none bg-transparent p-0 text-muted-foreground group-data-horizontal/tabs:h-8 group-data-vertical/tabs:w-full",
+        chrome: "h-8 gap-1 rounded-none bg-transparent p-0 text-muted-foreground",
         line: "gap-1 bg-transparent",
       },
     },
@@ -74,19 +75,23 @@ function TabsList({
       {...props}
     >
       <TabsIndicator variant={indicatorVariant} />
-      {children}
+      <TabsListVariantContext.Provider value={indicatorVariant}>
+        {children}
+      </TabsListVariantContext.Provider>
     </TabsPrimitive.List>
   );
 }
 
 function TabsTrigger({ className, ...props }: TabsPrimitive.Tab.Props) {
+  const variant = React.useContext(TabsListVariantContext);
+
   return (
     <TabsPrimitive.Tab
       data-slot="tabs-trigger"
       className={cn(
         "relative z-10 inline-flex h-[calc(100%-1px)] flex-1 items-center justify-center gap-1.5 rounded-md border border-transparent px-1.5 py-0.5 text-sm font-medium whitespace-nowrap text-foreground/60 transition-[color,border-color,box-shadow] duration-150 ease group-data-vertical/tabs:w-full group-data-vertical/tabs:justify-start hover:text-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1 focus-visible:outline-ring motion-reduce:transition-none disabled:pointer-events-none disabled:opacity-50 has-data-[icon=inline-end]:pr-1 has-data-[icon=inline-start]:pl-1 aria-disabled:pointer-events-none aria-disabled:opacity-50 dark:text-muted-foreground dark:hover:text-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
-        "group-data-[variant=chrome]/tabs-list:h-8 group-data-[variant=chrome]/tabs-list:w-36 group-data-[variant=chrome]/tabs-list:flex-none group-data-[variant=chrome]/tabs-list:justify-start group-data-[variant=chrome]/tabs-list:rounded-lg group-data-[variant=chrome]/tabs-list:px-3 group-data-[variant=chrome]/tabs-list:text-xs group-data-[variant=chrome]/tabs-list:font-medium group-data-[variant=chrome]/tabs-list:text-muted-foreground group-data-[variant=chrome]/tabs-list:hover:text-foreground",
-        "group-data-[variant=chrome]/tabs-list:data-active:text-foreground",
+        variant === "chrome" &&
+          "h-8 w-56 flex-none justify-start rounded-lg px-3 text-xs font-medium text-muted-foreground hover:text-foreground data-active:text-foreground",
         "group-data-[variant=line]/tabs-list:bg-transparent group-data-[variant=line]/tabs-list:data-active:bg-transparent dark:group-data-[variant=line]/tabs-list:data-active:border-transparent dark:group-data-[variant=line]/tabs-list:data-active:bg-transparent",
         "data-active:text-foreground dark:data-active:text-foreground",
         className,
