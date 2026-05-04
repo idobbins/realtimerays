@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Sidebar, SidebarContent, SidebarHeader } from "@/components/ui/sidebar";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { RecordingProfileId } from "@/lib/recording-settings";
-import type { ComparisonPaneId, RenderSettings } from "@/lib/render-settings";
+import type { ComparisonMode, ComparisonPaneId, RenderSettings } from "@/lib/render-settings";
 
 import type { RenderSettingChange } from "./_components/sidebar-section";
 
@@ -37,6 +37,8 @@ type AppSidebarProps = {
   onAutoOrbitChange: (enabled: boolean) => void;
   renderEnabled: boolean;
   onRenderEnabledChange: (enabled: boolean) => void;
+  comparisonMode: ComparisonMode;
+  onComparisonModeChange: (mode: ComparisonMode) => void;
 };
 
 const comparePaneTabs: Array<{ value: ComparisonPaneId; label: string; shortLabel: string }> = [
@@ -79,6 +81,8 @@ export function AppSidebar({
   onAutoOrbitChange,
   renderEnabled,
   onRenderEnabledChange,
+  comparisonMode,
+  onComparisonModeChange,
 }: AppSidebarProps) {
   const [animationDirection, setAnimationDirection] = useState(1);
   const shouldReduceMotion = useReducedMotion();
@@ -87,7 +91,7 @@ export function AppSidebar({
       return;
     }
 
-    setAnimationDirection(paneId === "b" ? 1 : -1);
+    setAnimationDirection(paneId === "b" ? -1 : 1);
     onActivePaneChange(paneId);
   };
   const resetLabel =
@@ -110,7 +114,7 @@ export function AppSidebar({
       <SidebarContent>
         <div className="px-3 pb-4 pt-1">
           <div className="mb-2 px-2 text-xs text-muted-foreground">
-            <span>Session settings</span>
+            <span>Global Settings</span>
           </div>
 
           <SharedSessionAccordion
@@ -119,9 +123,15 @@ export function AppSidebar({
             recordingState={recordingState}
             recordingProfileId={recordingProfileId}
             onRecordingProfileChange={onRecordingProfileChange}
+            comparisonMode={comparisonMode}
+            onComparisonModeChange={onComparisonModeChange}
           />
 
-          <div className="mt-4 mb-3 px-2">
+          <div className="mt-4 mb-2 px-2 text-xs text-muted-foreground">
+            <span>Variant Settings</span>
+          </div>
+
+          <div className="mb-3 px-2">
             <Tabs
               value={activePaneId}
               onValueChange={(value) => selectPane(value as ComparisonPaneId)}

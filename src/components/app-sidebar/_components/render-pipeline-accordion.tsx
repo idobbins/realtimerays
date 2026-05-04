@@ -12,10 +12,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { recordingProfiles, type RecordingProfileId } from "@/lib/recording-settings";
 import {
   renderAspectRatioProfiles,
   toneMapOptions,
+  type ComparisonMode,
   type RenderAspectRatio,
   type RenderQuality,
   type RenderSettings,
@@ -45,6 +47,11 @@ const previewQualityOptions: Array<{
     detail: "full viewport",
   },
 ];
+const comparisonModeTabs: Array<{ value: ComparisonMode; label: string; detail: string }> = [
+  { value: "inline-split", label: "Inline", detail: "one framed view cut in half" },
+  { value: "side-by-side", label: "Side", detail: "two independent panes" },
+  { value: "swap", label: "Swap", detail: "show the selected pane" },
+];
 
 function RenderOutputSection({
   settings,
@@ -52,12 +59,16 @@ function RenderOutputSection({
   recordingState,
   recordingProfileId,
   onRecordingProfileChange,
+  comparisonMode,
+  onComparisonModeChange,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
   recordingState: RecordingState;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  comparisonMode: ComparisonMode;
+  onComparisonModeChange: (mode: ComparisonMode) => void;
 }) {
   const activeQualityLabel =
     previewQualityOptions.find((option) => option.value === settings.renderQuality)?.label ??
@@ -83,6 +94,28 @@ function RenderOutputSection({
       <SidebarSectionTrigger icon={GaugeIcon} title="Render Output" value={sectionValue} />
       <AccordionContent className="space-y-3 px-2 pb-3">
         <div className="grid gap-2">
+          <SettingRow label="view">
+            <Tabs
+              value={comparisonMode}
+              onValueChange={(value) => onComparisonModeChange(value as ComparisonMode)}
+              className="gap-0"
+              aria-label="Render view mode"
+            >
+              <TabsList className="grid h-7 w-36 grid-cols-3">
+                {comparisonModeTabs.map((tab) => (
+                  <TabsTrigger
+                    key={tab.value}
+                    value={tab.value}
+                    title={tab.detail}
+                    className="px-1 text-[11px]"
+                  >
+                    {tab.label}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </SettingRow>
+
           <SettingRow label="recording quality">
             <Select
               value={recordingProfileId}
@@ -191,12 +224,16 @@ export function SharedSessionAccordion({
   recordingState,
   recordingProfileId,
   onRecordingProfileChange,
+  comparisonMode,
+  onComparisonModeChange,
 }: {
   settings: RenderSettings;
   onSettingChange: RenderSettingChange<RenderSettings>;
   recordingState: RecordingState;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  comparisonMode: ComparisonMode;
+  onComparisonModeChange: (mode: ComparisonMode) => void;
 }) {
   return (
     <Accordion multiple defaultValue={["scene", "camera", "render"]}>
@@ -208,6 +245,8 @@ export function SharedSessionAccordion({
         recordingState={recordingState}
         recordingProfileId={recordingProfileId}
         onRecordingProfileChange={onRecordingProfileChange}
+        comparisonMode={comparisonMode}
+        onComparisonModeChange={onComparisonModeChange}
       />
     </Accordion>
   );
