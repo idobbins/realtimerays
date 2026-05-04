@@ -24,9 +24,48 @@ import {
 import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 
-export function SidebarHeaderActions() {
-  const [isRecording, setIsRecording] = useState(false);
+export type RecordingState = "idle" | "starting" | "recording" | "stopping";
+
+type SidebarHeaderActionsProps = {
+  recordingState: RecordingState;
+  onToggleRecording: () => void | Promise<void>;
+  onTakeScreenshot: () => void | Promise<void>;
+};
+
+export function SidebarHeaderActions({
+  recordingState,
+  onToggleRecording,
+  onTakeScreenshot,
+}: SidebarHeaderActionsProps) {
   const [screenshotFlashKey, setScreenshotFlashKey] = useState(0);
+  const [isScreenshotting, setIsScreenshotting] = useState(false);
+  const isRecording = recordingState === "recording";
+  const isRecordingBusy = recordingState === "starting" || recordingState === "stopping";
+  const recordLabel =
+    recordingState === "starting"
+      ? "Starting recording"
+      : recordingState === "stopping"
+        ? "Stopping recording"
+        : isRecording
+          ? "Stop recording"
+          : "Record";
+
+  const handleScreenshot = async () => {
+    if (isScreenshotting) {
+      return;
+    }
+
+    setIsScreenshotting(true);
+
+    try {
+      await onTakeScreenshot();
+      setScreenshotFlashKey((key) => key + 1);
+    } catch (error) {
+      console.error("Could not save screenshot.", error);
+    } finally {
+      setIsScreenshotting(false);
+    }
+  };
 
   return (
     <SidebarMenu className="flex-row items-center gap-1">
@@ -76,11 +115,12 @@ export function SidebarHeaderActions() {
           type="button"
           variant="outline"
           size="icon"
-          aria-label={isRecording ? "Stop recording" : "Record"}
+          aria-label={recordLabel}
           aria-pressed={isRecording}
-          title={isRecording ? "Stop recording" : "Record"}
-          data-recording={isRecording}
-          onClick={() => setIsRecording((recording) => !recording)}
+          title={recordLabel}
+          disabled={isRecordingBusy}
+          data-recording={isRecording || recordingState === "starting"}
+          onClick={onToggleRecording}
           className={cn(
             "record-button relative overflow-hidden rounded-md border-sidebar-border bg-sidebar text-sidebar-foreground/70 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
             isRecording &&
@@ -95,9 +135,10 @@ export function SidebarHeaderActions() {
           type="button"
           variant="outline"
           size="icon"
-          aria-label="Screenshot"
-          title="Screenshot"
-          onClick={() => setScreenshotFlashKey((key) => key + 1)}
+          aria-label={isScreenshotting ? "Saving screenshot" : "Screenshot"}
+          title={isScreenshotting ? "Saving screenshot" : "Screenshot"}
+          disabled={isScreenshotting}
+          onClick={handleScreenshot}
           data-flashing={screenshotFlashKey > 0}
           className={cn(
             "relative overflow-hidden rounded-md border-sidebar-border bg-sidebar text-sidebar-foreground/70 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",

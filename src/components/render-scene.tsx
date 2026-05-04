@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 
 import { blitWGSL, pathTracerWGSL } from "@/lib/pathtracer.wgsl";
 import type {
@@ -36,6 +36,11 @@ type Stats = {
   error?: string;
 };
 
+export type RenderSceneHandle = {
+  capturePng: () => Promise<Blob>;
+  captureStream: (fps?: number) => MediaStream;
+};
+
 type CameraBasis = {
   position: [number, number, number];
   forward: [number, number, number];
@@ -66,6 +71,7 @@ type PaneGpuState = {
 
 const uniformBufferSize = 112;
 const displayUniformBufferSize = 16;
+const autoOrbitRadiansPerSecond = 0.22;
 
 const materialTypeIds: Record<SphereMaterial, number> = {
   diffuse: 0,
@@ -125,7 +131,9 @@ function accumulationSignature(settings: RenderSettings) {
 
 function layoutPanes(viewports: RenderViewport[], width: number, height: number) {
   if (viewports.length <= 1) {
-    return [{ renderRect: { x: 0, y: 0, width, height }, displayRect: { x: 0, y: 0, width, height } }];
+    return [
+      { renderRect: { x: 0, y: 0, width, height }, displayRect: { x: 0, y: 0, width, height } },
+    ];
   }
 
   const splitIndex = viewports.findIndex((viewport) => viewport.presentation === "split-left");
@@ -226,7 +234,10 @@ function destroyPane(pane: PaneGpuState) {
   pane.displayUniformBuffer.destroy();
 }
 
-export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
+export const RenderScene = forwardRef<
+  RenderSceneHandle,
+  { viewports: RenderViewport[]; autoOrbit?: boolean; renderEnabled?: boolean }
+>(function RenderScene({ viewports, autoOrbit = false, renderEnabled = true }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [stats, setStats] = useState<Stats>({
     fps: 0,
@@ -240,6 +251,42 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
   const viewportSignatureRef = useRef(new Map<string, string>());
   const dirtyViewportIdsRef = useRef(new Set(viewports.map((viewport) => viewport.id)));
   const resizeRef = useRef<(() => void) | null>(null);
+  const autoOrbitRef = useRef(autoOrbit);
+  const renderEnabledRef = useRef(renderEnabled);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      capturePng: () => {
+        const canvas = canvasRef.current;
+
+        if (!canvas) {
+          return Promise.reject(new Error("Render canvas is not ready."));
+        }
+
+        return new Promise<Blob>((resolve, reject) => {
+          canvas.toBlob((blob) => {
+            if (!blob) {
+              reject(new Error("Could not capture the render canvas."));
+              return;
+            }
+
+            resolve(blob);
+          }, "image/png");
+        });
+      },
+      captureStream: (fps = 60) => {
+        const canvas = canvasRef.current;
+
+        if (!canvas) {
+          throw new Error("Render canvas is not ready.");
+        }
+
+        return canvas.captureStream(fps);
+      },
+    }),
+    [],
+  );
 
   useEffect(() => {
     viewportsRef.current = viewports;
@@ -261,6 +308,14 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
 
     resizeRef.current?.();
   }, [viewports]);
+
+  useEffect(() => {
+    autoOrbitRef.current = autoOrbit;
+  }, [autoOrbit]);
+
+  useEffect(() => {
+    renderEnabledRef.current = renderEnabled;
+  }, [renderEnabled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -588,6 +643,7 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
       const displayUniformData = new Uint32Array(4);
       let fpsFrames = 0;
       let fpsTimer = performance.now();
+      let previousFrameTime = fpsTimer;
 
       const writePaneUniforms = (
         pane: PaneGpuState,
@@ -635,10 +691,29 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
           return;
         }
 
+        const now = performance.now();
+        const deltaSeconds = Math.min(0.05, (now - previousFrameTime) / 1000);
+        previousFrameTime = now;
         const currentViewports = viewportsRef.current;
         if (currentViewports.length === 0) {
           raf = requestAnimationFrame(render);
           return;
+        }
+
+        if (!renderEnabledRef.current) {
+          if (now - fpsTimer > 500) {
+            setStats((current) => ({ ...current, fps: 0 }));
+            fpsTimer = now;
+            fpsFrames = 0;
+          }
+
+          raf = requestAnimationFrame(render);
+          return;
+        }
+
+        if (autoOrbitRef.current && !dragging) {
+          cameraRef.current.yaw += autoOrbitRadiansPerSecond * deltaSeconds;
+          markAllPanesDirty();
         }
 
         const layouts = layoutPanes(currentViewports, width, height);
@@ -700,8 +775,7 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
         renderPass.setPipeline(blitPipeline);
         currentViewports.forEach((viewport) => {
           const pane = paneStates.get(viewport.id);
-          const blitBindGroup =
-            pane?.pingPong === 0 ? pane.blitBindGroupA : pane?.blitBindGroupB;
+          const blitBindGroup = pane?.pingPong === 0 ? pane.blitBindGroupA : pane?.blitBindGroupB;
 
           if (!pane || !blitBindGroup) {
             return;
@@ -733,7 +807,6 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
 
         fpsFrames += 1;
 
-        const now = performance.now();
         if (now - fpsTimer > 500) {
           setStats({
             fps: (fpsFrames * 1000) / (now - fpsTimer),
@@ -806,6 +879,7 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
           ? "text-orange-400"
           : "text-red-400";
   const paneCount = stats.panes.length || viewports.length;
+  const showRenderSurface = stats.supported && renderEnabled;
 
   return (
     <div
@@ -814,7 +888,10 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
     >
       <canvas
         ref={canvasRef}
-        className="block size-full cursor-grab touch-none active:cursor-grabbing"
+        className={cn(
+          "block size-full cursor-grab touch-none active:cursor-grabbing",
+          !showRenderSurface && "invisible",
+        )}
       />
       {!stats.supported ? (
         <div className="absolute inset-0 flex items-center justify-center bg-background/85 p-6 backdrop-blur-sm">
@@ -826,7 +903,7 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
             </p>
           </div>
         </div>
-      ) : (
+      ) : showRenderSurface ? (
         <div className="pointer-events-none absolute inset-0">
           {paneCount > 1 ? (
             <div className="absolute inset-y-0 left-1/2 w-px bg-white/25 shadow-[0_0_0_1px_rgba(0,0,0,0.25)]" />
@@ -869,14 +946,14 @@ export function RenderScene({ viewports }: { viewports: RenderViewport[] }) {
             </div>
           ) : null}
         </div>
-      )}
+      ) : null}
       <div
         aria-hidden="true"
         className={cn(
           "pointer-events-none absolute inset-x-0 bottom-0 h-px bg-white/20",
-          paneCount <= 1 && "hidden",
+          (!showRenderSurface || paneCount <= 1) && "hidden",
         )}
       />
     </div>
   );
-}
+});

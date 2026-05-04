@@ -8,15 +8,30 @@ import {
   SharedSessionAccordion,
   VariantPipelineAccordion,
 } from "@/components/app-sidebar/_components/render-pipeline-accordion";
-import { SidebarHeaderActions } from "@/components/app-sidebar/_components/sidebar-header-actions";
+import {
+  SidebarHeaderActions,
+  type RecordingState,
+} from "@/components/app-sidebar/_components/sidebar-header-actions";
 import { Button } from "@/components/ui/button";
 import { ButtonGroup } from "@/components/ui/button-group";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Sidebar, SidebarContent, SidebarHeader } from "@/components/ui/sidebar";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { recordingProfiles, type RecordingProfileId } from "@/lib/recording-settings";
 import type { ComparisonMode, ComparisonPaneId, RenderSettings } from "@/lib/render-settings";
 import { cn } from "@/lib/utils";
 
 import type { RenderSettingChange } from "./_components/sidebar-section";
+import { SettingRow } from "./_components/setting-row";
 
 type AppSidebarProps = {
   sharedSettings: RenderSettings;
@@ -29,6 +44,15 @@ type AppSidebarProps = {
   onSharedSettingChange: RenderSettingChange<RenderSettings>;
   onVariantSettingChange: RenderSettingChange<RenderSettings>;
   onResetVariantSettings: () => void;
+  recordingState: RecordingState;
+  onToggleRecording: () => void | Promise<void>;
+  onTakeScreenshot: () => void | Promise<void>;
+  recordingProfileId: RecordingProfileId;
+  onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  autoOrbit: boolean;
+  onAutoOrbitChange: (enabled: boolean) => void;
+  renderEnabled: boolean;
+  onRenderEnabledChange: (enabled: boolean) => void;
 };
 
 const comparisonModeOptions: Array<{
@@ -75,6 +99,15 @@ export function AppSidebar({
   onSharedSettingChange,
   onVariantSettingChange,
   onResetVariantSettings,
+  recordingState,
+  onToggleRecording,
+  onTakeScreenshot,
+  recordingProfileId,
+  onRecordingProfileChange,
+  autoOrbit,
+  onAutoOrbitChange,
+  renderEnabled,
+  onRenderEnabledChange,
 }: AppSidebarProps) {
   const [animationDirection, setAnimationDirection] = useState(1);
   const shouldReduceMotion = useReducedMotion();
@@ -90,13 +123,84 @@ export function AppSidebar({
   return (
     <Sidebar collapsible="none" className="hidden h-svh border-r-0 bg-muted/60 md:flex">
       <SidebarHeader className="gap-3 px-3 pt-3 pb-3">
-        <SidebarHeaderActions />
+        <SidebarHeaderActions
+          recordingState={recordingState}
+          onToggleRecording={onToggleRecording}
+          onTakeScreenshot={onTakeScreenshot}
+        />
       </SidebarHeader>
 
       <SidebarContent>
         <div className="px-3 pb-4 pt-1">
           <div className="mb-2 px-2 text-xs text-muted-foreground">
             <span>Shared session</span>
+          </div>
+
+          <div className="mb-2 grid gap-2">
+            <label
+              htmlFor="render-enabled"
+              className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50"
+            >
+              <span className="grid min-w-0 gap-0.5">
+                <span className="truncate">Rendering</span>
+                <span className="truncate text-[10px] text-muted-foreground">
+                  {renderEnabled ? "active" : "paused"}
+                </span>
+              </span>
+              <Switch
+                id="render-enabled"
+                size="sm"
+                checked={renderEnabled}
+                onCheckedChange={onRenderEnabledChange}
+                aria-label="Rendering"
+              />
+            </label>
+
+            <label
+              htmlFor="auto-orbit-camera"
+              className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/50"
+            >
+              <span className="grid min-w-0 gap-0.5">
+                <span className="truncate">Auto orbit camera</span>
+                <span className="truncate text-[10px] text-muted-foreground">
+                  {autoOrbit ? "rotating view" : "manual view"}
+                </span>
+              </span>
+              <Switch
+                id="auto-orbit-camera"
+                size="sm"
+                checked={autoOrbit}
+                onCheckedChange={onAutoOrbitChange}
+                aria-label="Auto orbit camera"
+              />
+            </label>
+
+            <SettingRow label="recording quality">
+              <Select
+                value={recordingProfileId}
+                onValueChange={(value) => onRecordingProfileChange(value as RecordingProfileId)}
+                disabled={recordingState !== "idle"}
+              >
+                <SelectTrigger size="sm" className="h-7 w-36 bg-background/60 text-[11px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                  <SelectGroup>
+                    <SelectLabel>Recording quality</SelectLabel>
+                    {recordingProfiles.map((profile) => (
+                      <SelectItem
+                        key={profile.id}
+                        value={profile.id}
+                        title={profile.detail}
+                        className="text-xs"
+                      >
+                        {profile.menuLabel}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </SettingRow>
           </div>
 
           <SharedSessionAccordion
