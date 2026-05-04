@@ -1,16 +1,28 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type Dispatch, type SetStateAction } from "react";
 import {
+  ApertureIcon,
+  BoxesIcon,
   CameraIcon,
   ChevronDownIcon,
   CircleDotIcon,
+  ContrastIcon,
+  GaugeIcon,
   Layers3Icon,
   LogOutIcon,
+  RotateCcwIcon,
+  SettingsIcon,
+  SparklesIcon,
   UserPlusIcon,
 } from "lucide-react";
 
-import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,6 +33,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
 import {
   Select,
   SelectContent,
@@ -38,31 +51,49 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
-import { CameraModeInfo } from "@/components/app-sidebar/_components/camera-mode-info";
-import { SettingGroups } from "@/components/app-sidebar/_components/setting-groups";
-import {
-  cameraModes,
-  getInitialActiveOptions,
-  getInitialSettingValues,
-  pipelineSectionSettingGroups,
-  pipelineSections,
-} from "@/lib/pipeline-data";
-import type { CameraSettingValue } from "@/lib/pipeline-types";
+import { defaultRenderSettings, type RenderSettings } from "@/lib/render-settings";
 import { cn } from "@/lib/utils";
 
-export function AppSidebar() {
-  const [activeOptions, setActiveOptions] =
-    useState<Record<string, string>>(getInitialActiveOptions);
-  const [settingValues, setSettingValues] =
-    useState<Record<string, CameraSettingValue>>(getInitialSettingValues);
+const pixelBudgetOptions = [
+  { label: "0.4 MP", value: 400_000 },
+  { label: "0.8 MP", value: 800_000 },
+  { label: "1.6 MP", value: 1_600_000 },
+  { label: "2.4 MP", value: 2_400_000 },
+];
+
+type AppSidebarProps = {
+  settings: RenderSettings;
+  onSettingsChange: Dispatch<SetStateAction<RenderSettings>>;
+};
+
+function SettingRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex min-h-8 items-center justify-between gap-3 rounded-md px-2 py-1 text-[12px] text-sidebar-foreground/80 transition-colors hover:bg-sidebar-accent/60">
+      <span className="min-w-0 flex-1 truncate" title={label}>
+        {label}
+      </span>
+      {children}
+    </div>
+  );
+}
+
+function Readout({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="max-w-34 truncate text-right text-[11px] text-muted-foreground">
+      {children}
+    </span>
+  );
+}
+
+export function AppSidebar({ settings, onSettingsChange }: AppSidebarProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [screenshotFlashKey, setScreenshotFlashKey] = useState(0);
 
-  const updateSetting = (settingId: string, value: CameraSettingValue) => {
-    setSettingValues((current) => ({
-      ...current,
-      [settingId]: value,
-    }));
+  const updateSetting = <Key extends keyof RenderSettings>(
+    key: Key,
+    value: RenderSettings[Key],
+  ) => {
+    onSettingsChange((current) => ({ ...current, [key]: value }));
   };
 
   return (
@@ -87,6 +118,10 @@ export function AppSidebar() {
               </DropdownMenuTrigger>
               <DropdownMenuContent side="bottom" align="start" className="w-48 p-1.5">
                 <DropdownMenuGroup>
+                  <DropdownMenuItem>
+                    <SettingsIcon />
+                    <span>User settings</span>
+                  </DropdownMenuItem>
                   <DropdownMenuItem>
                     <Layers3Icon />
                     <span>Pipeline presets</span>
@@ -153,150 +188,191 @@ export function AppSidebar() {
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
+
       <SidebarContent>
         <div className="px-3 pb-4 pt-1">
           <div className="mb-2 px-2 text-xs text-muted-foreground">
             <span>Render pipeline</span>
           </div>
 
-          <Accordion multiple defaultValue={["camera"]}>
-            {pipelineSections.map((section) => {
-              const activeOption = activeOptions[section.id];
-              const activeCameraMode =
-                section.id === "camera"
-                  ? (cameraModes.find((mode) => mode.label === activeOption) ?? cameraModes[0])
-                  : undefined;
-              const settingGroups =
-                activeCameraMode?.settingGroups ?? pipelineSectionSettingGroups[section.id] ?? [];
-
-              return (
-                <AccordionItem
-                  key={section.id}
-                  value={section.id}
-                  className="border-b border-sidebar-border/70 last:border-b-0"
-                >
-                  <AccordionTrigger className="min-h-9 gap-2 rounded-md px-2 py-1.5 text-sidebar-foreground hover:bg-sidebar-accent hover:no-underline">
-                    <span className="flex min-w-0 flex-1 items-center gap-2">
-                      <section.icon className="size-3.5 shrink-0 text-sidebar-foreground/55" />
-                      <span className="min-w-0 flex-1 truncate text-[13px]">{section.title}</span>
-                      <span className="max-w-34 truncate text-[11px] font-normal text-muted-foreground">
-                        {activeOption}
-                      </span>
+          <Accordion multiple defaultValue={["camera", "render"]}>
+            <AccordionItem value="camera" className="border-b border-sidebar-border/70">
+              <AccordionTrigger className="min-h-9 gap-2 rounded-md px-2 py-1.5 text-sidebar-foreground hover:bg-sidebar-accent hover:no-underline">
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                  <ApertureIcon className="size-3.5 shrink-0 text-sidebar-foreground/55" />
+                  <span className="min-w-0 flex-1 truncate text-[13px]">Camera</span>
+                  <span className="max-w-34 truncate text-[11px] font-normal text-muted-foreground">
+                    Pinhole
+                  </span>
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="space-y-3 px-2 pb-3">
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      Uniforms
                     </span>
-                  </AccordionTrigger>
-                  <AccordionContent className="space-y-3 px-2 pb-3">
-                    {activeCameraMode ? (
-                      <>
-                        <div className="grid gap-1.5">
-                          <span className="text-[11px] font-medium text-muted-foreground">
-                            Camera type
-                          </span>
-                          <DropdownMenu>
-                            <DropdownMenuTrigger
-                              render={
-                                <button
-                                  type="button"
-                                  className="flex min-h-10 w-full cursor-pointer items-center gap-2 rounded-md border border-sidebar-border bg-background/75 px-2 py-1.5 text-left text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:border-ring focus-visible:outline-none"
-                                />
-                              }
+                    <span className="text-[10px] text-muted-foreground">cam + fov</span>
+                  </div>
+                  <SettingRow label="camera type">
+                    <Readout>pinhole</Readout>
+                  </SettingRow>
+                  <SettingRow label="vertical field of view">
+                    <span className="flex shrink-0 items-center gap-1">
+                      <Input
+                        type="number"
+                        min={20}
+                        max={120}
+                        step={1}
+                        value={settings.fovDegrees}
+                        onChange={(event) => {
+                          updateSetting(
+                            "fovDegrees",
+                            Math.max(20, Math.min(120, Number(event.currentTarget.value) || 20)),
+                          );
+                        }}
+                        className="h-7 w-20 bg-background/60 px-2 text-right text-[11px]"
+                        aria-label="Vertical field of view"
+                      />
+                      <span className="w-6 text-[10px] text-muted-foreground">deg</span>
+                    </span>
+                  </SettingRow>
+                  <SettingRow label="camera pose">
+                    <Readout>orbit viewport</Readout>
+                  </SettingRow>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+
+            <AccordionItem value="scene" className="border-b border-sidebar-border/70">
+              <AccordionTrigger className="min-h-9 gap-2 rounded-md px-2 py-1.5 text-sidebar-foreground hover:bg-sidebar-accent hover:no-underline">
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                  <BoxesIcon className="size-3.5 shrink-0 text-sidebar-foreground/55" />
+                  <span className="min-w-0 flex-1 truncate text-[13px]">Scene</span>
+                  <span className="max-w-34 truncate text-[11px] font-normal text-muted-foreground">
+                    fixed spheres
+                  </span>
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="space-y-3 px-2 pb-3">
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      Shader storage
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">read-only</span>
+                  </div>
+                  <SettingRow label="geometry">
+                    <Readout>6 spheres + plane</Readout>
+                  </SettingRow>
+                  <SettingRow label="materials">
+                    <Readout>diffuse, metal, glass, emissive</Readout>
+                  </SettingRow>
+                  <SettingRow label="sky light">
+                    <Readout>fixed gradient sun</Readout>
+                  </SettingRow>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+
+            <AccordionItem value="sampling" className="border-b border-sidebar-border/70">
+              <AccordionTrigger className="min-h-9 gap-2 rounded-md px-2 py-1.5 text-sidebar-foreground hover:bg-sidebar-accent hover:no-underline">
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                  <SparklesIcon className="size-3.5 shrink-0 text-sidebar-foreground/55" />
+                  <span className="min-w-0 flex-1 truncate text-[13px]">Sampling</span>
+                  <span className="max-w-34 truncate text-[11px] font-normal text-muted-foreground">
+                    progressive
+                  </span>
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="space-y-3 px-2 pb-3">
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      Path tracer
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">hardcoded</span>
+                  </div>
+                  <SettingRow label="samples per dispatch">
+                    <Readout>1 spp</Readout>
+                  </SettingRow>
+                  <SettingRow label="max bounces">
+                    <Readout>4</Readout>
+                  </SettingRow>
+                  <SettingRow label="accumulation">
+                    <Readout>progressive average</Readout>
+                  </SettingRow>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
+
+            <AccordionItem
+              value="render"
+              className="border-b border-sidebar-border/70 last:border-b-0"
+            >
+              <AccordionTrigger className="min-h-9 gap-2 rounded-md px-2 py-1.5 text-sidebar-foreground hover:bg-sidebar-accent hover:no-underline">
+                <span className="flex min-w-0 flex-1 items-center gap-2">
+                  <GaugeIcon className="size-3.5 shrink-0 text-sidebar-foreground/55" />
+                  <span className="min-w-0 flex-1 truncate text-[13px]">Render Output</span>
+                  <span className="max-w-34 truncate text-[11px] font-normal text-muted-foreground">
+                    {pixelBudgetOptions.find((option) => option.value === settings.maxPixels)
+                      ?.label ?? `${Math.round(settings.maxPixels / 1000)}k px`}
+                  </span>
+                </span>
+              </AccordionTrigger>
+              <AccordionContent className="space-y-3 px-2 pb-3">
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      Target
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">renderer config</span>
+                  </div>
+                  <SettingRow label="render pixel budget">
+                    <Select
+                      value={String(settings.maxPixels)}
+                      onValueChange={(value) => updateSetting("maxPixels", Number(value))}
+                    >
+                      <SelectTrigger size="sm" className="h-7 w-24 bg-background/60 text-[11px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent align="end">
+                        <SelectGroup>
+                          <SelectLabel>Render pixel budget</SelectLabel>
+                          {pixelBudgetOptions.map((option) => (
+                            <SelectItem
+                              key={option.value}
+                              value={String(option.value)}
+                              className="text-xs"
                             >
-                              <span className="flex min-w-0 flex-1 items-center gap-1.5">
-                                <span className="min-w-0 truncate text-[12px] font-medium">
-                                  {activeCameraMode.label}
-                                </span>
-                                <CameraModeInfo description={activeCameraMode.description} />
-                              </span>
-                              <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="start" className="max-h-80 w-72">
-                              <DropdownMenuGroup>
-                                {cameraModes.map((mode) => {
-                                  const selected = activeOption === mode.label;
-
-                                  return (
-                                    <DropdownMenuItem
-                                      key={mode.label}
-                                      data-selected={selected}
-                                      onClick={() => {
-                                        setActiveOptions((current) => ({
-                                          ...current,
-                                          [section.id]: mode.label,
-                                        }));
-                                      }}
-                                      className="gap-2 py-1.5 text-xs data-[selected=true]:bg-accent/70 data-[selected=true]:text-accent-foreground"
-                                    >
-                                      <span
-                                        aria-hidden="true"
-                                        data-selected={selected}
-                                        className="size-1.5 shrink-0 rounded-full bg-transparent data-[selected=true]:bg-current"
-                                      />
-                                      <span className="flex min-w-0 flex-1 items-center gap-1.5">
-                                        <span className="min-w-0 truncate font-medium">
-                                          {mode.label}
-                                        </span>
-                                        <CameraModeInfo description={mode.description} />
-                                      </span>
-                                    </DropdownMenuItem>
-                                  );
-                                })}
-                              </DropdownMenuGroup>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        </div>
-
-                        <SettingGroups
-                          groups={settingGroups}
-                          values={settingValues}
-                          onSettingChange={updateSetting}
-                        />
-                      </>
-                    ) : (
-                      <>
-                        <div className="grid gap-1.5">
-                          <span className="text-[11px] font-medium text-muted-foreground">
-                            {section.activeLabel}
-                          </span>
-                          <Select
-                            value={activeOption}
-                            onValueChange={(option) => {
-                              if (option === null) {
-                                return;
-                              }
-
-                              setActiveOptions((current) => ({
-                                ...current,
-                                [section.id]: option,
-                              }));
-                            }}
-                          >
-                            <SelectTrigger size="sm" className="w-full bg-background/60 text-xs">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent align="start" className="max-h-72">
-                              <SelectGroup>
-                                <SelectLabel>{section.activeLabel}</SelectLabel>
-                                {section.selectOptions.map((option) => (
-                                  <SelectItem key={option} value={option} className="text-xs">
-                                    {option}
-                                  </SelectItem>
-                                ))}
-                              </SelectGroup>
-                            </SelectContent>
-                          </Select>
-                        </div>
-
-                        <SettingGroups
-                          groups={settingGroups}
-                          values={settingValues}
-                          onSettingChange={updateSetting}
-                        />
-                      </>
-                    )}
-                  </AccordionContent>
-                </AccordionItem>
-              );
-            })}
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </SettingRow>
+                  <SettingRow label="tone map">
+                    <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                      <ContrastIcon className="size-3" />
+                      Reinhard + gamma
+                    </span>
+                  </SettingRow>
+                </div>
+              </AccordionContent>
+            </AccordionItem>
           </Accordion>
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onSettingsChange(defaultRenderSettings)}
+            className="mt-3 w-full justify-start rounded-md border-sidebar-border bg-sidebar text-xs text-sidebar-foreground/75 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+          >
+            <RotateCcwIcon className="size-3.5" />
+            Reset path tracer settings
+          </Button>
         </div>
       </SidebarContent>
     </Sidebar>
