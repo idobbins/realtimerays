@@ -5,8 +5,10 @@ import {
   ApertureIcon,
   BoxesIcon,
   BugIcon,
+  CameraIcon,
   ChevronDownIcon,
   ContrastIcon,
+  CircleDotIcon,
   FolderOpenIcon,
   FrameIcon,
   GitBranchIcon,
@@ -31,6 +33,7 @@ import {
 } from "@/components/ui/accordion";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -59,6 +62,7 @@ import {
 } from "@/components/ui/sidebar";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 type OptionGroup = {
   title: string;
@@ -165,8 +169,18 @@ const cameraModes: CameraMode[] = [
       {
         title: "Pose",
         settings: [
-          { id: "pinhole-position", label: "position", control: "text", defaultValue: "3.1, 2.1, 5.7" },
-          { id: "pinhole-target", label: "look target", control: "text", defaultValue: "0, 0.85, 0" },
+          {
+            id: "pinhole-position",
+            label: "position",
+            control: "text",
+            defaultValue: "3.1, 2.1, 5.7",
+          },
+          {
+            id: "pinhole-target",
+            label: "look target",
+            control: "text",
+            defaultValue: "0, 0.85, 0",
+          },
           {
             id: "pinhole-up",
             label: "up vector",
@@ -200,14 +214,33 @@ const cameraModes: CameraMode[] = [
             defaultValue: "16:9",
             options: ["1:1", "4:3", "16:9", "21:9"],
           },
-          { id: "ortho-near", label: "near clip", control: "number", defaultValue: 0.1, min: 0.01, step: 0.01 },
-          { id: "ortho-far", label: "far clip", control: "number", defaultValue: 100, min: 1, step: 1 },
+          {
+            id: "ortho-near",
+            label: "near clip",
+            control: "number",
+            defaultValue: 0.1,
+            min: 0.01,
+            step: 0.01,
+          },
+          {
+            id: "ortho-far",
+            label: "far clip",
+            control: "number",
+            defaultValue: 100,
+            min: 1,
+            step: 1,
+          },
         ],
       },
       {
         title: "Pose",
         settings: [
-          { id: "ortho-position", label: "position", control: "text", defaultValue: "3.1, 2.1, 5.7" },
+          {
+            id: "ortho-position",
+            label: "position",
+            control: "text",
+            defaultValue: "3.1, 2.1, 5.7",
+          },
           {
             id: "ortho-direction",
             label: "look direction",
@@ -215,7 +248,13 @@ const cameraModes: CameraMode[] = [
             defaultValue: "-Z",
             options: ["-Z", "+Z", "-X", "+X", "-Y", "+Y"],
           },
-          { id: "ortho-up", label: "up vector", control: "select", defaultValue: "+Y", options: ["+Y", "+Z"] },
+          {
+            id: "ortho-up",
+            label: "up vector",
+            control: "select",
+            defaultValue: "+Y",
+            options: ["+Y", "+Z"],
+          },
         ],
       },
     ],
@@ -227,8 +266,25 @@ const cameraModes: CameraMode[] = [
       {
         title: "Projection",
         settings: [
-          { id: "thin-fov", label: "vertical field of view", control: "number", defaultValue: 34, min: 1, max: 179, step: 1, suffix: "deg" },
-          { id: "thin-focal-length", label: "focal length", control: "number", defaultValue: 50, min: 1, step: 1, suffix: "mm" },
+          {
+            id: "thin-fov",
+            label: "vertical field of view",
+            control: "number",
+            defaultValue: 34,
+            min: 1,
+            max: 179,
+            step: 1,
+            suffix: "deg",
+          },
+          {
+            id: "thin-focal-length",
+            label: "focal length",
+            control: "number",
+            defaultValue: 50,
+            min: 1,
+            step: 1,
+            suffix: "mm",
+          },
           {
             id: "thin-sensor-fit",
             label: "sensor fit",
@@ -241,10 +297,42 @@ const cameraModes: CameraMode[] = [
       {
         title: "Lens",
         settings: [
-          { id: "thin-aperture-radius", label: "aperture radius", control: "number", defaultValue: 0.04, min: 0, step: 0.01 },
-          { id: "thin-focus-distance", label: "focus distance", control: "number", defaultValue: 5, min: 0.1, step: 0.1, suffix: "m" },
-          { id: "thin-aperture-blades", label: "aperture blades", control: "number", defaultValue: 7, min: 3, max: 16, step: 1 },
-          { id: "thin-bokeh-rotation", label: "bokeh rotation", control: "number", defaultValue: 0, min: 0, max: 360, step: 1, suffix: "deg" },
+          {
+            id: "thin-aperture-radius",
+            label: "aperture radius",
+            control: "number",
+            defaultValue: 0.04,
+            min: 0,
+            step: 0.01,
+          },
+          {
+            id: "thin-focus-distance",
+            label: "focus distance",
+            control: "number",
+            defaultValue: 5,
+            min: 0.1,
+            step: 0.1,
+            suffix: "m",
+          },
+          {
+            id: "thin-aperture-blades",
+            label: "aperture blades",
+            control: "number",
+            defaultValue: 7,
+            min: 3,
+            max: 16,
+            step: 1,
+          },
+          {
+            id: "thin-bokeh-rotation",
+            label: "bokeh rotation",
+            control: "number",
+            defaultValue: 0,
+            min: 0,
+            max: 360,
+            step: 1,
+            suffix: "deg",
+          },
         ],
       },
     ],
@@ -263,7 +351,16 @@ const cameraModes: CameraMode[] = [
             defaultValue: "equidistant",
             options: ["equidistant", "equisolid", "orthographic", "stereographic"],
           },
-          { id: "fisheye-fov", label: "field of view", control: "number", defaultValue: 180, min: 1, max: 360, step: 1, suffix: "deg" },
+          {
+            id: "fisheye-fov",
+            label: "field of view",
+            control: "number",
+            defaultValue: 180,
+            min: 1,
+            max: 360,
+            step: 1,
+            suffix: "deg",
+          },
           { id: "fisheye-crop", label: "image circle crop", control: "toggle", defaultValue: true },
         ],
       },
@@ -271,8 +368,23 @@ const cameraModes: CameraMode[] = [
         title: "Pose",
         settings: [
           { id: "fisheye-position", label: "position", control: "text", defaultValue: "0, 1.5, 0" },
-          { id: "fisheye-direction", label: "look direction", control: "select", defaultValue: "-Z", options: ["-Z", "+Z", "-X", "+X"] },
-          { id: "fisheye-roll", label: "roll", control: "number", defaultValue: 0, min: -180, max: 180, step: 1, suffix: "deg" },
+          {
+            id: "fisheye-direction",
+            label: "look direction",
+            control: "select",
+            defaultValue: "-Z",
+            options: ["-Z", "+Z", "-X", "+X"],
+          },
+          {
+            id: "fisheye-roll",
+            label: "roll",
+            control: "number",
+            defaultValue: 0,
+            min: -180,
+            max: 180,
+            step: 1,
+            suffix: "deg",
+          },
         ],
       },
     ],
@@ -284,17 +396,62 @@ const cameraModes: CameraMode[] = [
       {
         title: "Coverage",
         settings: [
-          { id: "eq-horizontal", label: "horizontal coverage", control: "number", defaultValue: 360, min: 1, max: 360, step: 1, suffix: "deg" },
-          { id: "eq-vertical", label: "vertical coverage", control: "number", defaultValue: 180, min: 1, max: 180, step: 1, suffix: "deg" },
-          { id: "eq-seam", label: "seam longitude", control: "number", defaultValue: 0, min: -180, max: 180, step: 1, suffix: "deg" },
+          {
+            id: "eq-horizontal",
+            label: "horizontal coverage",
+            control: "number",
+            defaultValue: 360,
+            min: 1,
+            max: 360,
+            step: 1,
+            suffix: "deg",
+          },
+          {
+            id: "eq-vertical",
+            label: "vertical coverage",
+            control: "number",
+            defaultValue: 180,
+            min: 1,
+            max: 180,
+            step: 1,
+            suffix: "deg",
+          },
+          {
+            id: "eq-seam",
+            label: "seam longitude",
+            control: "number",
+            defaultValue: 0,
+            min: -180,
+            max: 180,
+            step: 1,
+            suffix: "deg",
+          },
         ],
       },
       {
         title: "Pose",
         settings: [
           { id: "eq-position", label: "position", control: "text", defaultValue: "0, 1.5, 0" },
-          { id: "eq-heading", label: "heading", control: "number", defaultValue: 0, min: -180, max: 180, step: 1, suffix: "deg" },
-          { id: "eq-pitch", label: "pitch", control: "number", defaultValue: 0, min: -90, max: 90, step: 1, suffix: "deg" },
+          {
+            id: "eq-heading",
+            label: "heading",
+            control: "number",
+            defaultValue: 0,
+            min: -180,
+            max: 180,
+            step: 1,
+            suffix: "deg",
+          },
+          {
+            id: "eq-pitch",
+            label: "pitch",
+            control: "number",
+            defaultValue: 0,
+            min: -90,
+            max: 90,
+            step: 1,
+            suffix: "deg",
+          },
         ],
       },
     ],
@@ -320,7 +477,12 @@ const cameraModes: CameraMode[] = [
             defaultValue: "+X -X +Y -Y +Z -Z",
             options: ["+X -X +Y -Y +Z -Z", "+X -X +Z -Z +Y -Y"],
           },
-          { id: "cube-seam-fixup", label: "edge seam fixup", control: "toggle", defaultValue: true },
+          {
+            id: "cube-seam-fixup",
+            label: "edge seam fixup",
+            control: "toggle",
+            defaultValue: true,
+          },
         ],
       },
       {
@@ -345,8 +507,24 @@ const cameraModes: CameraMode[] = [
       {
         title: "Rig",
         settings: [
-          { id: "stereo-eye-separation", label: "eye separation", control: "number", defaultValue: 0.064, min: 0, step: 0.001, suffix: "m" },
-          { id: "stereo-convergence", label: "convergence distance", control: "number", defaultValue: 10, min: 0.1, step: 0.1, suffix: "m" },
+          {
+            id: "stereo-eye-separation",
+            label: "eye separation",
+            control: "number",
+            defaultValue: 0.064,
+            min: 0,
+            step: 0.001,
+            suffix: "m",
+          },
+          {
+            id: "stereo-convergence",
+            label: "convergence distance",
+            control: "number",
+            defaultValue: 10,
+            min: 0.1,
+            step: 0.1,
+            suffix: "m",
+          },
           {
             id: "stereo-projection",
             label: "per-eye projection",
@@ -366,7 +544,14 @@ const cameraModes: CameraMode[] = [
             defaultValue: "none",
             options: ["none", "OpenXR", "custom"],
           },
-          { id: "stereo-ipd-offset", label: "interpupillary offset", control: "number", defaultValue: 0, step: 0.001, suffix: "m" },
+          {
+            id: "stereo-ipd-offset",
+            label: "interpupillary offset",
+            control: "number",
+            defaultValue: 0,
+            step: 0.001,
+            suffix: "m",
+          },
           {
             id: "stereo-layout",
             label: "view layout",
@@ -385,8 +570,24 @@ const cameraModes: CameraMode[] = [
       {
         title: "Projection",
         settings: [
-          { id: "oblique-scale", label: "orthographic scale", control: "number", defaultValue: 4, min: 0.1, step: 0.1 },
-          { id: "oblique-shear", label: "shear angle", control: "number", defaultValue: 45, min: 0, max: 89, step: 1, suffix: "deg" },
+          {
+            id: "oblique-scale",
+            label: "orthographic scale",
+            control: "number",
+            defaultValue: 4,
+            min: 0.1,
+            step: 0.1,
+          },
+          {
+            id: "oblique-shear",
+            label: "shear angle",
+            control: "number",
+            defaultValue: 45,
+            min: 0,
+            max: 89,
+            step: 1,
+            suffix: "deg",
+          },
           {
             id: "oblique-axis",
             label: "receding axis",
@@ -399,8 +600,22 @@ const cameraModes: CameraMode[] = [
       {
         title: "Clipping",
         settings: [
-          { id: "oblique-near", label: "near clip", control: "number", defaultValue: 0.1, min: 0.01, step: 0.01 },
-          { id: "oblique-far", label: "far clip", control: "number", defaultValue: 100, min: 1, step: 1 },
+          {
+            id: "oblique-near",
+            label: "near clip",
+            control: "number",
+            defaultValue: 0.1,
+            min: 0.01,
+            step: 0.01,
+          },
+          {
+            id: "oblique-far",
+            label: "far clip",
+            control: "number",
+            defaultValue: 100,
+            min: 1,
+            step: 1,
+          },
         ],
       },
     ],
@@ -412,7 +627,14 @@ const cameraModes: CameraMode[] = [
       {
         title: "Projection",
         settings: [
-          { id: "iso-scale", label: "orthographic scale", control: "number", defaultValue: 4, min: 0.1, step: 0.1 },
+          {
+            id: "iso-scale",
+            label: "orthographic scale",
+            control: "number",
+            defaultValue: 4,
+            min: 0.1,
+            step: 0.1,
+          },
           {
             id: "iso-orientation",
             label: "isometric orientation",
@@ -426,8 +648,22 @@ const cameraModes: CameraMode[] = [
       {
         title: "Clipping",
         settings: [
-          { id: "iso-near", label: "near clip", control: "number", defaultValue: 0.1, min: 0.01, step: 0.01 },
-          { id: "iso-far", label: "far clip", control: "number", defaultValue: 100, min: 1, step: 1 },
+          {
+            id: "iso-near",
+            label: "near clip",
+            control: "number",
+            defaultValue: 0.1,
+            min: 0.01,
+            step: 0.01,
+          },
+          {
+            id: "iso-far",
+            label: "far clip",
+            control: "number",
+            defaultValue: 100,
+            min: 1,
+            step: 1,
+          },
         ],
       },
     ],
@@ -439,8 +675,22 @@ const cameraModes: CameraMode[] = [
       {
         title: "Shutter",
         settings: [
-          { id: "motion-shutter-open", label: "shutter open", control: "number", defaultValue: 0, min: 0, step: 0.01 },
-          { id: "motion-shutter-close", label: "shutter close", control: "number", defaultValue: 0.5, min: 0, step: 0.01 },
+          {
+            id: "motion-shutter-open",
+            label: "shutter open",
+            control: "number",
+            defaultValue: 0,
+            min: 0,
+            step: 0.01,
+          },
+          {
+            id: "motion-shutter-close",
+            label: "shutter close",
+            control: "number",
+            defaultValue: 0.5,
+            min: 0,
+            step: 0.01,
+          },
           {
             id: "motion-time-distribution",
             label: "sample time distribution",
@@ -467,7 +717,14 @@ const cameraModes: CameraMode[] = [
             defaultValue: "none",
             options: ["none", "top to bottom", "left to right"],
           },
-          { id: "motion-rolling-duration", label: "rolling shutter duration", control: "number", defaultValue: 0, min: 0, step: 0.01 },
+          {
+            id: "motion-rolling-duration",
+            label: "rolling shutter duration",
+            control: "number",
+            defaultValue: 0,
+            min: 0,
+            step: 0.01,
+          },
         ],
       },
     ],
@@ -479,7 +736,15 @@ const cameraModes: CameraMode[] = [
       {
         title: "Body",
         settings: [
-          { id: "physical-focal-length", label: "focal length", control: "number", defaultValue: 50, min: 1, step: 1, suffix: "mm" },
+          {
+            id: "physical-focal-length",
+            label: "focal length",
+            control: "number",
+            defaultValue: 50,
+            min: 1,
+            step: 1,
+            suffix: "mm",
+          },
           {
             id: "physical-sensor-size",
             label: "sensor size",
@@ -494,13 +759,27 @@ const cameraModes: CameraMode[] = [
             defaultValue: "horizontal",
             options: ["horizontal", "vertical", "fill", "overscan"],
           },
-          { id: "physical-crop-factor", label: "crop factor", control: "number", defaultValue: 1, min: 0.1, step: 0.1 },
+          {
+            id: "physical-crop-factor",
+            label: "crop factor",
+            control: "number",
+            defaultValue: 1,
+            min: 0.1,
+            step: 0.1,
+          },
         ],
       },
       {
         title: "Exposure",
         settings: [
-          { id: "physical-fstop", label: "f-stop", control: "number", defaultValue: 2.8, min: 0.7, step: 0.1 },
+          {
+            id: "physical-fstop",
+            label: "f-stop",
+            control: "number",
+            defaultValue: 2.8,
+            min: 0.7,
+            step: 0.1,
+          },
           {
             id: "physical-shutter-speed",
             label: "shutter speed",
@@ -508,7 +787,14 @@ const cameraModes: CameraMode[] = [
             defaultValue: "1/125",
             options: ["1/30", "1/60", "1/125", "1/250", "1/500"],
           },
-          { id: "physical-iso", label: "ISO-like exposure", control: "number", defaultValue: 100, min: 25, step: 25 },
+          {
+            id: "physical-iso",
+            label: "ISO-like exposure",
+            control: "number",
+            defaultValue: 100,
+            min: 25,
+            step: 25,
+          },
         ],
       },
     ],
@@ -1186,7 +1472,14 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
       title: "Placement",
       settings: [
         { id: "geometry-transform", label: "transform", control: "text", defaultValue: "0, 0, 0" },
-        { id: "geometry-scale", label: "scale", control: "number", defaultValue: 1, min: 0.01, step: 0.1 },
+        {
+          id: "geometry-scale",
+          label: "scale",
+          control: "number",
+          defaultValue: 1,
+          min: 0.01,
+          step: 0.1,
+        },
         {
           id: "geometry-motion",
           label: "motion",
@@ -1199,9 +1492,28 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Shape",
       settings: [
-        { id: "geometry-radius", label: "radius / extent", control: "number", defaultValue: 1, min: 0, step: 0.1 },
-        { id: "geometry-segments", label: "segments", control: "number", defaultValue: 32, min: 3, step: 1 },
-        { id: "geometry-visible-to-camera", label: "visible to camera", control: "toggle", defaultValue: true },
+        {
+          id: "geometry-radius",
+          label: "radius / extent",
+          control: "number",
+          defaultValue: 1,
+          min: 0,
+          step: 0.1,
+        },
+        {
+          id: "geometry-segments",
+          label: "segments",
+          control: "number",
+          defaultValue: 32,
+          min: 3,
+          step: 1,
+        },
+        {
+          id: "geometry-visible-to-camera",
+          label: "visible to camera",
+          control: "toggle",
+          defaultValue: true,
+        },
       ],
     },
   ],
@@ -1216,15 +1528,45 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
           defaultValue: "neutral gray",
           options: ["neutral gray", "warm white", "copper", "glass blue", "emissive white"],
         },
-        { id: "material-roughness", label: "roughness", control: "number", defaultValue: 0.45, min: 0, max: 1, step: 0.01 },
-        { id: "material-metallic", label: "metallic", control: "number", defaultValue: 0, min: 0, max: 1, step: 0.01 },
+        {
+          id: "material-roughness",
+          label: "roughness",
+          control: "number",
+          defaultValue: 0.45,
+          min: 0,
+          max: 1,
+          step: 0.01,
+        },
+        {
+          id: "material-metallic",
+          label: "metallic",
+          control: "number",
+          defaultValue: 0,
+          min: 0,
+          max: 1,
+          step: 0.01,
+        },
       ],
     },
     {
       title: "Transport",
       settings: [
-        { id: "material-ior", label: "index of refraction", control: "number", defaultValue: 1.5, min: 1, step: 0.01 },
-        { id: "material-emission", label: "emission strength", control: "number", defaultValue: 0, min: 0, step: 0.1 },
+        {
+          id: "material-ior",
+          label: "index of refraction",
+          control: "number",
+          defaultValue: 1.5,
+          min: 1,
+          step: 0.01,
+        },
+        {
+          id: "material-emission",
+          label: "emission strength",
+          control: "number",
+          defaultValue: 0,
+          min: 0,
+          step: 0.1,
+        },
       ],
     },
   ],
@@ -1232,7 +1574,14 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Emission",
       settings: [
-        { id: "light-intensity", label: "intensity", control: "number", defaultValue: 4, min: 0, step: 0.1 },
+        {
+          id: "light-intensity",
+          label: "intensity",
+          control: "number",
+          defaultValue: 4,
+          min: 0,
+          step: 0.1,
+        },
         {
           id: "light-color",
           label: "color",
@@ -1240,13 +1589,27 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
           defaultValue: "white",
           options: ["white", "warm", "cool", "sky", "custom"],
         },
-        { id: "light-size", label: "size / radius", control: "number", defaultValue: 1, min: 0, step: 0.1 },
+        {
+          id: "light-size",
+          label: "size / radius",
+          control: "number",
+          defaultValue: 1,
+          min: 0,
+          step: 0.1,
+        },
       ],
     },
     {
       title: "Sampling",
       settings: [
-        { id: "light-samples", label: "samples", control: "number", defaultValue: 1, min: 1, step: 1 },
+        {
+          id: "light-samples",
+          label: "samples",
+          control: "number",
+          defaultValue: 1,
+          min: 1,
+          step: 1,
+        },
         { id: "light-cast-shadows", label: "cast shadows", control: "toggle", defaultValue: true },
       ],
     },
@@ -1255,7 +1618,12 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Source",
       settings: [
-        { id: "loader-path", label: "asset path", control: "text", defaultValue: "/scenes/demo.glb" },
+        {
+          id: "loader-path",
+          label: "asset path",
+          control: "text",
+          defaultValue: "/scenes/demo.glb",
+        },
         {
           id: "loader-units",
           label: "units",
@@ -1268,8 +1636,18 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Import",
       settings: [
-        { id: "loader-generate-normals", label: "generate normals", control: "toggle", defaultValue: false },
-        { id: "loader-merge-materials", label: "merge materials", control: "toggle", defaultValue: true },
+        {
+          id: "loader-generate-normals",
+          label: "generate normals",
+          control: "toggle",
+          defaultValue: false,
+        },
+        {
+          id: "loader-merge-materials",
+          label: "merge materials",
+          control: "toggle",
+          defaultValue: true,
+        },
       ],
     },
   ],
@@ -1284,14 +1662,33 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
           defaultValue: "balanced",
           options: ["fast", "balanced", "high quality"],
         },
-        { id: "tracer-leaf-size", label: "leaf size", control: "number", defaultValue: 4, min: 1, step: 1 },
-        { id: "tracer-refit", label: "refit dynamic geometry", control: "toggle", defaultValue: true },
+        {
+          id: "tracer-leaf-size",
+          label: "leaf size",
+          control: "number",
+          defaultValue: 4,
+          min: 1,
+          step: 1,
+        },
+        {
+          id: "tracer-refit",
+          label: "refit dynamic geometry",
+          control: "toggle",
+          defaultValue: true,
+        },
       ],
     },
     {
       title: "Traversal",
       settings: [
-        { id: "tracer-max-steps", label: "max steps", control: "number", defaultValue: 256, min: 1, step: 1 },
+        {
+          id: "tracer-max-steps",
+          label: "max steps",
+          control: "number",
+          defaultValue: 256,
+          min: 1,
+          step: 1,
+        },
         { id: "tracer-any-hit", label: "any-hit shadows", control: "toggle", defaultValue: true },
       ],
     },
@@ -1300,7 +1697,14 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Image Sampling",
       settings: [
-        { id: "sampler-spp", label: "samples per pixel", control: "number", defaultValue: 1, min: 1, step: 1 },
+        {
+          id: "sampler-spp",
+          label: "samples per pixel",
+          control: "number",
+          defaultValue: 1,
+          min: 1,
+          step: 1,
+        },
         {
           id: "sampler-sequence",
           label: "sequence",
@@ -1314,8 +1718,22 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Randomness",
       settings: [
-        { id: "sampler-seed", label: "seed", control: "number", defaultValue: 1337, min: 0, step: 1 },
-        { id: "sampler-dimensions", label: "dimensions", control: "number", defaultValue: 8, min: 1, step: 1 },
+        {
+          id: "sampler-seed",
+          label: "seed",
+          control: "number",
+          defaultValue: 1337,
+          min: 0,
+          step: 1,
+        },
+        {
+          id: "sampler-dimensions",
+          label: "dimensions",
+          control: "number",
+          defaultValue: 8,
+          min: 1,
+          step: 1,
+        },
       ],
     },
   ],
@@ -1323,16 +1741,45 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Path Limits",
       settings: [
-        { id: "integrator-max-bounces", label: "max bounces", control: "number", defaultValue: 6, min: 0, step: 1 },
-        { id: "integrator-min-bounces", label: "min bounces", control: "number", defaultValue: 2, min: 0, step: 1 },
-        { id: "integrator-russian-roulette", label: "russian roulette", control: "toggle", defaultValue: true },
+        {
+          id: "integrator-max-bounces",
+          label: "max bounces",
+          control: "number",
+          defaultValue: 6,
+          min: 0,
+          step: 1,
+        },
+        {
+          id: "integrator-min-bounces",
+          label: "min bounces",
+          control: "number",
+          defaultValue: 2,
+          min: 0,
+          step: 1,
+        },
+        {
+          id: "integrator-russian-roulette",
+          label: "russian roulette",
+          control: "toggle",
+          defaultValue: true,
+        },
       ],
     },
     {
       title: "Lighting",
       settings: [
-        { id: "integrator-nee", label: "next-event estimation", control: "toggle", defaultValue: true },
-        { id: "integrator-mis", label: "multiple importance sampling", control: "toggle", defaultValue: true },
+        {
+          id: "integrator-nee",
+          label: "next-event estimation",
+          control: "toggle",
+          defaultValue: true,
+        },
+        {
+          id: "integrator-mis",
+          label: "multiple importance sampling",
+          control: "toggle",
+          defaultValue: true,
+        },
       ],
     },
   ],
@@ -1340,17 +1787,47 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Filter",
       settings: [
-        { id: "denoiser-strength", label: "strength", control: "number", defaultValue: 0.65, min: 0, max: 1, step: 0.01 },
-        { id: "denoiser-radius", label: "radius", control: "number", defaultValue: 2, min: 0, step: 1 },
-        { id: "denoiser-temporal", label: "temporal history", control: "toggle", defaultValue: true },
+        {
+          id: "denoiser-strength",
+          label: "strength",
+          control: "number",
+          defaultValue: 0.65,
+          min: 0,
+          max: 1,
+          step: 0.01,
+        },
+        {
+          id: "denoiser-radius",
+          label: "radius",
+          control: "number",
+          defaultValue: 2,
+          min: 0,
+          step: 1,
+        },
+        {
+          id: "denoiser-temporal",
+          label: "temporal history",
+          control: "toggle",
+          defaultValue: true,
+        },
       ],
     },
     {
       title: "Guides",
       settings: [
         { id: "denoiser-depth-guide", label: "depth guide", control: "toggle", defaultValue: true },
-        { id: "denoiser-normal-guide", label: "normal guide", control: "toggle", defaultValue: true },
-        { id: "denoiser-albedo-guide", label: "albedo guide", control: "toggle", defaultValue: false },
+        {
+          id: "denoiser-normal-guide",
+          label: "normal guide",
+          control: "toggle",
+          defaultValue: true,
+        },
+        {
+          id: "denoiser-albedo-guide",
+          label: "albedo guide",
+          control: "toggle",
+          defaultValue: false,
+        },
       ],
     },
   ],
@@ -1358,9 +1835,30 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Exposure",
       settings: [
-        { id: "tonemapper-exposure", label: "exposure", control: "number", defaultValue: 0, step: 0.1, suffix: "EV" },
-        { id: "tonemapper-gamma", label: "gamma", control: "number", defaultValue: 2.2, min: 0.1, step: 0.1 },
-        { id: "tonemapper-white-point", label: "white point", control: "number", defaultValue: 1, min: 0.1, step: 0.1 },
+        {
+          id: "tonemapper-exposure",
+          label: "exposure",
+          control: "number",
+          defaultValue: 0,
+          step: 0.1,
+          suffix: "EV",
+        },
+        {
+          id: "tonemapper-gamma",
+          label: "gamma",
+          control: "number",
+          defaultValue: 2.2,
+          min: 0.1,
+          step: 0.1,
+        },
+        {
+          id: "tonemapper-white-point",
+          label: "white point",
+          control: "number",
+          defaultValue: 1,
+          min: 0.1,
+          step: 0.1,
+        },
       ],
     },
     {
@@ -1388,14 +1886,34 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
           defaultValue: "1280 x 720",
           options: ["800 x 800", "1280 x 720", "1920 x 1080", "custom"],
         },
-        { id: "target-scale", label: "scale", control: "number", defaultValue: 1, min: 0.1, max: 2, step: 0.1 },
+        {
+          id: "target-scale",
+          label: "scale",
+          control: "number",
+          defaultValue: 1,
+          min: 0.1,
+          max: 2,
+          step: 0.1,
+        },
       ],
     },
     {
       title: "Accumulation",
       settings: [
-        { id: "target-progressive", label: "progressive accumulation", control: "toggle", defaultValue: true },
-        { id: "target-max-samples", label: "sample budget", control: "number", defaultValue: 256, min: 1, step: 1 },
+        {
+          id: "target-progressive",
+          label: "progressive accumulation",
+          control: "toggle",
+          defaultValue: true,
+        },
+        {
+          id: "target-max-samples",
+          label: "sample budget",
+          control: "number",
+          defaultValue: 256,
+          min: 1,
+          step: 1,
+        },
       ],
     },
   ],
@@ -1403,16 +1921,39 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Viewport",
       settings: [
-        { id: "display-fit", label: "fit mode", control: "select", defaultValue: "contain", options: ["contain", "cover", "1:1"] },
-        { id: "display-zoom", label: "zoom", control: "number", defaultValue: 1, min: 0.1, step: 0.1 },
+        {
+          id: "display-fit",
+          label: "fit mode",
+          control: "select",
+          defaultValue: "contain",
+          options: ["contain", "cover", "1:1"],
+        },
+        {
+          id: "display-zoom",
+          label: "zoom",
+          control: "number",
+          defaultValue: 1,
+          min: 0.1,
+          step: 0.1,
+        },
       ],
     },
     {
       title: "Overlays",
       settings: [
-        { id: "display-sample-count", label: "sample count", control: "toggle", defaultValue: true },
+        {
+          id: "display-sample-count",
+          label: "sample count",
+          control: "toggle",
+          defaultValue: true,
+        },
         { id: "display-frame-time", label: "frame time", control: "toggle", defaultValue: true },
-        { id: "display-pixel-inspector", label: "pixel inspector", control: "toggle", defaultValue: false },
+        {
+          id: "display-pixel-inspector",
+          label: "pixel inspector",
+          control: "toggle",
+          defaultValue: false,
+        },
       ],
     },
   ],
@@ -1420,15 +1961,35 @@ const pipelineSectionSettingGroups: Record<string, CameraSettingGroup[]> = {
     {
       title: "Inspection",
       settings: [
-        { id: "debug-range-min", label: "range min", control: "number", defaultValue: 0, step: 0.1 },
-        { id: "debug-range-max", label: "range max", control: "number", defaultValue: 1, step: 0.1 },
+        {
+          id: "debug-range-min",
+          label: "range min",
+          control: "number",
+          defaultValue: 0,
+          step: 0.1,
+        },
+        {
+          id: "debug-range-max",
+          label: "range max",
+          control: "number",
+          defaultValue: 1,
+          step: 0.1,
+        },
         { id: "debug-normalize", label: "normalize", control: "toggle", defaultValue: true },
       ],
     },
     {
       title: "Overlay",
       settings: [
-        { id: "debug-opacity", label: "opacity", control: "number", defaultValue: 1, min: 0, max: 1, step: 0.01 },
+        {
+          id: "debug-opacity",
+          label: "opacity",
+          control: "number",
+          defaultValue: 1,
+          min: 0,
+          max: 1,
+          step: 0.01,
+        },
         { id: "debug-legend", label: "legend", control: "toggle", defaultValue: true },
       ],
     },
@@ -1450,9 +2011,7 @@ function getInitialSettingValues() {
     [
       ...cameraModes.flatMap((mode) => mode.settingGroups),
       ...Object.values(pipelineSectionSettingGroups).flat(),
-    ].flatMap((group) =>
-      group.settings.map((setting) => [setting.id, setting.defaultValue]),
-    ),
+    ].flatMap((group) => group.settings.map((setting) => [setting.id, setting.defaultValue])),
   );
 }
 
@@ -1590,6 +2149,8 @@ export function AppSidebar() {
     useState<Record<string, string>>(getInitialActiveOptions);
   const [settingValues, setSettingValues] =
     useState<Record<string, CameraSettingValue>>(getInitialSettingValues);
+  const [isRecording, setIsRecording] = useState(false);
+  const [screenshotFlashKey, setScreenshotFlashKey] = useState(0);
 
   const updateSetting = (settingId: string, value: CameraSettingValue) => {
     setSettingValues((current) => ({
@@ -1600,15 +2161,15 @@ export function AppSidebar() {
 
   return (
     <Sidebar collapsible="none" className="hidden h-svh border-r-0 bg-muted/60 md:flex">
-      <SidebarHeader className="gap-3 px-3 pt-4 pb-3">
-        <SidebarMenu>
-          <SidebarMenuItem>
+      <SidebarHeader className="gap-3 px-3 pt-3 pb-3">
+        <SidebarMenu className="flex-row items-center gap-1">
+          <SidebarMenuItem className="min-w-0">
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
                   <SidebarMenuButton
                     size="lg"
-                    className="h-8 gap-2 rounded-md px-1.5 data-open:bg-sidebar-accent data-open:text-sidebar-accent-foreground"
+                    className="h-8 w-auto max-w-[9.5rem] gap-2 rounded-md px-1.5 pr-2 data-open:bg-sidebar-accent data-open:text-sidebar-accent-foreground"
                   />
                 }
               >
@@ -1616,7 +2177,7 @@ export function AppSidebar() {
                   <AvatarFallback>ID</AvatarFallback>
                 </Avatar>
                 <span className="truncate text-sm font-medium">idobbins</span>
-                <ChevronDownIcon className="ml-auto size-3.5 text-sidebar-foreground/50" />
+                <ChevronDownIcon className="ml-0.5 size-3.5 text-sidebar-foreground/50" />
               </DropdownMenuTrigger>
               <DropdownMenuContent side="bottom" align="start" className="w-48 p-1.5">
                 <DropdownMenuGroup>
@@ -1639,6 +2200,51 @@ export function AppSidebar() {
               </DropdownMenuContent>
             </DropdownMenu>
           </SidebarMenuItem>
+          <SidebarMenuItem className="ml-auto shrink-0">
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              aria-label={isRecording ? "Stop recording" : "Record"}
+              aria-pressed={isRecording}
+              title={isRecording ? "Stop recording" : "Record"}
+              data-recording={isRecording}
+              onClick={() => setIsRecording((recording) => !recording)}
+              className={cn(
+                "record-button relative overflow-hidden rounded-md border-sidebar-border bg-sidebar text-sidebar-foreground/70 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                isRecording &&
+                  "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive",
+              )}
+            >
+              <CircleDotIcon className={cn("size-4", isRecording && "fill-current")} />
+            </Button>
+          </SidebarMenuItem>
+          <SidebarMenuItem className="shrink-0">
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              aria-label="Screenshot"
+              title="Screenshot"
+              onClick={() => setScreenshotFlashKey((key) => key + 1)}
+              data-flashing={screenshotFlashKey > 0}
+              className={cn(
+                "relative overflow-hidden rounded-md border-sidebar-border bg-sidebar text-sidebar-foreground/70 shadow-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                screenshotFlashKey > 0 &&
+                  "border-blue-500/35 bg-blue-500/10 text-blue-600 hover:bg-blue-500/15 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300",
+              )}
+            >
+              <CameraIcon className="size-4" />
+              {screenshotFlashKey > 0 ? (
+                <span
+                  key={screenshotFlashKey}
+                  aria-hidden="true"
+                  className="screenshot-shimmer"
+                  onAnimationEnd={() => setScreenshotFlashKey(0)}
+                />
+              ) : null}
+            </Button>
+          </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
@@ -1652,7 +2258,7 @@ export function AppSidebar() {
               const activeOption = activeOptions[section.id];
               const activeCameraMode =
                 section.id === "camera"
-                  ? cameraModes.find((mode) => mode.label === activeOption) ?? cameraModes[0]
+                  ? (cameraModes.find((mode) => mode.label === activeOption) ?? cameraModes[0])
                   : undefined;
               const settingGroups =
                 activeCameraMode?.settingGroups ?? pipelineSectionSettingGroups[section.id] ?? [];
