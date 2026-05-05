@@ -1244,10 +1244,10 @@ export const RenderScene = forwardRef<
           if (dirtyViewportIdsRef.current.has(pane.id)) {
             pane.pingPong = 0;
             pane.sampleIndex = 0;
-            pane.frame = 0;
             dirtyViewportIdsRef.current.delete(pane.id);
           }
 
+          pane.frame = (pane.frame + 1) >>> 0;
           writePaneUniforms(pane, viewport.settings, camera);
           const queryIndex = queryIndexByPaneId.get(viewport.id);
           const computePassDescriptor: GPUComputePassDescriptor = {};
@@ -1265,7 +1265,6 @@ export const RenderScene = forwardRef<
           computePass.end();
           pane.pingPong = pane.pingPong === 0 ? 1 : 0;
           pane.sampleIndex += 1;
-          pane.frame += 1;
         });
 
         const frameTextureView = context.getCurrentTexture().createView();

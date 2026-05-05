@@ -46,6 +46,23 @@ fn pcg(state : ptr<function, u32>) -> u32 {
 fn rand(state : ptr<function, u32>) -> f32 {
   return f32(pcg(state)) / 4294967295.0;
 }
+fn mixSeed(seed : u32, value : u32) -> u32 {
+  var x = seed ^ (value + 0x9e3779b9u + (seed << 6u) + (seed >> 2u));
+  x = (x ^ (x >> 16u)) * 0x7feb352du;
+  x = (x ^ (x >> 15u)) * 0x846ca68bu;
+  return x ^ (x >> 16u);
+}
+fn sampleSeed(pixel : vec2<u32>, sample : u32) -> u32 {
+  let dispatchSample = U.frame * max(U.samplesPerDispatch, 1u) + sample;
+  var seed = 0x6d2b79f5u;
+  seed = mixSeed(seed, pixel.x);
+  seed = mixSeed(seed, pixel.y);
+  seed = mixSeed(seed, U.frame);
+  seed = mixSeed(seed, U.sampleIdx);
+  seed = mixSeed(seed, dispatchSample);
+  seed = mixSeed(seed, 0xdeadbeefu);
+  return seed;
+}
 fn randInUnitSphere(state : ptr<function, u32>) -> vec3<f32> {
   let z = rand(state) * 2.0 - 1.0;
   let a = rand(state) * 6.2831853;
@@ -250,12 +267,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dims = vec2<u32>(u32(U.resolution.x), u32(U.resolution.y));
   if (gid.x >= dims.x || gid.y >= dims.y) { return; }
 
-  var rng = gid.x * 1973u + gid.y * 9277u + U.frame * 26699u + 1u;
-  pcg(&rng);
-
   let spp = clamp(U.samplesPerDispatch, 1u, 8u);
   var col = vec3<f32>(0.0);
   for (var s = 0u; s < spp; s = s + 1u) {
+    var rng = sampleSeed(vec2<u32>(gid.x, gid.y), s);
+    pcg(&rng);
+    pcg(&rng);
+
     let jx = rand(&rng);
     let jy = rand(&rng);
     let uv = (vec2<f32>(f32(gid.x) + jx, f32(gid.y) + jy) / U.resolution) * 2.0 - 1.0;
