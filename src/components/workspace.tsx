@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { AppSidebar } from "@/components/app-sidebar";
 import { RenderScene, type RenderSceneHandle } from "@/components/render-scene";
@@ -8,9 +8,13 @@ import { AspectRatio } from "@/components/ui/aspect-ratio";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import type { RecordingState } from "@/components/app-sidebar/_components/sidebar-header-actions";
 import {
+  defaultRecordingCodecId,
   defaultRecordingProfileId,
+  getRecordingCodec,
   getRecordingProfile,
-  type RecordingProfile,
+  getSupportedRecordingCodecs,
+  type RecordingCodec,
+  type RecordingCodecId,
   type RecordingProfileId,
 } from "@/lib/recording-settings";
 import {
@@ -69,16 +73,6 @@ function downloadBlob(blob: Blob, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function getRecordingMimeType(profile: RecordingProfile) {
-  if (typeof MediaRecorder === "undefined") {
-    return "";
-  }
-
-  return (
-    profile.preferredMimeTypes.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? ""
-  );
-}
-
 function getRecordingExtension(mimeType: string) {
   if (mimeType.includes("mp4")) {
     return "mp4";
@@ -120,6 +114,9 @@ export function Workspace() {
   const [autoOrbit, setAutoOrbit] = useState(false);
   const [recordingProfileId, setRecordingProfileId] =
     useState<RecordingProfileId>(defaultRecordingProfileId);
+  const [recordingCodecId, setRecordingCodecId] =
+    useState<RecordingCodecId>(defaultRecordingCodecId);
+  const [supportedRecordingCodecs, setSupportedRecordingCodecs] = useState<RecordingCodec[]>([]);
   const [comparisonOverrides, setComparisonOverrides] =
     useState<Partial<RenderSettings>>(comparisonDefaults);
   const comparisonSettings = withSharedSettings(
@@ -152,6 +149,19 @@ export function Workspace() {
               presentation: "split-right",
             },
           ];
+
+  useEffect(() => {
+    const supportedCodecs = getSupportedRecordingCodecs();
+
+    setSupportedRecordingCodecs(supportedCodecs);
+
+    if (
+      supportedCodecs.length > 0 &&
+      !supportedCodecs.some((codec) => codec.id === recordingCodecId)
+    ) {
+      setRecordingCodecId(supportedCodecs[0].id);
+    }
+  }, [recordingCodecId]);
 
   const updateSharedSetting = <Key extends keyof RenderSettings>(
     key: Key,
@@ -224,10 +234,21 @@ export function Workspace() {
     setRecordingState("starting");
 
     const recordingProfile = getRecordingProfile(recordingProfileId);
+    const recordingCodec =
+      supportedRecordingCodecs.find((codec) => codec.id === recordingCodecId) ??
+      getSupportedRecordingCodecs()[0] ??
+      getRecordingCodec(recordingCodecId);
+    const mimeType = MediaRecorder.isTypeSupported(recordingCodec.mimeType)
+      ? recordingCodec.mimeType
+      : "";
+
+    if (!mimeType) {
+      throw new Error("No supported recording codec is available in this browser.");
+    }
+
     const stream = renderScene.captureStream(recordingProfile.fps);
-    const mimeType = getRecordingMimeType(recordingProfile);
     const recorder = new MediaRecorder(stream, {
-      ...(mimeType ? { mimeType } : {}),
+      mimeType,
       videoBitsPerSecond: recordingProfile.videoBitsPerSecond,
     });
     const chunks: Blob[] = [];
@@ -304,6 +325,9 @@ export function Workspace() {
         onTakeScreenshot={takeScreenshot}
         recordingProfileId={recordingProfileId}
         onRecordingProfileChange={setRecordingProfileId}
+        recordingCodecId={recordingCodecId}
+        onRecordingCodecChange={setRecordingCodecId}
+        supportedRecordingCodecs={supportedRecordingCodecs}
         autoOrbit={autoOrbit}
         onAutoOrbitChange={setAutoOrbit}
         renderEnabled={renderEnabled}

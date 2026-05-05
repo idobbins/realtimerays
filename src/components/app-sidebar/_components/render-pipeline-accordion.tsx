@@ -13,7 +13,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { recordingProfiles, type RecordingProfileId } from "@/lib/recording-settings";
+import {
+  recordingProfiles,
+  type RecordingCodec,
+  type RecordingCodecId,
+  type RecordingProfileId,
+} from "@/lib/recording-settings";
 import {
   renderAspectRatioProfiles,
   toneMapOptions,
@@ -59,6 +64,9 @@ function RenderOutputSection({
   recordingState,
   recordingProfileId,
   onRecordingProfileChange,
+  recordingCodecId,
+  onRecordingCodecChange,
+  supportedRecordingCodecs,
   comparisonMode,
   onComparisonModeChange,
 }: {
@@ -67,6 +75,9 @@ function RenderOutputSection({
   recordingState: RecordingState;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  recordingCodecId: RecordingCodecId;
+  onRecordingCodecChange: (codecId: RecordingCodecId) => void;
+  supportedRecordingCodecs: RecordingCodec[];
   comparisonMode: ComparisonMode;
   onComparisonModeChange: (mode: ComparisonMode) => void;
 }) {
@@ -116,31 +127,57 @@ function RenderOutputSection({
             </Tabs>
           </SettingRow>
 
-          <SettingRow label="recording quality">
-            <Select
-              value={recordingProfileId}
-              onValueChange={(value) => onRecordingProfileChange(value as RecordingProfileId)}
-              disabled={recordingState !== "idle"}
-            >
-              <SelectTrigger size="sm" className="h-7 w-36 bg-background/60 text-[11px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
-                <SelectGroup>
-                  <SelectLabel>Recording quality</SelectLabel>
-                  {recordingProfiles.map((profile) => (
-                    <SelectItem
-                      key={profile.id}
-                      value={profile.id}
-                      title={profile.detail}
-                      className="text-xs"
-                    >
-                      {profile.menuLabel}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
+          <SettingRow label="recording">
+            <div className="flex items-center gap-1.5">
+              <Select
+                value={recordingProfileId}
+                onValueChange={(value) => onRecordingProfileChange(value as RecordingProfileId)}
+                disabled={recordingState !== "idle"}
+              >
+                <SelectTrigger size="sm" className="h-7 w-28 bg-background/60 text-[11px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                  <SelectGroup>
+                    <SelectLabel>Recording quality</SelectLabel>
+                    {recordingProfiles.map((profile) => (
+                      <SelectItem
+                        key={profile.id}
+                        value={profile.id}
+                        title={profile.detail}
+                        className="text-xs"
+                      >
+                        {profile.menuLabel}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <Select
+                value={recordingCodecId}
+                onValueChange={(value) => onRecordingCodecChange(value as RecordingCodecId)}
+                disabled={recordingState !== "idle" || supportedRecordingCodecs.length === 0}
+              >
+                <SelectTrigger size="sm" className="h-7 w-20 bg-background/60 text-[11px]">
+                  <SelectValue placeholder="Codec" />
+                </SelectTrigger>
+                <SelectContent align="end" alignItemWithTrigger={false} sideOffset={8}>
+                  <SelectGroup>
+                    <SelectLabel>Codec</SelectLabel>
+                    {supportedRecordingCodecs.map((codec) => (
+                      <SelectItem
+                        key={codec.id}
+                        value={codec.id}
+                        title={codec.detail}
+                        className="text-xs"
+                      >
+                        {codec.menuLabel}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </div>
           </SettingRow>
 
           <SettingRow label="tone map">
@@ -224,6 +261,9 @@ export function SharedSessionAccordion({
   recordingState,
   recordingProfileId,
   onRecordingProfileChange,
+  recordingCodecId,
+  onRecordingCodecChange,
+  supportedRecordingCodecs,
   comparisonMode,
   onComparisonModeChange,
 }: {
@@ -232,6 +272,9 @@ export function SharedSessionAccordion({
   recordingState: RecordingState;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  recordingCodecId: RecordingCodecId;
+  onRecordingCodecChange: (codecId: RecordingCodecId) => void;
+  supportedRecordingCodecs: RecordingCodec[];
   comparisonMode: ComparisonMode;
   onComparisonModeChange: (mode: ComparisonMode) => void;
 }) {
@@ -245,6 +288,9 @@ export function SharedSessionAccordion({
         recordingState={recordingState}
         recordingProfileId={recordingProfileId}
         onRecordingProfileChange={onRecordingProfileChange}
+        recordingCodecId={recordingCodecId}
+        onRecordingCodecChange={onRecordingCodecChange}
+        supportedRecordingCodecs={supportedRecordingCodecs}
         comparisonMode={comparisonMode}
         onComparisonModeChange={onComparisonModeChange}
       />

@@ -15,7 +15,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Sidebar, SidebarContent, SidebarHeader } from "@/components/ui/sidebar";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { RecordingProfileId } from "@/lib/recording-settings";
+import type {
+  RecordingCodec,
+  RecordingCodecId,
+  RecordingProfileId,
+} from "@/lib/recording-settings";
 import type { ComparisonMode, ComparisonPaneId, RenderSettings } from "@/lib/render-settings";
 
 import type { RenderSettingChange } from "./_components/sidebar-section";
@@ -33,6 +37,9 @@ type AppSidebarProps = {
   onTakeScreenshot: () => void | Promise<void>;
   recordingProfileId: RecordingProfileId;
   onRecordingProfileChange: (profileId: RecordingProfileId) => void;
+  recordingCodecId: RecordingCodecId;
+  onRecordingCodecChange: (codecId: RecordingCodecId) => void;
+  supportedRecordingCodecs: RecordingCodec[];
   autoOrbit: boolean;
   onAutoOrbitChange: (enabled: boolean) => void;
   renderEnabled: boolean;
@@ -77,6 +84,9 @@ export function AppSidebar({
   onTakeScreenshot,
   recordingProfileId,
   onRecordingProfileChange,
+  recordingCodecId,
+  onRecordingCodecChange,
+  supportedRecordingCodecs,
   autoOrbit,
   onAutoOrbitChange,
   renderEnabled,
@@ -94,8 +104,7 @@ export function AppSidebar({
     setAnimationDirection(paneId === "b" ? -1 : 1);
     onActivePaneChange(paneId);
   };
-  const resetLabel =
-    activePaneId === "b" ? "Reset variant sampling" : "Reset baseline sampling";
+  const resetLabel = activePaneId === "b" ? "Reset variant sampling" : "Reset baseline sampling";
 
   return (
     <Sidebar collapsible="none" className="hidden h-svh border-r-0 bg-muted/60 md:flex">
@@ -123,6 +132,9 @@ export function AppSidebar({
             recordingState={recordingState}
             recordingProfileId={recordingProfileId}
             onRecordingProfileChange={onRecordingProfileChange}
+            recordingCodecId={recordingCodecId}
+            onRecordingCodecChange={onRecordingCodecChange}
+            supportedRecordingCodecs={supportedRecordingCodecs}
             comparisonMode={comparisonMode}
             onComparisonModeChange={onComparisonModeChange}
           />
