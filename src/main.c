@@ -321,25 +321,5 @@ int main(void)
         frameIndex = (frameIndex + 1u) % FRAME_COUNT;
     }
 
-    vkDeviceWaitIdle(device);
-
-    for (uint32_t i = 0u; i < FRAME_COUNT; i++)
-    {
-        vkDestroyFence(device, inFlightFences[i], NULL);
-        vkDestroySemaphore(device, renderFinishedSemaphores[i], NULL);
-        vkDestroySemaphore(device, imageAvailableSemaphores[i], NULL);
-        vkDestroyImageView(device, swapImageViews[i], NULL);
-    }
-
-    vkDestroyCommandPool(device, commandPool, NULL);
-    vkDestroyPipeline(device, pipeline, NULL);
-    vkDestroyPipelineLayout(device, pipelineLayout, NULL);
-    vkDestroyDescriptorPool(device, descriptorPool, NULL);
-    vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
-    vkDestroySwapchainKHR(device, swapchain, NULL);
-    vkDestroyDevice(device, NULL);
-    vkDestroySurfaceKHR(instance, surface, NULL);
-    vkDestroyInstance(instance, NULL);
-    gbbShutdownWindow();
     return 0;
 }
