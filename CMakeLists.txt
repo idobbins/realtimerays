@@ -28,7 +28,7 @@ if(NOT Vulkan_GLSLC_EXECUTABLE)
 endif()
 
 set(SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders)
-set(SHADER_GENERATED_DIR ${CMAKE_SOURCE_DIR}/build/generated/shaders)
+set(SHADER_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders)
 set(SHADER_EMBED_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake)
 
 set(GRADIENT_COMP_SOURCE ${SHADER_SOURCE_DIR}/gradient.comp)
@@ -75,6 +75,8 @@ add_executable(${PROJECT_NAME}
 add_dependencies(${PROJECT_NAME} embedded_shaders)
 target_include_directories(${PROJECT_NAME} PRIVATE ${SHADER_GENERATED_DIR})
 target_link_libraries(${PROJECT_NAME} PRIVATE Vulkan::Vulkan)
+
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
 
 if(APPLE)
     target_link_libraries(${PROJECT_NAME} PRIVATE
