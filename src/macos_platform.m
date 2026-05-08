@@ -16,10 +16,12 @@ int gbbInitWindow(uint32_t width, uint32_t height, const char* title)
         [NSApp finishLaunching];
 
         window_handle = [[NSWindow alloc] initWithContentRect:NSMakeRect(0.0, 0.0, (CGFloat)width, (CGFloat)height)
-                                             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskFullSizeContentView)
                                                backing:NSBackingStoreBuffered
                                                  defer:NO];
         [window_handle center];
+        [window_handle setTitleVisibility:NSWindowTitleHidden];
+        [window_handle setTitlebarAppearsTransparent:YES];
 
         NSView* view = [window_handle contentView];
         surface_layer = (void *)[CAMetalLayer layer];
