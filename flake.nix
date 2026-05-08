@@ -25,9 +25,6 @@
             pkgs.vulkan-loader
             pkgs.moltenvk
           ];
-          captureRuntimePath = lib.makeBinPath [
-            pkgs.ffmpeg
-          ];
         in
         {
           default = pkgs.stdenv.mkDerivation {
@@ -54,8 +51,7 @@
             postInstall = ''
               wrapProgram "$out/bin/greatbadbeyond" \
                 --set-default VK_ICD_FILENAMES ${moltenvkIcd} \
-                --prefix DYLD_LIBRARY_PATH : ${vulkanRuntimeLibPath} \
-                --prefix PATH : ${captureRuntimePath}
+                --prefix DYLD_LIBRARY_PATH : ${vulkanRuntimeLibPath}
             '';
 
             meta = {
@@ -137,7 +133,6 @@
               pkgs.ninja
               pkgs.pkg-config
               pkgs.shaderc.bin
-              pkgs.ffmpeg
               pkgs.vulkan-tools
               pkgs.vulkan-validation-layers
               pkgs.zsh
