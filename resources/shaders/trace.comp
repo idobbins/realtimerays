@@ -7,12 +7,71 @@ layout(push_constant) uniform Push {
     float time;
 } pc;
 
+const int MAX_TRACE_STEPS = 128;
+const int MAX_BOUNCES = 3;
+const float SURFACE_EPSILON = 0.001;
+const float GAMMA = 2.2;
+
+const float CAMERA_ORBIT_SPEED = 0.12;
+const float CAMERA_ORBIT_ANGLE = 0.45;
+const float CAMERA_ORBIT_RADIUS = 16.0;
+const float CAMERA_HEIGHT = 6.0;
+const float CAMERA_FOCAL_LENGTH = 1.5;
+const vec3 CAMERA_TARGET = vec3(0.0, 2.25, 0.0);
+
 const uint MAT_EMPTY = 0u;
 const uint MAT_FLOOR = 1u;
 const uint MAT_RED   = 2u;
 const uint MAT_GREEN = 3u;
 const uint MAT_BLUE  = 4u;
 const uint MAT_LIGHT = 5u;
+
+const int MATERIAL_COUNT = 6;
+const int SCENE_BOX_COUNT = 6;
+
+const vec3 MATERIAL_ALBEDO[MATERIAL_COUNT] = vec3[MATERIAL_COUNT](
+    vec3(0.0),          // MAT_EMPTY
+    vec3(0.8),          // MAT_FLOOR
+    vec3(0.8, 0.2, 0.2),// MAT_RED
+    vec3(0.2, 0.8, 0.2),// MAT_GREEN
+    vec3(0.2, 0.4, 0.9),// MAT_BLUE
+    vec3(0.0)           // MAT_LIGHT
+);
+
+const vec3 MATERIAL_EMISSION[MATERIAL_COUNT] = vec3[MATERIAL_COUNT](
+    vec3(0.0),          // MAT_EMPTY
+    vec3(0.0),          // MAT_FLOOR
+    vec3(0.0),          // MAT_RED
+    vec3(0.0),          // MAT_GREEN
+    vec3(0.0),          // MAT_BLUE
+    vec3(8.0, 7.0, 6.0)// MAT_LIGHT
+);
+
+struct VoxelBox {
+    ivec3 lo;
+    ivec3 hi;
+    uint mat;
+};
+
+const VoxelBox SCENE_BOXES[SCENE_BOX_COUNT] = VoxelBox[SCENE_BOX_COUNT](
+    // Hero subject near the origin.
+    VoxelBox(ivec3(-1, 0, -1), ivec3( 2, 5,  2), MAT_GREEN),
+
+    // Low foreground mass for depth.
+    VoxelBox(ivec3(-5, 0,  2), ivec3(-2, 2,  5), MAT_RED),
+
+    // Taller background tower for silhouette.
+    VoxelBox(ivec3( 3, 0, -4), ivec3( 5, 6, -2), MAT_BLUE),
+
+    // Side block to avoid a symmetric composition.
+    VoxelBox(ivec3(-4, 0, -3), ivec3(-2, 3, -1), MAT_RED),
+
+    // Floating accent shape.
+    VoxelBox(ivec3( 1, 6, -2), ivec3( 3, 7,  0), MAT_BLUE),
+
+    // Overhead/side area light for more cinematic shadows.
+    VoxelBox(ivec3(-3, 8,  1), ivec3( 2, 9,  5), MAT_LIGHT)
+);
 
 bool box(ivec3 p, ivec3 lo, ivec3 hi)
 {
@@ -25,41 +84,23 @@ uint voxel(ivec3 p)
     if (p.y < 0)
         return MAT_FLOOR;
 
-    // left block
-    if (box(p, ivec3(-5, 0, -2), ivec3(-3, 2,  0)))
-        return MAT_RED;
-
-    // middle block
-    if (box(p, ivec3(-1, 0,  0), ivec3( 1, 4,  2)))
-        return MAT_GREEN;
-
-    // right block
-    if (box(p, ivec3( 3, 0, -2), ivec3( 5, 3,  0)))
-        return MAT_BLUE;
-
-    // small floating block
-    if (box(p, ivec3( 0, 5, -3), ivec3( 2, 6, -1)))
-        return MAT_RED;
-
-    // ceiling light
-    if (box(p, ivec3(-2, 7, -1), ivec3( 2, 8,  3)))
-        return MAT_LIGHT;
+    for (int i = 0; i < SCENE_BOX_COUNT; i++) {
+        VoxelBox b = SCENE_BOXES[i];
+        if (box(p, b.lo, b.hi))
+            return b.mat;
+    }
 
     return MAT_EMPTY;
 }
 
 vec3 albedo(uint m)
 {
-    if (m == MAT_FLOOR) return vec3(0.8);
-    if (m == MAT_RED)   return vec3(0.8, 0.2, 0.2);
-    if (m == MAT_GREEN) return vec3(0.2, 0.8, 0.2);
-    if (m == MAT_BLUE)  return vec3(0.2, 0.4, 0.9);
-    return vec3(0.0);
+    return MATERIAL_ALBEDO[int(m)];
 }
 
 vec3 emission(uint m)
 {
-    return m == MAT_LIGHT ? vec3(8.0, 7.0, 6.0) : vec3(0.0);
+    return MATERIAL_EMISSION[int(m)];
 }
 
 uint hash(uint x)
@@ -101,7 +142,7 @@ bool trace(vec3 ro, vec3 rd, out vec3 hp, out vec3 hn, out uint hm)
     float t = 0.0;
     hn = vec3(0.0);
 
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < MAX_TRACE_STEPS; i++) {
         hm = voxel(p);
         if (hm != MAT_EMPTY) {
             hp = ro + rd * t;
@@ -140,7 +181,7 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint rng)
     vec3 L = vec3(0.0);
     vec3 T = vec3(1.0);
 
-    for (int bounce = 0; bounce < 3; bounce++) {
+    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         vec3 hp, hn;
         uint hm;
 
@@ -156,7 +197,7 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint rng)
         }
 
         T *= albedo(hm);
-        ro = hp + hn * 0.001;
+        ro = hp + hn * SURFACE_EPSILON;
         rd = hemi(hn, rng);
     }
 
@@ -180,28 +221,25 @@ void main()
     uv.x *= float(sz.x) / float(sz.y);
     uv.y = -uv.y;
 
-    // Real-time orbital camera looking at the origin.
-    float orbitAngle = pc.time * 0.35;
-    float orbitRadius = 12.0;
-    vec3 target = vec3(0.0);
+    // Real-time orbital camera looking at the configured target.
+    float orbitAngle = CAMERA_ORBIT_ANGLE + pc.time * CAMERA_ORBIT_SPEED;
 
-    vec3 ro = target + vec3(
-        sin(orbitAngle) * orbitRadius,
-        4.0,
-        cos(orbitAngle) * orbitRadius
+    vec3 ro = CAMERA_TARGET + vec3(
+        sin(orbitAngle) * CAMERA_ORBIT_RADIUS,
+        CAMERA_HEIGHT,
+        cos(orbitAngle) * CAMERA_ORBIT_RADIUS
     );
 
-    vec3 forward = normalize(target - ro);
+    vec3 forward = normalize(CAMERA_TARGET - ro);
     vec3 right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
     vec3 up = cross(right, forward);
 
-    float focalLength = 1.5;
-    vec3 rd = normalize(right * uv.x + up * uv.y + forward * focalLength);
+    vec3 rd = normalize(right * uv.x + up * uv.y + forward * CAMERA_FOCAL_LENGTH);
 
     uint rng = uint(px.x) * 1973u + uint(px.y) * 9277u + 1u;
 
     vec3 color = pathTrace(ro, rd, rng);
-    color = pow(tonemap(color), vec3(1.0 / 2.2));
+    color = pow(tonemap(color), vec3(1.0 / GAMMA));
 
     imageStore(outImage, px, vec4(color, 1.0));
 }
