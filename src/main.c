@@ -1,6 +1,7 @@
 #define VK_USE_PLATFORM_METAL_EXT
 #define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,12 @@
 #define SWAP_IMAGE_COUNT  3
 #define COMPUTE_TILE_SIZE 8
 #define LEN(a)            ((uint32_t)(sizeof(a) / sizeof(*(a))))
+
+#define CAMERA_ORBIT_SPEED  0.12f
+#define CAMERA_ORBIT_ANGLE  0.45f
+#define CAMERA_ORBIT_RADIUS 16.0f
+#define CAMERA_HEIGHT       6.0f
+#define CAMERA_FOCAL_LENGTH 1.5f
 
 static const VkFormat SWAP_FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
 static const VkFormat RENDER_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
@@ -47,11 +54,69 @@ static VkSemaphore           imageAvailable;
 static VkSemaphore           renderFinished;
 static VkFence               inFlight;
 
+typedef struct CameraPushConstants {
+    float roTime[4];
+    float right[4];
+    float up[4];
+    float forward[4];
+} CameraPushConstants;
+
 static double nowSeconds(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static float dot3(const float a[3], const float b[3])
+{
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void cross3(const float a[3], const float b[3], float out[3])
+{
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static void normalize3(float v[3])
+{
+    float invLen = 1.0f / sqrtf(dot3(v, v));
+    v[0] *= invLen;
+    v[1] *= invLen;
+    v[2] *= invLen;
+}
+
+static CameraPushConstants cameraPushConstants(float time)
+{
+    float a = CAMERA_ORBIT_ANGLE + time * CAMERA_ORBIT_SPEED;
+    float target[3] = { 0.0f, 2.25f, 0.0f };
+    float ro[3] = {
+        target[0] + sinf(a) * CAMERA_ORBIT_RADIUS,
+        target[1] + CAMERA_HEIGHT,
+        target[2] + cosf(a) * CAMERA_ORBIT_RADIUS,
+    };
+    float forward[3] = {
+        target[0] - ro[0],
+        target[1] - ro[1],
+        target[2] - ro[2],
+    };
+    float worldUp[3] = { 0.0f, 1.0f, 0.0f };
+    float right[3];
+    float up[3];
+
+    normalize3(forward);
+    cross3(forward, worldUp, right);
+    normalize3(right);
+    cross3(right, forward, up);
+
+    return (CameraPushConstants){
+        .roTime  = { ro[0], ro[1], ro[2], time },
+        .right   = { right[0], right[1], right[2], 0.0f },
+        .up      = { up[0], up[1], up[2], 0.0f },
+        .forward = { forward[0], forward[1], forward[2], CAMERA_FOCAL_LENGTH },
+    };
 }
 
 static uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags)
@@ -97,7 +162,7 @@ static void imageBarrier(
         });
 }
 
-static void recordCommandBuffer(VkImage swapImage, float time)
+static void recordCommandBuffer(VkImage swapImage, const CameraPushConstants *camera)
 {
     vkBeginCommandBuffer(cb, &(VkCommandBufferBeginInfo){
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -111,7 +176,7 @@ static void recordCommandBuffer(VkImage swapImage, float time)
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, NULL);
-    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(time), &time);
+    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*camera), camera);
     vkCmdDispatch(cb,
         (swapExtent.width  + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
         (swapExtent.height + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
@@ -344,7 +409,7 @@ int main(void)
         .pPushConstantRanges    = &(VkPushConstantRange){
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset     = 0,
-            .size       = sizeof(float),
+            .size       = sizeof(CameraPushConstants),
         },
     }, NULL, &pipelineLayout);
 
@@ -421,10 +486,10 @@ int main(void)
         uint32_t imageIndex;
         vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
 
-        float time = (float)(nowSeconds() - startTime);
+        CameraPushConstants camera = cameraPushConstants((float)(nowSeconds() - startTime));
 
         vkResetCommandBuffer(cb, 0);
-        recordCommandBuffer(swapImages[imageIndex], time);
+        recordCommandBuffer(swapImages[imageIndex], &camera);
 
         vkQueueSubmit(queue, 1, &(VkSubmitInfo){
             .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,

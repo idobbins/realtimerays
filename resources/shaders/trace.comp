@@ -4,23 +4,18 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(binding = 0, rgba8) uniform writeonly image2D outImage;
 
 layout(push_constant) uniform Push {
-    float time;
+    vec4 cameraRoTime;
+    vec4 cameraRight;
+    vec4 cameraUp;
+    vec4 cameraForward;
 } pc;
 
-const int MAX_TRACE_STEPS = 128;
 const int MAX_BOUNCES = 3;
 const int SAMPLES_PER_PIXEL = 2;
 const float SURFACE_EPSILON = 0.001;
 const float MAX_RAY_DISTANCE = 80.0;
 const float AXIS_NEVER = 1.0e20;
 const float PI = 3.14159265359;
-
-const float CAMERA_ORBIT_SPEED = 0.12;
-const float CAMERA_ORBIT_ANGLE = 0.45;
-const float CAMERA_ORBIT_RADIUS = 16.0;
-const float CAMERA_HEIGHT = 6.0;
-const float CAMERA_FOCAL_LENGTH = 1.5;
-const vec3 CAMERA_TARGET = vec3(0.0, 2.25, 0.0);
 
 const uint MAT_EMPTY = 0u;
 const uint MAT_FLOOR = 1u;
@@ -34,12 +29,6 @@ const ivec3 LIGHT_HI = ivec3( 2, 9, 5);
 const float LIGHT_AREA = 20.0;
 
 const int HIT_FLOOR = -2;
-
-const ivec3 WORLD_MIN = ivec3(-6, 0, -5);
-const ivec3 WORLD_MAX = ivec3( 6, 9,  6);
-
-const int GRID_CELL_SIZE = 4;
-const ivec3 GRID_DIMS = ivec3(3, 3, 3);
 
 struct Hit {
     float t;
@@ -92,36 +81,15 @@ uint seed(ivec2 px, int sampleIndex)
     return hash(uint(px.x) * 1973u ^
                 uint(px.y) * 9277u ^
                 uint(sampleIndex) * 26699u ^
-                floatBitsToUint(pc.time) * 747796405u);
-}
-
-bool inside(ivec3 p, ivec3 lo, ivec3 hi)
-{
-    return all(greaterThanEqual(p, lo)) &&
-           all(lessThan(p, hi));
-}
-
-int voxelId(ivec3 p)
-{
-    for (int i = 0; i < BOX_COUNT; i++) {
-        if (inside(p, BOXES[i].lo, BOXES[i].hi))
-            return i;
-    }
-
-    return -1;
-}
-
-uint voxelMat(int id)
-{
-    if (id == HIT_FLOOR)
-        return MAT_FLOOR;
-
-    return id < 0 ? MAT_EMPTY : BOXES[id].mat;
+                floatBitsToUint(pc.cameraRoTime.w) * 747796405u);
 }
 
 uint hitMat(Hit h)
 {
-    return voxelMat(h.id);
+    if (h.id == HIT_FLOOR)
+        return MAT_FLOOR;
+
+    return h.id < 0 ? MAT_EMPTY : BOXES[h.id].mat;
 }
 
 vec3 albedo(uint m)
@@ -138,29 +106,15 @@ vec3 emission(uint m)
     return m == MAT_LIGHT ? vec3(8.0, 7.0, 6.0) : vec3(0.0);
 }
 
-float firstSideDistance(float ro, float rd, int cell)
-{
-    if (rd > 0.0)
-        return (float(cell + 1) - ro) / rd;
-
-    if (rd < 0.0)
-        return (ro - float(cell)) / -rd;
-
-    return AXIS_NEVER;
-}
-
-float axisDelta(float rd)
-{
-    return rd == 0.0 ? AXIS_NEVER : 1.0 / abs(rd);
-}
-
 float safeInv(float x)
 {
     return abs(x) < 0.000001 ? 1.0e20 : 1.0 / x;
 }
 
-bool rayBox(vec3 ro, vec3 rd, vec3 lo, vec3 hi, out float t0, out float t1)
+bool traceBox(vec3 ro, vec3 rd, int id, float maxDistance, out Hit hit)
 {
+    vec3 lo = vec3(BOXES[id].lo);
+    vec3 hi = vec3(BOXES[id].hi);
     vec3 inv = vec3(safeInv(rd.x), safeInv(rd.y), safeInv(rd.z));
 
     vec3 a = (lo - ro) * inv;
@@ -169,139 +123,39 @@ bool rayBox(vec3 ro, vec3 rd, vec3 lo, vec3 hi, out float t0, out float t1)
     vec3 near = min(a, b);
     vec3 far = max(a, b);
 
-    t0 = max(max(near.x, near.y), near.z);
-    t1 = min(min(far.x, far.y), far.z);
+    float t0 = max(max(near.x, near.y), near.z);
+    float t1 = min(min(far.x, far.y), far.z);
+    if (t1 < max(t0, SURFACE_EPSILON) || t0 > maxDistance)
+        return false;
 
-    return t1 >= max(t0, 0.0);
-}
+    vec3 nearNormal;
+    if (t0 == near.x)
+        nearNormal = vec3(rd.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
+    else if (t0 == near.y)
+        nearNormal = vec3(0.0, rd.y > 0.0 ? -1.0 : 1.0, 0.0);
+    else
+        nearNormal = vec3(0.0, 0.0, rd.z > 0.0 ? -1.0 : 1.0);
 
-ivec3 gridOfVoxel(ivec3 p)
-{
-    return (p - WORLD_MIN) / GRID_CELL_SIZE;
-}
+    vec3 farNormal;
+    if (t1 == far.x)
+        farNormal = vec3(rd.x > 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+    else if (t1 == far.y)
+        farNormal = vec3(0.0, rd.y > 0.0 ? 1.0 : -1.0, 0.0);
+    else
+        farNormal = vec3(0.0, 0.0, rd.z > 0.0 ? 1.0 : -1.0);
 
-ivec3 gridCellLo(ivec3 g)
-{
-    return WORLD_MIN + g * GRID_CELL_SIZE;
-}
-
-ivec3 gridCellHi(ivec3 g)
-{
-    return min(gridCellLo(g) + ivec3(GRID_CELL_SIZE), WORLD_MAX);
-}
-
-bool gridInside(ivec3 g)
-{
-    return all(greaterThanEqual(g, ivec3(0))) &&
-           all(lessThan(g, GRID_DIMS));
-}
-
-bool boxesOverlap(ivec3 aLo, ivec3 aHi, ivec3 bLo, ivec3 bHi)
-{
-    return all(lessThan(aLo, bHi)) &&
-           all(lessThan(bLo, aHi));
-}
-
-bool gridOccupied(ivec3 g)
-{
-    ivec3 lo = gridCellLo(g);
-    ivec3 hi = gridCellHi(g);
-
-    for (int i = 0; i < BOX_COUNT; i++) {
-        if (boxesOverlap(lo, hi, BOXES[i].lo, BOXES[i].hi))
-            return true;
+    float t = t0;
+    vec3 n = nearNormal;
+    if (t < SURFACE_EPSILON) {
+        t = t1;
+        n = farNormal;
     }
 
-    return false;
-}
+    if (t < SURFACE_EPSILON || t > maxDistance)
+        return false;
 
-vec3 boxNormalAt(vec3 p, int id)
-{
-    vec3 lo = vec3(BOXES[id].lo);
-    vec3 hi = vec3(BOXES[id].hi);
-    vec3 dLo = abs(p - lo);
-    vec3 dHi = abs(hi - p);
-
-    float d = dLo.x;
-    vec3 n = vec3(-1.0, 0.0, 0.0);
-
-    if (dHi.x < d) {
-        d = dHi.x;
-        n = vec3(1.0, 0.0, 0.0);
-    }
-    if (dLo.y < d) {
-        d = dLo.y;
-        n = vec3(0.0, -1.0, 0.0);
-    }
-    if (dHi.y < d) {
-        d = dHi.y;
-        n = vec3(0.0, 1.0, 0.0);
-    }
-    if (dLo.z < d) {
-        d = dLo.z;
-        n = vec3(0.0, 0.0, -1.0);
-    }
-    if (dHi.z < d)
-        n = vec3(0.0, 0.0, 1.0);
-
-    return n;
-}
-
-bool traceFine(vec3 ro, vec3 rd, float t0, float t1, vec3 entryNormal, out Hit hit)
-{
-    float t = t0 + SURFACE_EPSILON;
-    vec3 p0 = ro + rd * t;
-
-    ivec3 p = ivec3(floor(p0));
-    ivec3 s = ivec3(sign(rd));
-
-    vec3 side = vec3(
-        t + firstSideDistance(p0.x, rd.x, p.x),
-        t + firstSideDistance(p0.y, rd.y, p.y),
-        t + firstSideDistance(p0.z, rd.z, p.z)
-    );
-
-    vec3 delta = vec3(
-        axisDelta(rd.x),
-        axisDelta(rd.y),
-        axisDelta(rd.z)
-    );
-
-    vec3 n = entryNormal;
-
-    for (int i = 0; i < MAX_TRACE_STEPS; i++) {
-        if (t > t1)
-            break;
-
-        int id = voxelId(p);
-        if (id >= 0) {
-            if (dot(n, n) == 0.0)
-                n = boxNormalAt(ro + rd * t, id);
-
-            hit = Hit(t, n, id);
-            return true;
-        }
-
-        if (side.x <= side.y && side.x <= side.z) {
-            t = side.x;
-            side.x += delta.x;
-            p.x += s.x;
-            n = vec3(-s.x, 0, 0);
-        } else if (side.y <= side.z) {
-            t = side.y;
-            side.y += delta.y;
-            p.y += s.y;
-            n = vec3(0, -s.y, 0);
-        } else {
-            t = side.z;
-            side.z += delta.z;
-            p.z += s.z;
-            n = vec3(0, 0, -s.z);
-        }
-    }
-
-    hit = Hit(t1, vec3(0.0), -1);
-    return false;
+    hit = Hit(t, n, id);
+    return true;
 }
 
 bool trace(vec3 ro, vec3 rd, float maxDistance, out Hit hit)
@@ -314,86 +168,25 @@ bool trace(vec3 ro, vec3 rd, float maxDistance, out Hit hit)
             floorT = AXIS_NEVER;
     }
 
-    float boxEnter;
-    float boxExit;
-
-    bool hitWorld = rayBox(
-        ro,
-        rd,
-        vec3(WORLD_MIN),
-        vec3(WORLD_MAX),
-        boxEnter,
-        boxExit
-    );
-
-    if (!hitWorld || boxEnter > maxDistance || boxEnter > floorT) {
-        if (floorT <= maxDistance) {
-            hit = Hit(floorT, vec3(0.0, 1.0, 0.0), HIT_FLOOR);
-            return true;
-        }
-
-        hit = Hit(maxDistance, vec3(0.0), -1);
-        return false;
-    }
-
-    float t = max(boxEnter, 0.0) + SURFACE_EPSILON;
-    float limit = min(min(boxExit, maxDistance), floorT);
-
-    vec3 p0 = ro + rd * t;
-
-    ivec3 g = gridOfVoxel(ivec3(floor(p0)));
-    ivec3 s = ivec3(sign(rd));
-
-    vec3 cellLo = vec3(gridCellLo(g));
-    vec3 cellHi = vec3(gridCellHi(g));
-
-    vec3 side = vec3(
-        rd.x > 0.0 ? (cellHi.x - p0.x) / rd.x : rd.x < 0.0 ? (p0.x - cellLo.x) / -rd.x : AXIS_NEVER,
-        rd.y > 0.0 ? (cellHi.y - p0.y) / rd.y : rd.y < 0.0 ? (p0.y - cellLo.y) / -rd.y : AXIS_NEVER,
-        rd.z > 0.0 ? (cellHi.z - p0.z) / rd.z : rd.z < 0.0 ? (p0.z - cellLo.z) / -rd.z : AXIS_NEVER
-    ) + vec3(t);
-
-    vec3 delta = vec3(
-        axisDelta(rd.x) * float(GRID_CELL_SIZE),
-        axisDelta(rd.y) * float(GRID_CELL_SIZE),
-        axisDelta(rd.z) * float(GRID_CELL_SIZE)
-    );
-
-    vec3 coarseNormal = vec3(0.0);
-
-    for (int i = 0; i < MAX_TRACE_STEPS; i++) {
-        if (t > limit || !gridInside(g))
-            break;
-
-        float nextT = min(min(side.x, side.y), side.z);
-
-        if (gridOccupied(g)) {
-            if (traceFine(ro, rd, t, min(nextT, limit), coarseNormal, hit))
-                return true;
-        }
-
-        if (side.x <= side.y && side.x <= side.z) {
-            t = side.x;
-            side.x += delta.x;
-            g.x += s.x;
-            coarseNormal = vec3(-s.x, 0, 0);
-        } else if (side.y <= side.z) {
-            t = side.y;
-            side.y += delta.y;
-            g.y += s.y;
-            coarseNormal = vec3(0, -s.y, 0);
-        } else {
-            t = side.z;
-            side.z += delta.z;
-            g.z += s.z;
-            coarseNormal = vec3(0, 0, -s.z);
-        }
-    }
-
+    bool found = false;
+    float closest = maxDistance;
     if (floorT <= maxDistance) {
         hit = Hit(floorT, vec3(0.0, 1.0, 0.0), HIT_FLOOR);
-        return true;
+        closest = floorT;
+        found = true;
     }
+
+    for (int i = 0; i < BOX_COUNT; i++) {
+        Hit boxHit;
+        if (traceBox(ro, rd, i, closest, boxHit)) {
+            hit = boxHit;
+            closest = boxHit.t;
+            found = true;
+        }
+    }
+
+    if (found)
+        return true;
 
     hit = Hit(maxDistance, vec3(0.0), -1);
     return false;
@@ -497,26 +290,19 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint rng)
 
 Camera camera()
 {
-    float a = CAMERA_ORBIT_ANGLE + pc.time * CAMERA_ORBIT_SPEED;
-
-    vec3 ro = CAMERA_TARGET + vec3(
-        sin(a) * CAMERA_ORBIT_RADIUS,
-        CAMERA_HEIGHT,
-        cos(a) * CAMERA_ORBIT_RADIUS
+    return Camera(
+        pc.cameraRoTime.xyz,
+        pc.cameraRight.xyz,
+        pc.cameraUp.xyz,
+        pc.cameraForward.xyz
     );
-
-    vec3 f = normalize(CAMERA_TARGET - ro);
-    vec3 r = normalize(cross(f, vec3(0.0, 1.0, 0.0)));
-    vec3 u = cross(r, f);
-
-    return Camera(ro, r, u, f);
 }
 
 vec3 cameraRay(Camera c, vec2 uv)
 {
     return normalize(c.right * uv.x +
                      c.up * uv.y +
-                     c.forward * CAMERA_FOCAL_LENGTH);
+                     c.forward * pc.cameraForward.w);
 }
 
 vec2 pixelUv(ivec2 px, ivec2 sz, vec2 jitter)
