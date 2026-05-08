@@ -2,7 +2,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
 #include <stdint.h>
-#include "gradient_comp_spv.h"
+#include "trace_comp_spv.h"
 #include "platform.h"
 
 #define SWAP_IMAGE_COUNT  3
@@ -192,8 +192,8 @@ int main(void)
     VkShaderModule shaderModule;
     vkCreateShaderModule(device, &(VkShaderModuleCreateInfo){
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = gradientCompSpv_size,
-        .pCode    = gradientCompSpv,
+        .codeSize = traceCompSpv_size,
+        .pCode    = traceCompSpv,
     }, NULL, &shaderModule);
 
     vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &(VkComputePipelineCreateInfo){

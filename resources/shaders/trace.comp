@@ -1,0 +1,188 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0, rgba8) uniform writeonly image2D outImage;
+
+const uint MAT_EMPTY = 0u;
+const uint MAT_FLOOR = 1u;
+const uint MAT_RED   = 2u;
+const uint MAT_GREEN = 3u;
+const uint MAT_BLUE  = 4u;
+const uint MAT_LIGHT = 5u;
+
+bool box(ivec3 p, ivec3 lo, ivec3 hi)
+{
+    return all(greaterThanEqual(p, lo)) &&
+           all(lessThan(p, hi));
+}
+
+uint voxel(ivec3 p)
+{
+    if (p.y < 0)
+        return MAT_FLOOR;
+
+    // left block
+    if (box(p, ivec3(-5, 0,  8), ivec3(-3, 2, 10)))
+        return MAT_RED;
+
+    // middle block
+    if (box(p, ivec3(-1, 0, 10), ivec3( 1, 4, 12)))
+        return MAT_GREEN;
+
+    // right block
+    if (box(p, ivec3( 3, 0,  8), ivec3( 5, 3, 10)))
+        return MAT_BLUE;
+
+    // small floating block
+    if (box(p, ivec3( 0, 5,  7), ivec3( 2, 6,  9)))
+        return MAT_RED;
+
+    // ceiling light
+    if (box(p, ivec3(-2, 7,  9), ivec3( 2, 8, 13)))
+        return MAT_LIGHT;
+
+    return MAT_EMPTY;
+}
+
+vec3 albedo(uint m)
+{
+    if (m == MAT_FLOOR) return vec3(0.8);
+    if (m == MAT_RED)   return vec3(0.8, 0.2, 0.2);
+    if (m == MAT_GREEN) return vec3(0.2, 0.8, 0.2);
+    if (m == MAT_BLUE)  return vec3(0.2, 0.4, 0.9);
+    return vec3(0.0);
+}
+
+vec3 emission(uint m)
+{
+    return m == MAT_LIGHT ? vec3(8.0, 7.0, 6.0) : vec3(0.0);
+}
+
+uint hash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint s)
+{
+    s = hash(s);
+    return float(s) / 4294967295.0;
+}
+
+vec3 hemi(vec3 n, inout uint rng)
+{
+    vec3 d = normalize(vec3(
+        rand(rng) * 2.0 - 1.0,
+        rand(rng) * 2.0 - 1.0,
+        rand(rng) * 2.0 - 1.0
+    ));
+
+    return dot(d, n) < 0.0 ? -d : d;
+}
+
+bool trace(vec3 ro, vec3 rd, out vec3 hp, out vec3 hn, out uint hm)
+{
+    ivec3 p = ivec3(floor(ro));
+    ivec3 s = ivec3(sign(rd));
+
+    vec3 inv   = 1.0 / rd;
+    vec3 side  = (vec3(p) + step(vec3(0.0), rd) - ro) * inv;
+    vec3 delta = abs(inv);
+
+    float t = 0.0;
+    hn = vec3(0.0);
+
+    for (int i = 0; i < 128; i++) {
+        hm = voxel(p);
+        if (hm != MAT_EMPTY) {
+            hp = ro + rd * t;
+            return true;
+        }
+
+        if (side.x < side.y && side.x < side.z) {
+            t = side.x;
+            side.x += delta.x;
+            p.x += s.x;
+            hn = vec3(-s.x, 0, 0);
+        } else if (side.y < side.z) {
+            t = side.y;
+            side.y += delta.y;
+            p.y += s.y;
+            hn = vec3(0, -s.y, 0);
+        } else {
+            t = side.z;
+            side.z += delta.z;
+            p.z += s.z;
+            hn = vec3(0, 0, -s.z);
+        }
+    }
+
+    return false;
+}
+
+vec3 sky(vec3 rd)
+{
+    float t = 0.5 * (rd.y + 1.0);
+    return mix(vec3(0.7, 0.8, 1.0), vec3(0.2, 0.3, 0.5), t);
+}
+
+vec3 pathTrace(vec3 ro, vec3 rd, inout uint rng)
+{
+    vec3 L = vec3(0.0);
+    vec3 T = vec3(1.0);
+
+    for (int bounce = 0; bounce < 3; bounce++) {
+        vec3 hp, hn;
+        uint hm;
+
+        if (!trace(ro, rd, hp, hn, hm)) {
+            L += T * sky(rd);
+            break;
+        }
+
+        vec3 E = emission(hm);
+        if (max(E.r, max(E.g, E.b)) > 0.0) {
+            L += T * E;
+            break;
+        }
+
+        T *= albedo(hm);
+        ro = hp + hn * 0.001;
+        rd = hemi(hn, rng);
+    }
+
+    return L;
+}
+
+vec3 tonemap(vec3 x)
+{
+    return x / (x + vec3(1.0));
+}
+
+void main()
+{
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(outImage);
+
+    if (any(greaterThanEqual(px, sz)))
+        return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(sz) * 2.0 - 1.0;
+    uv.x *= float(sz.x) / float(sz.y);
+    uv.y = -uv.y;
+
+    vec3 ro = vec3(0.0, 2.5, -8.0);
+    vec3 rd = normalize(vec3(uv.x, uv.y, 1.5));
+
+    uint rng = uint(px.x) * 1973u + uint(px.y) * 9277u + 1u;
+
+    vec3 color = pathTrace(ro, rd, rng);
+    color = pow(tonemap(color), vec3(1.0 / 2.2));
+
+    imageStore(outImage, px, vec4(color, 1.0));
+}

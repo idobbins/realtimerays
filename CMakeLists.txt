@@ -31,33 +31,33 @@ set(SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/resources/shaders)
 set(SHADER_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders)
 set(SHADER_EMBED_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake)
 
-set(GRADIENT_COMP_SOURCE ${SHADER_SOURCE_DIR}/gradient.comp)
-set(GRADIENT_COMP_SPV ${SHADER_GENERATED_DIR}/gradient.comp.spv)
-set(GRADIENT_COMP_HEADER ${SHADER_GENERATED_DIR}/gradient_comp_spv.h)
+set(TRACE_COMP_SOURCE ${SHADER_SOURCE_DIR}/trace.comp)
+set(TRACE_COMP_SPV ${SHADER_GENERATED_DIR}/trace.comp.spv)
+set(TRACE_COMP_HEADER ${SHADER_GENERATED_DIR}/trace_comp_spv.h)
 
 add_custom_command(
-    OUTPUT ${GRADIENT_COMP_SPV}
+    OUTPUT ${TRACE_COMP_SPV}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_GENERATED_DIR}
-    COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${GRADIENT_COMP_SOURCE} -o ${GRADIENT_COMP_SPV}
-    DEPENDS ${GRADIENT_COMP_SOURCE}
-    COMMENT "Compiling gradient.comp to SPIR-V"
+    COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${TRACE_COMP_SOURCE} -o ${TRACE_COMP_SPV}
+    DEPENDS ${TRACE_COMP_SOURCE}
+    COMMENT "Compiling trace.comp to SPIR-V"
     VERBATIM
 )
 
 add_custom_command(
-    OUTPUT ${GRADIENT_COMP_HEADER}
+    OUTPUT ${TRACE_COMP_HEADER}
     COMMAND ${CMAKE_COMMAND}
-        -DINPUT_FILE=${GRADIENT_COMP_SPV}
-        -DOUTPUT_FILE=${GRADIENT_COMP_HEADER}
-        -DSYMBOL_NAME=gradientCompSpv
+        -DINPUT_FILE=${TRACE_COMP_SPV}
+        -DOUTPUT_FILE=${TRACE_COMP_HEADER}
+        -DSYMBOL_NAME=traceCompSpv
         -P ${SHADER_EMBED_SCRIPT}
-    DEPENDS ${GRADIENT_COMP_SPV} ${SHADER_EMBED_SCRIPT}
-    COMMENT "Embedding gradient.comp.spv into C header"
+    DEPENDS ${TRACE_COMP_SPV} ${SHADER_EMBED_SCRIPT}
+    COMMENT "Embedding trace.comp.spv into C header"
     VERBATIM
 )
 
 add_custom_target(embedded_shaders
-    DEPENDS ${GRADIENT_COMP_HEADER}
+    DEPENDS ${TRACE_COMP_HEADER}
 )
 
 set(PLATFORM_SOURCES)
