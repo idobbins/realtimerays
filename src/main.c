@@ -38,6 +38,7 @@ static VkCommandBuffer       cb;
 static VkSemaphore           imageAvailable;
 static VkSemaphore           renderFinished;
 static VkFence               inFlight;
+
 static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage image)
 {
     VkImageSubresourceRange range = {
