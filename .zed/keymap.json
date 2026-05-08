@@ -4,8 +4,8 @@
     "bindings": {
       "f5": [
         "task::Spawn",
-        { "task_name": "build and run (windows)", "reveal_target": "dock" },
-      ],
-    },
-  },
+        { "task_name": "build and run", "reveal_target": "dock" }
+      ]
+    }
+  }
 ]

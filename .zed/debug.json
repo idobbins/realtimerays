@@ -1,20 +1,11 @@
 [
   {
-    "label": "greatbadbeyond (windows)",
+    "label": "greatbadbeyond",
     "adapter": "CodeLLDB",
     "request": "launch",
-    "build": "build (windows)",
+    "build": "build",
     "cwd": "$ZED_WORKTREE_ROOT",
-    "program": "$ZED_WORKTREE_ROOT/build/debug/Debug/greatbadbeyond.exe",
-    "args": []
-  },
-  {
-    "label": "greatbadbeyond (macOS)",
-    "adapter": "CodeLLDB",
-    "request": "launch",
-    "build": "build (macOS)",
-    "cwd": "$ZED_WORKTREE_ROOT",
-    "program": "$ZED_WORKTREE_ROOT/build/debug/greatbadbeyond",
+    "program": "$ZED_WORKTREE_ROOT/build/greatbadbeyond",
     "args": []
   }
 ]
