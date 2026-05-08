@@ -7,9 +7,13 @@ layout(push_constant) uniform Push {
     float time;
 } pc;
 
-const int MAX_TRACE_STEPS = 128;
-const int MAX_BOUNCES = 3;
+const int MAX_TRACE_STEPS = 96;
+const int AA_SAMPLE_COUNT = 4;
+const int INDIRECT_SAMPLE_COUNT = 4;
 const float SURFACE_EPSILON = 0.001;
+const float MAX_RAY_DISTANCE = 80.0;
+const float AXIS_NEVER = 1.0e20;
+const float INDIRECT_STRENGTH = 0.42;
 const float GAMMA = 2.2;
 
 const float CAMERA_ORBIT_SPEED = 0.12;
@@ -18,6 +22,23 @@ const float CAMERA_ORBIT_RADIUS = 16.0;
 const float CAMERA_HEIGHT = 6.0;
 const float CAMERA_FOCAL_LENGTH = 1.5;
 const vec3 CAMERA_TARGET = vec3(0.0, 2.25, 0.0);
+
+const vec3 LIGHT_POSITION = vec3(-0.5, 8.5, 3.0);
+const vec3 LIGHT_COLOR = vec3(5.2, 4.6, 3.8);
+
+const vec2 AA_OFFSETS[AA_SAMPLE_COUNT] = vec2[AA_SAMPLE_COUNT](
+    vec2(-0.25, -0.25),
+    vec2( 0.25, -0.25),
+    vec2(-0.25,  0.25),
+    vec2( 0.25,  0.25)
+);
+
+const vec2 INDIRECT_OFFSETS[INDIRECT_SAMPLE_COUNT] = vec2[INDIRECT_SAMPLE_COUNT](
+    vec2( 0.00,  0.00),
+    vec2( 0.54,  0.18),
+    vec2(-0.34,  0.50),
+    vec2( 0.18, -0.62)
+);
 
 const uint MAT_EMPTY = 0u;
 const uint MAT_FLOOR = 1u;
@@ -51,6 +72,13 @@ struct VoxelBox {
     ivec3 lo;
     ivec3 hi;
     uint mat;
+};
+
+struct Hit {
+    vec3 position;
+    vec3 normal;
+    uint material;
+    float distance;
 };
 
 const VoxelBox SCENE_BOXES[SCENE_BOX_COUNT] = VoxelBox[SCENE_BOX_COUNT](
@@ -103,105 +131,185 @@ vec3 emission(uint m)
     return MATERIAL_EMISSION[int(m)];
 }
 
-uint hash(uint x)
+float firstSideDistance(float ro, float rd, int cell)
 {
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
+    if (rd > 0.0)
+        return (float(cell + 1) - ro) / rd;
+
+    if (rd < 0.0)
+        return (ro - float(cell)) / -rd;
+
+    return AXIS_NEVER;
 }
 
-float rand(inout uint s)
+float axisDelta(float rd)
 {
-    s = hash(s);
-    return float(s) / 4294967295.0;
+    return rd == 0.0 ? AXIS_NEVER : 1.0 / abs(rd);
 }
 
-vec3 hemi(vec3 n, inout uint rng)
-{
-    vec3 d = normalize(vec3(
-        rand(rng) * 2.0 - 1.0,
-        rand(rng) * 2.0 - 1.0,
-        rand(rng) * 2.0 - 1.0
-    ));
-
-    return dot(d, n) < 0.0 ? -d : d;
-}
-
-bool trace(vec3 ro, vec3 rd, out vec3 hp, out vec3 hn, out uint hm)
+bool trace(vec3 ro, vec3 rd, float maxDistance, out Hit hit)
 {
     ivec3 p = ivec3(floor(ro));
     ivec3 s = ivec3(sign(rd));
 
-    vec3 inv   = 1.0 / rd;
-    vec3 side  = (vec3(p) + step(vec3(0.0), rd) - ro) * inv;
-    vec3 delta = abs(inv);
+    vec3 side = vec3(
+        firstSideDistance(ro.x, rd.x, p.x),
+        firstSideDistance(ro.y, rd.y, p.y),
+        firstSideDistance(ro.z, rd.z, p.z)
+    );
+
+    vec3 delta = vec3(
+        axisDelta(rd.x),
+        axisDelta(rd.y),
+        axisDelta(rd.z)
+    );
 
     float t = 0.0;
-    hn = vec3(0.0);
+    vec3 n = vec3(0.0);
 
     for (int i = 0; i < MAX_TRACE_STEPS; i++) {
-        hm = voxel(p);
-        if (hm != MAT_EMPTY) {
-            hp = ro + rd * t;
+        if (t > maxDistance)
+            break;
+
+        uint material = voxel(p);
+        if (material != MAT_EMPTY) {
+            hit = Hit(ro + rd * t, n, material, t);
             return true;
         }
 
-        if (side.x < side.y && side.x < side.z) {
+        if (side.x <= side.y && side.x <= side.z) {
             t = side.x;
             side.x += delta.x;
             p.x += s.x;
-            hn = vec3(-s.x, 0, 0);
-        } else if (side.y < side.z) {
+            n = vec3(-s.x, 0, 0);
+        } else if (side.y <= side.z) {
             t = side.y;
             side.y += delta.y;
             p.y += s.y;
-            hn = vec3(0, -s.y, 0);
+            n = vec3(0, -s.y, 0);
         } else {
             t = side.z;
             side.z += delta.z;
             p.z += s.z;
-            hn = vec3(0, 0, -s.z);
+            n = vec3(0, 0, -s.z);
         }
     }
 
+    hit = Hit(ro + rd * maxDistance, vec3(0.0), MAT_EMPTY, maxDistance);
     return false;
 }
 
 vec3 sky(vec3 rd)
 {
-    float t = 0.5 * (rd.y + 1.0);
-    return mix(vec3(0.7, 0.8, 1.0), vec3(0.2, 0.3, 0.5), t);
+    float t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+    return mix(vec3(0.78, 0.84, 0.92), vec3(0.30, 0.40, 0.58), t);
 }
 
-vec3 pathTrace(vec3 ro, vec3 rd, inout uint rng)
+float lightVisibility(vec3 origin)
 {
-    vec3 L = vec3(0.0);
-    vec3 T = vec3(1.0);
+    vec3 toLight = LIGHT_POSITION - origin;
+    float distanceToLight = length(toLight);
 
-    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
-        vec3 hp, hn;
-        uint hm;
+    if (distanceToLight <= SURFACE_EPSILON)
+        return 1.0;
 
-        if (!trace(ro, rd, hp, hn, hm)) {
-            L += T * sky(rd);
-            break;
-        }
+    Hit shadowHit;
+    vec3 lightDirection = toLight / distanceToLight;
+    if (!trace(origin, lightDirection, distanceToLight - SURFACE_EPSILON, shadowHit))
+        return 1.0;
 
-        vec3 E = emission(hm);
-        if (max(E.r, max(E.g, E.b)) > 0.0) {
-            L += T * E;
-            break;
-        }
+    return shadowHit.material == MAT_LIGHT ? 1.0 : 0.0;
+}
 
-        T *= albedo(hm);
-        ro = hp + hn * SURFACE_EPSILON;
-        rd = hemi(hn, rng);
-    }
+vec3 directLight(vec3 p, vec3 n)
+{
+    vec3 toLight = LIGHT_POSITION - p;
+    float distanceSquared = max(dot(toLight, toLight), 0.0001);
+    vec3 lightDirection = toLight * inversesqrt(distanceSquared);
 
-    return L;
+    float lambert = max(dot(n, lightDirection), 0.0);
+    float visibility = lambert > 0.0 ? lightVisibility(p) : 0.0;
+    float attenuation = 1.0 / (1.0 + 0.035 * distanceSquared);
+
+    return LIGHT_COLOR * lambert * visibility * attenuation;
+}
+
+vec3 ambientLight(vec3 n)
+{
+    return mix(
+        vec3(0.08, 0.08, 0.10),
+        vec3(0.26, 0.34, 0.46),
+        clamp(n.y * 0.5 + 0.5, 0.0, 1.0)
+    );
+}
+
+vec3 tangentFor(vec3 n)
+{
+    vec3 up = abs(n.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    return normalize(cross(up, n));
+}
+
+vec3 hemiDirection(vec3 n, int sampleIndex)
+{
+    vec2 d = INDIRECT_OFFSETS[sampleIndex % INDIRECT_SAMPLE_COUNT];
+    float z = sqrt(max(0.0, 1.0 - dot(d, d)));
+    vec3 t = tangentFor(n);
+    vec3 b = cross(n, t);
+    return normalize(t * d.x + b * d.y + n * z);
+}
+
+vec3 surfaceRadiance(Hit hit, vec3 rd, bool includeAmbient)
+{
+    vec3 E = emission(hit.material);
+    if (max(E.r, max(E.g, E.b)) > 0.0)
+        return E;
+
+    vec3 n = hit.normal;
+    vec3 p = hit.position + n * SURFACE_EPSILON;
+    vec3 base = albedo(hit.material);
+    vec3 light = directLight(p, n);
+
+    if (includeAmbient)
+        light += ambientLight(n);
+
+    float edge = pow(1.0 - max(dot(n, -rd), 0.0), 2.0);
+    vec3 grazing = vec3(0.08, 0.10, 0.13) * edge;
+
+    return base * light + (includeAmbient ? grazing : vec3(0.0));
+}
+
+vec3 indirectRadiance(Hit hit, int sampleIndex)
+{
+    vec3 n = hit.normal;
+    vec3 p = hit.position + n * SURFACE_EPSILON;
+    vec3 rd = hemiDirection(n, sampleIndex);
+
+    Hit bounceHit;
+    vec3 incoming = trace(p, rd, MAX_RAY_DISTANCE, bounceHit) ?
+        surfaceRadiance(bounceHit, rd, false) :
+        sky(rd);
+
+    return albedo(hit.material) * incoming * (INDIRECT_STRENGTH * max(dot(n, rd), 0.0));
+}
+
+vec3 shade(Hit hit, vec3 rd, int sampleIndex)
+{
+    vec3 E = emission(hit.material);
+    if (max(E.r, max(E.g, E.b)) > 0.0)
+        return E;
+
+    return surfaceRadiance(hit, rd, true) + indirectRadiance(hit, sampleIndex);
+}
+
+vec3 pathTrace(vec3 ro, vec3 rd, int sampleIndex)
+{
+    Hit hit;
+    if (!trace(ro, rd, MAX_RAY_DISTANCE, hit))
+        return sky(rd);
+
+    vec3 color = shade(hit, rd, sampleIndex);
+    float fog = smoothstep(24.0, 72.0, hit.distance) * 0.65;
+    return mix(color, sky(rd), fog);
 }
 
 vec3 tonemap(vec3 x)
@@ -217,10 +325,6 @@ void main()
     if (any(greaterThanEqual(px, sz)))
         return;
 
-    vec2 uv = (vec2(px) + 0.5) / vec2(sz) * 2.0 - 1.0;
-    uv.x *= float(sz.x) / float(sz.y);
-    uv.y = -uv.y;
-
     // Real-time orbital camera looking at the configured target.
     float orbitAngle = CAMERA_ORBIT_ANGLE + pc.time * CAMERA_ORBIT_SPEED;
 
@@ -232,13 +336,19 @@ void main()
 
     vec3 forward = normalize(CAMERA_TARGET - ro);
     vec3 right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
-    vec3 up = cross(right, forward);
+    vec3 up = normalize(cross(right, forward));
 
-    vec3 rd = normalize(right * uv.x + up * uv.y + forward * CAMERA_FOCAL_LENGTH);
+    vec3 color = vec3(0.0);
+    for (int i = 0; i < AA_SAMPLE_COUNT; i++) {
+        vec2 uv = (vec2(px) + 0.5 + AA_OFFSETS[i]) / vec2(sz) * 2.0 - 1.0;
+        uv.x *= float(sz.x) / float(sz.y);
+        uv.y = -uv.y;
 
-    uint rng = uint(px.x) * 1973u + uint(px.y) * 9277u + 1u;
+        vec3 rd = normalize(right * uv.x + up * uv.y + forward * CAMERA_FOCAL_LENGTH);
+        color += pathTrace(ro, rd, i);
+    }
 
-    vec3 color = pathTrace(ro, rd, rng);
+    color /= float(AA_SAMPLE_COUNT);
     color = pow(tonemap(color), vec3(1.0 / GAMMA));
 
     imageStore(outImage, px, vec4(color, 1.0));
