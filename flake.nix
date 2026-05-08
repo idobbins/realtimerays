@@ -113,6 +113,113 @@
               exec "$build_dir/greatbadbeyond" "$@"
             '';
           };
+
+          syncZedConfig = pkgs.writeShellApplication {
+            name = "realtimerays-sync-zed-config";
+            runtimeInputs = [ pkgs.coreutils ];
+            text = ''
+                            root="''${1:-}"
+                            if [ -z "$root" ]; then
+                              root="''${REALTIMERAYS_ROOT:-$PWD}"
+                            fi
+
+                            zed_dir="$root/.zed"
+                            mkdir -p "$zed_dir"
+
+                            cat > "$zed_dir/debug.json" <<'JSON'
+              [
+                {
+                  "label": "greatbadbeyond",
+                  "adapter": "CodeLLDB",
+                  "request": "launch",
+                  "build": "build",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "program": "$ZED_WORKTREE_ROOT/build/greatbadbeyond",
+                  "args": []
+                }
+              ]
+              JSON
+
+                            cat > "$zed_dir/keymap.json" <<'JSON'
+              [
+                {
+                  "context": "Workspace",
+                  "bindings": {
+                    "f5": [
+                      "task::Spawn",
+                      { "task_name": "build and run", "reveal_target": "dock" }
+                    ]
+                  }
+                }
+              ]
+              JSON
+
+                            cat > "$zed_dir/tasks.json" <<'JSON'
+              [
+                {
+                  "label": "configure",
+                  "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-configure",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": false,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                },
+                {
+                  "label": "build",
+                  "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-build",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": false,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                },
+                {
+                  "label": "build and run",
+                  "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-run",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": true,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                },
+                {
+                  "label": "clean build",
+                  "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays clean-build",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": false,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                },
+                {
+                  "label": "sync zed config",
+                  "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-sync-zed-config \"$ZED_WORKTREE_ROOT\"",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": false,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                },
+                {
+                  "label": "nix build package",
+                  "command": "nix build path:\"$ZED_WORKTREE_ROOT\"",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": false,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                },
+                {
+                  "label": "nix run package",
+                  "command": "nix run path:\"$ZED_WORKTREE_ROOT\"",
+                  "cwd": "$ZED_WORKTREE_ROOT",
+                  "use_new_terminal": true,
+                  "allow_concurrent_runs": false,
+                  "reveal": "always"
+                }
+              ]
+              JSON
+
+                            echo "wrote $zed_dir/debug.json"
+                            echo "wrote $zed_dir/keymap.json"
+                            echo "wrote $zed_dir/tasks.json"
+            '';
+          };
         in
         {
           packages = {
@@ -170,6 +277,7 @@
             configure = configureLocal;
             build-local = buildLocal;
             run-local = runLocal;
+            sync-zed-config = syncZedConfig;
           };
 
           apps = {
@@ -189,6 +297,10 @@
               type = "app";
               program = "${runLocal}/bin/realtimerays-run";
             };
+            sync-zed-config = {
+              type = "app";
+              program = "${syncZedConfig}/bin/realtimerays-sync-zed-config";
+            };
           };
 
           devShells.default = pkgs.mkShell {
@@ -196,6 +308,7 @@
               configureLocal
               buildLocal
               runLocal
+              syncZedConfig
               pkgs.cmake
               pkgs.ninja
               pkgs.pkg-config
@@ -217,6 +330,8 @@
                             export VK_ICD_FILENAMES="''${VK_ICD_FILENAMES:-${moltenvkIcd}}"
                             export DYLD_LIBRARY_PATH="${vulkanRuntimeLibPath}:''${DYLD_LIBRARY_PATH:-}"
 
+                            realtimerays-sync-zed-config "$PWD" >/dev/null
+
                             if [ ! -f "$PWD/build/compile_commands.json" ]; then
                               realtimerays-configure >/dev/null || true
                             elif [ ! -e "$PWD/compile_commands.json" ]; then
@@ -235,6 +350,7 @@
               alias build='realtimerays-build'
               alias run='realtimerays-run'
               alias clean-build='realtimerays clean-build'
+              alias sync-zed='realtimerays-sync-zed-config'
               alias nix-build='nix build path:$PWD'
               alias nix-run='nix run path:$PWD'
 
@@ -245,11 +361,12 @@
                   build) shift; realtimerays-build "$@" ;;
                   run) shift; realtimerays-run "$@" ;;
                   clean-build) shift; rm -rf "''${REALTIMERAYS_BUILD_DIR:-''${REALTIMERAYS_ROOT:-$PWD}/build}" && realtimerays-build "$@" ;;
+                  sync-zed|sync-zed-config) shift; realtimerays-sync-zed-config "$@" ;;
                   nix-build) shift; nix build path:$PWD "$@" ;;
                   nix-run) shift; nix run path:$PWD "$@" ;;
                   ""|-h|--help|help)
                     print 'usage: realtimerays <command>'
-                    print 'commands: configure build run clean-build nix-build nix-run'
+                    print 'commands: configure build run clean-build sync-zed nix-build nix-run'
                     ;;
                   *)
                     print -u2 "realtimerays: unknown command: $cmd"

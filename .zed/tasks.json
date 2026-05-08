@@ -1,15 +1,7 @@
 [
   {
-    "label": "generate shaders",
-    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-generate-shaders \"$ZED_WORKTREE_ROOT\"",
-    "cwd": "$ZED_WORKTREE_ROOT",
-    "use_new_terminal": false,
-    "allow_concurrent_runs": false,
-    "reveal": "always"
-  },
-  {
-    "label": "compile commands",
-    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-compile-commands \"$ZED_WORKTREE_ROOT\"",
+    "label": "configure",
+    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-configure",
     "cwd": "$ZED_WORKTREE_ROOT",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
@@ -17,7 +9,7 @@
   },
   {
     "label": "build",
-    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-build \"$ZED_WORKTREE_ROOT\"",
+    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-build",
     "cwd": "$ZED_WORKTREE_ROOT",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
@@ -25,9 +17,25 @@
   },
   {
     "label": "build and run",
-    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command sh -c 'realtimerays-build \"$ZED_WORKTREE_ROOT\" && \"$ZED_WORKTREE_ROOT/build/greatbadbeyond\"'",
+    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-run",
     "cwd": "$ZED_WORKTREE_ROOT",
     "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "clean build",
+    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays clean-build",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "sync zed config",
+    "command": "nix develop path:\"$ZED_WORKTREE_ROOT\" --command realtimerays-sync-zed-config \"$ZED_WORKTREE_ROOT\"",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": false,
     "allow_concurrent_runs": false,
     "reveal": "always"
   },
