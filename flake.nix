@@ -185,8 +185,9 @@
           };
 
           projectZshrc = pkgs.writeText "realtimerays-zshrc" ''
-            # Nix-managed project zsh config.
-            autoload -Uz colors && colors
+            # Nix-managed project zsh config. The generated .zshrc sources
+            # ~/.zshrc first, so your devkit/home-manager prompt, aliases,
+            # autosuggestions, fzf, and completion setup remain authoritative.
             setopt auto_cd interactive_comments prompt_subst
             bindkey -e
 
@@ -201,7 +202,60 @@
             alias nix-run='nix run path:$PWD'
             alias clean-build='rm -rf build && realtimerays-build'
 
-            PROMPT='%F{cyan}realtimerays%f %F{yellow}%~%f %# '
+            _realtimerays_no_args() {
+              _message 'no arguments'
+            }
+
+            _realtimerays_nix_run() {
+              local -a targets
+              targets=(
+                'build:local editable build into ./build/greatbadbeyond'
+                'compile-commands:generate compile_commands.json and generated shader header'
+                'generate-shaders:compile GLSL and embed SPIR-V header'
+              )
+              _describe 'nix app' targets
+            }
+
+            _realtimerays_project_command() {
+              local -a commands
+              commands=(
+                'build:compile shaders and native executable into ./build'
+                'run:build and run ./build/greatbadbeyond'
+                'clean-build:remove ./build and rebuild'
+                'compile-commands:generate compile_commands.json for editor/LSP'
+                'gen-shaders:compile GLSL and embed SPIR-V header'
+                'nix-build:build packaged app with nix build path:$PWD'
+                'nix-run:run packaged app with nix run path:$PWD'
+              )
+              _describe 'realtimerays command' commands
+            }
+
+            if (( $+functions[compdef] )); then
+              compdef _realtimerays_no_args build run clean-build compile-commands gen-shaders nix-build
+              compdef _realtimerays_nix_run nix-run
+              compdef _realtimerays_project_command realtimerays
+            fi
+
+            realtimerays() {
+              local cmd="''${1:-}"
+              case "$cmd" in
+                build) shift; realtimerays-build "$@" ;;
+                run) shift; realtimerays-build "$@" && ./build/greatbadbeyond ;;
+                clean-build) shift; rm -rf build && realtimerays-build "$@" ;;
+                compile-commands) shift; realtimerays-compile-commands "$@" ;;
+                gen-shaders|generate-shaders) shift; realtimerays-generate-shaders "$@" ;;
+                nix-build) shift; nix build path:$PWD "$@" ;;
+                nix-run) shift; nix run path:$PWD "$@" ;;
+                ""|-h|--help|help)
+                  print 'usage: realtimerays <command>'
+                  print 'commands: build run clean-build compile-commands gen-shaders nix-build nix-run'
+                  ;;
+                *)
+                  print -u2 "realtimerays: unknown command: $cmd"
+                  return 2
+                  ;;
+              esac
+            }
           '';
         in
         {
