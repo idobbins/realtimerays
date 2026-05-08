@@ -2,6 +2,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
 #include <stdint.h>
+#include <time.h>
 #include "trace_comp_spv.h"
 #include "platform.h"
 
@@ -39,7 +40,14 @@ static VkSemaphore           imageAvailable;
 static VkSemaphore           renderFinished;
 static VkFence               inFlight;
 
-static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage image)
+static double nowSeconds(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage image, float time)
 {
     VkImageSubresourceRange range = {
         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -66,6 +74,7 @@ static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage 
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &ds, 0, NULL);
+    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(time), &time);
     vkCmdDispatch(cb,
         (swapExtent.width  + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
         (swapExtent.height + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
@@ -184,9 +193,15 @@ int main(void)
     }, &descriptorSet);
 
     vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
-        .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts    = &descriptorSetLayout,
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount         = 1,
+        .pSetLayouts            = &descriptorSetLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &(VkPushConstantRange){
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset     = 0,
+            .size       = sizeof(float),
+        },
     }, NULL, &pipelineLayout);
 
     VkShaderModule shaderModule;
@@ -232,6 +247,8 @@ int main(void)
         .flags = VK_FENCE_CREATE_SIGNALED_BIT,
     }, NULL, &inFlight);
 
+    double startTime = nowSeconds();
+
     while (rtrPumpEventsOnce() == 0) {
         vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &inFlight);
@@ -250,8 +267,10 @@ int main(void)
             },
         }, 0, NULL);
 
+        float time = (float)(nowSeconds() - startTime);
+
         vkResetCommandBuffer(cb, 0);
-        recordCommandBuffer(cb, descriptorSet, swapImages[imageIndex]);
+        recordCommandBuffer(cb, descriptorSet, swapImages[imageIndex], time);
 
         vkQueueSubmit(queue, 1, &(VkSubmitInfo){
             .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
