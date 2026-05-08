@@ -106,7 +106,7 @@ static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage 
 
 int main(void)
 {
-    gbbInitWindow(1280u, 720u, APPLICATION_NAME);
+    rtrInitWindow(1280u, 720u, APPLICATION_NAME);
 
     vkCreateInstance(&(VkInstanceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -290,7 +290,7 @@ int main(void)
 
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     uint32_t frameIndex = 0u;
-    while (gbbPumpEventsOnce() == 0)
+    while (rtrPumpEventsOnce() == 0)
     {
         uint32_t fi = frameIndex;
         vkWaitForFences(device, 1u, &inFlightFences[fi], VK_TRUE, UINT64_MAX);

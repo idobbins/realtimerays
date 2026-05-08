@@ -13,9 +13,9 @@ extern void *window_handle;
 extern void *surface_layer;
 #endif
 
-int gbbInitWindow(uint32_t width, uint32_t height, const char* title);
-void gbbShutdownWindow(void);
-int gbbPumpEventsOnce(void);
+int rtrInitWindow(uint32_t width, uint32_t height, const char* title);
+void rtrShutdownWindow(void);
+int rtrPumpEventsOnce(void);
 
 #ifdef __cplusplus
 }

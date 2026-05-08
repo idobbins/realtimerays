@@ -8,7 +8,7 @@ static HINSTANCE instance_handle = NULL;
 void *window_handle = NULL;
 static uint32_t should_quit = 0u;
 
-static LRESULT CALLBACK gbbWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+static LRESULT CALLBACK rtrWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     switch (message)
     {
@@ -41,7 +41,7 @@ static LRESULT CALLBACK gbbWindowProc(HWND window, UINT message, WPARAM wParam, 
     return DefWindowProcA(window, message, wParam, lParam);
 }
 
-int gbbInitWindow(uint32_t width, uint32_t height, const char* title)
+int rtrInitWindow(uint32_t width, uint32_t height, const char* title)
 {
     const char* const title_text = title ? title : "";
     const DWORD window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -51,7 +51,7 @@ int gbbInitWindow(uint32_t width, uint32_t height, const char* title)
     instance_handle = GetModuleHandleA(NULL);
     if (!instance_handle) return 1;
 
-    window_class.lpfnWndProc   = gbbWindowProc;
+    window_class.lpfnWndProc   = rtrWindowProc;
     window_class.hInstance     = instance_handle;
     window_class.lpszClassName = WINDOW_CLASS_NAME;
 
@@ -72,7 +72,7 @@ int gbbInitWindow(uint32_t width, uint32_t height, const char* title)
     return 0;
 }
 
-void gbbShutdownWindow(void)
+void rtrShutdownWindow(void)
 {
     if (window_handle)
     {
@@ -87,7 +87,7 @@ void gbbShutdownWindow(void)
     should_quit = 1u;
 }
 
-int gbbPumpEventsOnce(void)
+int rtrPumpEventsOnce(void)
 {
     const uint32_t exit_mask = (uint32_t)(!window_handle || !IsWindow((HWND)window_handle));
     MSG event = {0};

@@ -8,7 +8,7 @@ static NSWindow* window_handle = nil;
 void *surface_layer = NULL;
 static uint32_t should_quit = 0u;
 
-int gbbInitWindow(uint32_t width, uint32_t height, const char* title)
+int rtrInitWindow(uint32_t width, uint32_t height, const char* title)
 {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -42,7 +42,7 @@ int gbbInitWindow(uint32_t width, uint32_t height, const char* title)
     return 0;
 }
 
-void gbbShutdownWindow(void)
+void rtrShutdownWindow(void)
 {
     @autoreleasepool {
         [window_handle close];
@@ -52,7 +52,7 @@ void gbbShutdownWindow(void)
     }
 }
 
-int gbbPumpEventsOnce(void)
+int rtrPumpEventsOnce(void)
 {
     @autoreleasepool {
         NSEvent* event = nil;
