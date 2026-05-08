@@ -1,74 +1,56 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
-#include <stdint.h>
-
 #include "platform.h"
 
-static NSWindow* window_handle = nil;
-void *surface_layer = NULL;
-static uint32_t should_quit = 0u;
+void *surface_layer;
+static NSWindow *window;
+static uint32_t should_quit;
 
-int rtrInitWindow(uint32_t width, uint32_t height, const char* title)
+void rtrInitWindow(uint32_t width, uint32_t height, const char *title)
 {
-    @autoreleasepool {
-        [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        [NSApp finishLaunching];
+    [NSApplication sharedApplication];
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [NSApp finishLaunching];
 
-        window_handle = [[NSWindow alloc] initWithContentRect:NSMakeRect(0.0, 0.0, (CGFloat)width, (CGFloat)height)
-                                             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskFullSizeContentView)
-                                               backing:NSBackingStoreBuffered
-                                                 defer:NO];
-        [window_handle center];
-        [window_handle setTitleVisibility:NSWindowTitleHidden];
-        [window_handle setTitlebarAppearsTransparent:YES];
+    window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, width, height)
+                                         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskFullSizeContentView)
+                                           backing:NSBackingStoreBuffered
+                                             defer:NO];
+    [window center];
+    [window setTitleVisibility:NSWindowTitleHidden];
+    [window setTitlebarAppearsTransparent:YES];
+    [window setReleasedWhenClosed:NO];
+    [window setTitle:[NSString stringWithUTF8String:title]];
 
-        NSView* view = [window_handle contentView];
-        surface_layer = (void *)[CAMetalLayer layer];
-        if (!(window_handle && view && surface_layer)) return 1;
+    NSView *view = [window contentView];
+    CAMetalLayer *layer = [CAMetalLayer layer];
+    const CGFloat scale = [window backingScaleFactor];
+    [layer setOpaque:YES];
+    [layer setContentsScale:scale];
+    [layer setDrawableSize:CGSizeMake(width * scale, height * scale)];
+    [view setWantsLayer:YES];
+    [view setLayer:layer];
+    surface_layer = (__bridge void *)layer;
 
-        [window_handle setReleasedWhenClosed:NO];
-        [window_handle setTitle:title ? [NSString stringWithUTF8String:title] : @""];
-        [view setWantsLayer:YES];
-        [(CAMetalLayer*)surface_layer setOpaque:YES];
-        const CGFloat scale = [window_handle backingScaleFactor];
-        [(CAMetalLayer*)surface_layer setContentsScale:scale];
-        [(CAMetalLayer*)surface_layer setDrawableSize:CGSizeMake((CGFloat)width * scale, (CGFloat)height * scale)];
-        [view setLayer:(CAMetalLayer*)surface_layer];
-        [window_handle makeKeyAndOrderFront:nil];
-        [NSApp activateIgnoringOtherApps:YES];
-        should_quit = 0u;
-    }
-    return 0;
-}
-
-void rtrShutdownWindow(void)
-{
-    @autoreleasepool {
-        [window_handle close];
-        window_handle = nil;
-        surface_layer = NULL;
-        should_quit = 1u;
-    }
+    [window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
 }
 
 int rtrPumpEventsOnce(void)
 {
     @autoreleasepool {
-        NSEvent* event = nil;
-        if (!window_handle) return 1;
-
-        while (!should_quit &&
-               (event = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                           untilDate:[NSDate distantPast]
-                                              inMode:NSDefaultRunLoopMode
-                                             dequeue:YES]) != nil) {
-            const uint32_t is_escape = (uint32_t)([event type] == NSEventTypeKeyDown && [event keyCode] == 53);
-            should_quit |= is_escape;
-            if (!is_escape) [NSApp sendEvent:event];
+        for (NSEvent *event;
+             !should_quit && (event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                                         untilDate:[NSDate distantPast]
+                                                            inMode:NSDefaultRunLoopMode
+                                                           dequeue:YES]) != nil;)
+        {
+            if ([event type] == NSEventTypeKeyDown && [event keyCode] == 53)
+                should_quit = 1;
+            else
+                [NSApp sendEvent:event];
         }
-
-        should_quit |= (uint32_t)(![window_handle isVisible]);
+        if (![window isVisible]) should_quit = 1;
     }
     return (int)should_quit;
 }
