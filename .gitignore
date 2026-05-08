@@ -9,5 +9,6 @@ __pycache__/
 /build
 /.nix-zsh
 /compile_commands.json
+/raw
 
 /resources/external

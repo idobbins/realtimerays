@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <stdlib.h>
 #include "platform.h"
 
 void *surface_layer;
@@ -24,7 +25,8 @@ void rtrInitWindow(uint32_t width, uint32_t height, const char *title)
 
     NSView *view = [window contentView];
     CAMetalLayer *layer = [CAMetalLayer layer];
-    const CGFloat scale = [window backingScaleFactor];
+    const char *retina = getenv("REALTIMERAYS_RETINA");
+    const CGFloat scale = (retina && retina[0] != '\0' && retina[0] != '0') ? [window backingScaleFactor] : 1.0;
     [layer setOpaque:YES];
     [layer setContentsScale:scale];
     [layer setDrawableSize:CGSizeMake(width * scale, height * scale)];
