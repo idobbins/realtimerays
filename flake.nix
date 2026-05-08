@@ -142,6 +142,13 @@
               pkgs.vulkan-validation-layers
               pkgs.zsh
             ] ++ devCommands;
+
+            shellHook = ''
+              if [ -z "$REALTIMERAYS_IN_ZSH" ] && [ -z "$DIRENV_DIR" ] && [ -z "$DIRENV_IN_ENVRC" ] && [ -t 0 ]; then
+                export REALTIMERAYS_IN_ZSH=1
+                exec ${pkgs.zsh}/bin/zsh
+              fi
+            '';
           };
         });
 
