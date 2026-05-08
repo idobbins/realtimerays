@@ -2,6 +2,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include "trace_comp_spv.h"
@@ -393,8 +394,27 @@ int main(void)
     }, NULL, &inFlight);
 
     double startTime = nowSeconds();
+    double lastFrameTime = startTime;
+    double statsTime = startTime;
+    double frameMsSum = 0.0;
+    uint32_t frameMsCount = 0;
 
     while (rtrPumpEventsOnce() == 0) {
+        double frameStartTime = nowSeconds();
+        double frameMs = (frameStartTime - lastFrameTime) * 1000.0;
+        lastFrameTime = frameStartTime;
+        frameMsSum += frameMs;
+        frameMsCount++;
+
+        if (frameStartTime - statsTime >= 1.0) {
+            double averageFrameMs = frameMsSum / (double)frameMsCount;
+            printf("frame %.2f ms (%.1f fps)\n", averageFrameMs, 1000.0 / averageFrameMs);
+            fflush(stdout);
+            statsTime = frameStartTime;
+            frameMsSum = 0.0;
+            frameMsCount = 0;
+        }
+
         vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &inFlight);
 
