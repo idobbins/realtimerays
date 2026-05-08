@@ -5,15 +5,16 @@ layout(binding = 0, rgba8) uniform writeonly image2D outImage;
 
 layout(push_constant) uniform Push {
     float time;
+    uint frameIndex;
 } pc;
 
-const int MAX_TRACE_STEPS = 96;
-const int AA_SAMPLE_COUNT = 4;
-const int INDIRECT_SAMPLE_COUNT = 4;
+const int MAX_TRACE_STEPS = 64;
+const int MAX_BOUNCES = 3;
+const int SAMPLES_PER_PIXEL = 2;
 const float SURFACE_EPSILON = 0.001;
 const float MAX_RAY_DISTANCE = 80.0;
 const float AXIS_NEVER = 1.0e20;
-const float INDIRECT_STRENGTH = 0.42;
+const float PI = 3.14159265359;
 const float GAMMA = 2.2;
 
 const float CAMERA_ORBIT_SPEED = 0.12;
@@ -23,22 +24,10 @@ const float CAMERA_HEIGHT = 6.0;
 const float CAMERA_FOCAL_LENGTH = 1.5;
 const vec3 CAMERA_TARGET = vec3(0.0, 2.25, 0.0);
 
-const vec3 LIGHT_POSITION = vec3(-0.5, 8.5, 3.0);
-const vec3 LIGHT_COLOR = vec3(5.2, 4.6, 3.8);
-
-const vec2 AA_OFFSETS[AA_SAMPLE_COUNT] = vec2[AA_SAMPLE_COUNT](
-    vec2(-0.25, -0.25),
-    vec2( 0.25, -0.25),
-    vec2(-0.25,  0.25),
-    vec2( 0.25,  0.25)
-);
-
-const vec2 INDIRECT_OFFSETS[INDIRECT_SAMPLE_COUNT] = vec2[INDIRECT_SAMPLE_COUNT](
-    vec2( 0.00,  0.00),
-    vec2( 0.54,  0.18),
-    vec2(-0.34,  0.50),
-    vec2( 0.18, -0.62)
-);
+const vec3 LIGHT_LO = vec3(-3.0, 8.0, 1.0);
+const vec3 LIGHT_HI = vec3( 2.0, 9.0, 5.0);
+const vec3 LIGHT_NORMAL = vec3(0.0, -1.0, 0.0);
+const float LIGHT_AREA = (LIGHT_HI.x - LIGHT_LO.x) * (LIGHT_HI.z - LIGHT_LO.z);
 
 const uint MAT_EMPTY = 0u;
 const uint MAT_FLOOR = 1u;
@@ -131,6 +120,22 @@ vec3 emission(uint m)
     return MATERIAL_EMISSION[int(m)];
 }
 
+uint hash(uint x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand(inout uint s)
+{
+    s = hash(s);
+    return float(s) / 4294967295.0;
+}
+
 float firstSideDistance(float ro, float rd, int cell)
 {
     if (rd > 0.0)
@@ -205,111 +210,96 @@ vec3 sky(vec3 rd)
     return mix(vec3(0.78, 0.84, 0.92), vec3(0.30, 0.40, 0.58), t);
 }
 
-float lightVisibility(vec3 origin)
-{
-    vec3 toLight = LIGHT_POSITION - origin;
-    float distanceToLight = length(toLight);
-
-    if (distanceToLight <= SURFACE_EPSILON)
-        return 1.0;
-
-    Hit shadowHit;
-    vec3 lightDirection = toLight / distanceToLight;
-    if (!trace(origin, lightDirection, distanceToLight - SURFACE_EPSILON, shadowHit))
-        return 1.0;
-
-    return shadowHit.material == MAT_LIGHT ? 1.0 : 0.0;
-}
-
-vec3 directLight(vec3 p, vec3 n)
-{
-    vec3 toLight = LIGHT_POSITION - p;
-    float distanceSquared = max(dot(toLight, toLight), 0.0001);
-    vec3 lightDirection = toLight * inversesqrt(distanceSquared);
-
-    float lambert = max(dot(n, lightDirection), 0.0);
-    float visibility = lambert > 0.0 ? lightVisibility(p) : 0.0;
-    float attenuation = 1.0 / (1.0 + 0.035 * distanceSquared);
-
-    return LIGHT_COLOR * lambert * visibility * attenuation;
-}
-
-vec3 ambientLight(vec3 n)
-{
-    return mix(
-        vec3(0.08, 0.08, 0.10),
-        vec3(0.26, 0.34, 0.46),
-        clamp(n.y * 0.5 + 0.5, 0.0, 1.0)
-    );
-}
-
 vec3 tangentFor(vec3 n)
 {
     vec3 up = abs(n.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     return normalize(cross(up, n));
 }
 
-vec3 hemiDirection(vec3 n, int sampleIndex)
+vec3 cosineHemisphere(vec3 n, inout uint rng)
 {
-    vec2 d = INDIRECT_OFFSETS[sampleIndex % INDIRECT_SAMPLE_COUNT];
-    float z = sqrt(max(0.0, 1.0 - dot(d, d)));
+    float r1 = rand(rng);
+    float r2 = rand(rng);
+    float a = 2.0 * PI * r1;
+    float r = sqrt(r2);
+
     vec3 t = tangentFor(n);
     vec3 b = cross(n, t);
-    return normalize(t * d.x + b * d.y + n * z);
+    vec3 d = t * (cos(a) * r) +
+             b * (sin(a) * r) +
+             n * sqrt(max(0.0, 1.0 - r2));
+
+    return normalize(d);
 }
 
-vec3 surfaceRadiance(Hit hit, vec3 rd, bool includeAmbient)
+vec3 sampleLight(inout uint rng)
 {
-    vec3 E = emission(hit.material);
-    if (max(E.r, max(E.g, E.b)) > 0.0)
-        return E;
-
-    vec3 n = hit.normal;
-    vec3 p = hit.position + n * SURFACE_EPSILON;
-    vec3 base = albedo(hit.material);
-    vec3 light = directLight(p, n);
-
-    if (includeAmbient)
-        light += ambientLight(n);
-
-    float edge = pow(1.0 - max(dot(n, -rd), 0.0), 2.0);
-    vec3 grazing = vec3(0.08, 0.10, 0.13) * edge;
-
-    return base * light + (includeAmbient ? grazing : vec3(0.0));
+    return vec3(
+        mix(LIGHT_LO.x, LIGHT_HI.x, rand(rng)),
+        LIGHT_LO.y,
+        mix(LIGHT_LO.z, LIGHT_HI.z, rand(rng))
+    );
 }
 
-vec3 indirectRadiance(Hit hit, int sampleIndex)
+vec3 sampleDirectLight(Hit hit, inout uint rng)
 {
     vec3 n = hit.normal;
     vec3 p = hit.position + n * SURFACE_EPSILON;
-    vec3 rd = hemiDirection(n, sampleIndex);
+    vec3 lightPoint = sampleLight(rng);
+    vec3 toLight = lightPoint - p;
+    float distanceSquared = dot(toLight, toLight);
+    float distanceToLight = sqrt(distanceSquared);
 
-    Hit bounceHit;
-    vec3 incoming = trace(p, rd, MAX_RAY_DISTANCE, bounceHit) ?
-        surfaceRadiance(bounceHit, rd, false) :
-        sky(rd);
+    if (distanceToLight <= SURFACE_EPSILON)
+        return vec3(0.0);
 
-    return albedo(hit.material) * incoming * (INDIRECT_STRENGTH * max(dot(n, rd), 0.0));
+    vec3 wi = toLight / distanceToLight;
+    float surfaceCos = max(dot(n, wi), 0.0);
+    float lightCos = max(dot(LIGHT_NORMAL, -wi), 0.0);
+
+    if (surfaceCos <= 0.0 || lightCos <= 0.0)
+        return vec3(0.0);
+
+    Hit shadowHit;
+    if (trace(p, wi, distanceToLight - SURFACE_EPSILON, shadowHit))
+        return vec3(0.0);
+
+    vec3 brdf = albedo(hit.material) / PI;
+    vec3 lightEmission = emission(MAT_LIGHT);
+    float geometry = surfaceCos * lightCos / max(distanceSquared, 0.0001);
+
+    return brdf * lightEmission * geometry * LIGHT_AREA;
 }
 
-vec3 shade(Hit hit, vec3 rd, int sampleIndex)
+vec3 pathTrace(vec3 ro, vec3 rd, inout uint rng)
 {
-    vec3 E = emission(hit.material);
-    if (max(E.r, max(E.g, E.b)) > 0.0)
-        return E;
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
 
-    return surfaceRadiance(hit, rd, true) + indirectRadiance(hit, sampleIndex);
-}
+    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+        Hit hit;
+        if (!trace(ro, rd, MAX_RAY_DISTANCE, hit)) {
+            radiance += throughput * sky(rd);
+            break;
+        }
 
-vec3 pathTrace(vec3 ro, vec3 rd, int sampleIndex)
-{
-    Hit hit;
-    if (!trace(ro, rd, MAX_RAY_DISTANCE, hit))
-        return sky(rd);
+        vec3 E = emission(hit.material);
+        if (max(E.r, max(E.g, E.b)) > 0.0) {
+            if (bounce == 0)
+                radiance += throughput * E;
 
-    vec3 color = shade(hit, rd, sampleIndex);
-    float fog = smoothstep(24.0, 72.0, hit.distance) * 0.65;
-    return mix(color, sky(rd), fog);
+            break;
+        }
+
+        radiance += throughput * sampleDirectLight(hit, rng);
+
+        vec3 n = hit.normal;
+        ro = hit.position + n * SURFACE_EPSILON;
+        rd = cosineHemisphere(n, rng);
+        throughput *= albedo(hit.material);
+    }
+
+    return radiance;
 }
 
 vec3 tonemap(vec3 x)
@@ -339,16 +329,23 @@ void main()
     vec3 up = normalize(cross(right, forward));
 
     vec3 color = vec3(0.0);
-    for (int i = 0; i < AA_SAMPLE_COUNT; i++) {
-        vec2 uv = (vec2(px) + 0.5 + AA_OFFSETS[i]) / vec2(sz) * 2.0 - 1.0;
+    uint frameSeed = hash(pc.frameIndex * 747796405u + 2891336453u);
+    for (int i = 0; i < SAMPLES_PER_PIXEL; i++) {
+        uint rng = hash(uint(px.x) * 1973u ^
+                        uint(px.y) * 9277u ^
+                        uint(i) * 26699u ^
+                        frameSeed);
+
+        vec2 jitter = vec2(rand(rng), rand(rng)) - 0.5;
+        vec2 uv = (vec2(px) + 0.5 + jitter) / vec2(sz) * 2.0 - 1.0;
         uv.x *= float(sz.x) / float(sz.y);
         uv.y = -uv.y;
 
         vec3 rd = normalize(right * uv.x + up * uv.y + forward * CAMERA_FOCAL_LENGTH);
-        color += pathTrace(ro, rd, i);
+        color += pathTrace(ro, rd, rng);
     }
 
-    color /= float(AA_SAMPLE_COUNT);
+    color /= float(SAMPLES_PER_PIXEL);
     color = pow(tonemap(color), vec3(1.0 / GAMMA));
 
     imageStore(outImage, px, vec4(color, 1.0));

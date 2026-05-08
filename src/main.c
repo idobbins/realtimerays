@@ -14,6 +14,11 @@
 static const VkFormat SWAP_FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
 static const VkFormat RENDER_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
 
+typedef struct Push {
+    float    time;
+    uint32_t frameIndex;
+} Push;
+
 static const char *const INSTANCE_EXTS[] = {
     VK_KHR_SURFACE_EXTENSION_NAME,
     VK_EXT_METAL_SURFACE_EXTENSION_NAME,
@@ -102,7 +107,7 @@ static void recordCommandBuffer(
     VkImage renderImage,
     VkImage swapImage,
     VkImageLayout renderOldLayout,
-    float time)
+    Push push)
 {
     VkImageBlit blit = {
         .srcSubresource = {
@@ -141,7 +146,7 @@ static void recordCommandBuffer(
 
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &ds, 0, NULL);
-    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(time), &time);
+    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cb,
         (swapExtent.width  + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
         (swapExtent.height + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
@@ -336,7 +341,7 @@ int main(void)
         .pPushConstantRanges    = &(VkPushConstantRange){
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset     = 0,
-            .size       = sizeof(float),
+            .size       = sizeof(Push),
         },
     }, NULL, &pipelineLayout);
 
@@ -394,12 +399,16 @@ int main(void)
         vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
 
         float time = (float)(nowSeconds() - startTime);
+        Push push = {
+            .time = time,
+            .frameIndex = frameIndex,
+        };
         VkImageLayout renderOldLayout = frameIndex == 0 ?
             VK_IMAGE_LAYOUT_UNDEFINED :
             VK_IMAGE_LAYOUT_GENERAL;
 
         vkResetCommandBuffer(cb, 0);
-        recordCommandBuffer(cb, descriptorSet, renderImage, swapImages[imageIndex], renderOldLayout, time);
+        recordCommandBuffer(cb, descriptorSet, renderImage, swapImages[imageIndex], renderOldLayout, push);
         frameIndex++;
 
         vkQueueSubmit(queue, 1, &(VkSubmitInfo){
