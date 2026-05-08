@@ -5,7 +5,7 @@
 #include "gradient_comp_spv.h"
 #include "platform.h"
 
-#define FRAME_COUNT       3
+#define SWAP_IMAGE_COUNT  3
 #define COMPUTE_TILE_SIZE 8
 #define LEN(a)            ((uint32_t)(sizeof(a) / sizeof(*(a))))
 
@@ -26,18 +26,18 @@ static VkDevice              device;
 static VkQueue               queue;
 static VkSwapchainKHR        swapchain;
 static VkExtent2D            swapExtent;
-static VkImage               swapImages[FRAME_COUNT];
-static VkImageView           swapImageViews[FRAME_COUNT];
+static VkImage               swapImages[SWAP_IMAGE_COUNT];
+static VkImageView           swapImageViews[SWAP_IMAGE_COUNT];
 static VkDescriptorSetLayout descriptorSetLayout;
 static VkDescriptorPool      descriptorPool;
 static VkDescriptorSet       descriptorSet;
 static VkPipelineLayout      pipelineLayout;
 static VkPipeline            pipeline;
 static VkCommandPool         commandPool;
-static VkCommandBuffer       commandBuffers[FRAME_COUNT];
-static VkSemaphore           imageAvailable[FRAME_COUNT];
-static VkSemaphore           renderFinished[FRAME_COUNT];
-static VkFence               inFlight[FRAME_COUNT];
+static VkCommandBuffer       cb;
+static VkSemaphore           imageAvailable;
+static VkSemaphore           renderFinished;
+static VkFence               inFlight;
 static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage image)
 {
     VkImageSubresourceRange range = {
@@ -127,7 +127,7 @@ int main(void)
     vkCreateSwapchainKHR(device, &(VkSwapchainCreateInfoKHR){
         .sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface          = surface,
-        .minImageCount    = FRAME_COUNT,
+        .minImageCount    = SWAP_IMAGE_COUNT,
         .imageFormat      = VK_FORMAT_B8G8R8A8_UNORM,
         .imageColorSpace  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
         .imageExtent      = swapExtent,
@@ -140,9 +140,9 @@ int main(void)
         .clipped          = VK_TRUE,
     }, NULL, &swapchain);
 
-    vkGetSwapchainImagesKHR(device, swapchain, &(uint32_t){FRAME_COUNT}, swapImages);
+    vkGetSwapchainImagesKHR(device, swapchain, &(uint32_t){SWAP_IMAGE_COUNT}, swapImages);
 
-    for (uint32_t i = 0; i < FRAME_COUNT; i++)
+    for (uint32_t i = 0; i < SWAP_IMAGE_COUNT; i++)
         vkCreateImageView(device, &(VkImageViewCreateInfo){
             .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image            = swapImages[i],
@@ -217,29 +217,26 @@ int main(void)
         .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool        = commandPool,
         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = FRAME_COUNT,
-    }, commandBuffers);
+        .commandBufferCount = 1,
+    }, &cb);
 
-    for (uint32_t i = 0; i < FRAME_COUNT; i++) {
-        vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        }, NULL, &imageAvailable[i]);
-        vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        }, NULL, &renderFinished[i]);
-        vkCreateFence(device, &(VkFenceCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-        }, NULL, &inFlight[i]);
-    }
+    vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    }, NULL, &imageAvailable);
+    vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    }, NULL, &renderFinished);
+    vkCreateFence(device, &(VkFenceCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    }, NULL, &inFlight);
 
-    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    for (uint32_t f = 0; rtrPumpEventsOnce() == 0; f = (f + 1) % FRAME_COUNT) {
-        vkWaitForFences(device, 1, &inFlight[f], VK_TRUE, UINT64_MAX);
-        vkResetFences(device, 1, &inFlight[f]);
+    while (rtrPumpEventsOnce() == 0) {
+        vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
+        vkResetFences(device, 1, &inFlight);
 
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable[f], VK_NULL_HANDLE, &imageIndex);
+        vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
 
         vkUpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
             .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -252,24 +249,24 @@ int main(void)
             },
         }, 0, NULL);
 
-        vkResetCommandBuffer(commandBuffers[f], 0);
-        recordCommandBuffer(commandBuffers[f], descriptorSet, swapImages[imageIndex]);
+        vkResetCommandBuffer(cb, 0);
+        recordCommandBuffer(cb, descriptorSet, swapImages[imageIndex]);
 
         vkQueueSubmit(queue, 1, &(VkSubmitInfo){
             .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount   = 1,
-            .pWaitSemaphores      = &imageAvailable[f],
-            .pWaitDstStageMask    = &waitStage,
+            .pWaitSemaphores      = &imageAvailable,
+            .pWaitDstStageMask    = &(VkPipelineStageFlags){ VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT },
             .commandBufferCount   = 1,
-            .pCommandBuffers      = &commandBuffers[f],
+            .pCommandBuffers      = &cb,
             .signalSemaphoreCount = 1,
-            .pSignalSemaphores    = &renderFinished[f],
-        }, inFlight[f]);
+            .pSignalSemaphores    = &renderFinished,
+        }, inFlight);
 
         vkQueuePresentKHR(queue, &(VkPresentInfoKHR){
             .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores    = &renderFinished[f],
+            .pWaitSemaphores    = &renderFinished,
             .swapchainCount     = 1,
             .pSwapchains        = &swapchain,
             .pImageIndices      = &imageIndex,
