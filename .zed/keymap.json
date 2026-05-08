@@ -2,9 +2,17 @@
   {
     "context": "Workspace",
     "bindings": {
-      "f5": [
+      "cmd-shift-b": [
         "task::Spawn",
-        { "task_name": "build and run", "reveal_target": "dock" }
+        { "task_name": "build" }
+      ],
+      "cmd-shift-r": [
+        "task::Spawn",
+        { "task_name": "build and run" }
+      ],
+      "cmd-shift-k": [
+        "task::Spawn",
+        { "task_name": "clean build" }
       ]
     }
   }
