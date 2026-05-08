@@ -90,7 +90,7 @@ static void recordCommandBuffer(VkCommandBuffer cb, VkDescriptorSet ds, VkImage 
 
 int main(void)
 {
-    rtrInitWindow(1280, 720, "greatbadbeyond");
+    rtrInitWindow(1280, 720, "realtimerays");
 
     vkCreateInstance(&(VkInstanceCreateInfo){
         .sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
