@@ -31,7 +31,7 @@ static VkImage               swapImages[FRAME_COUNT];
 static VkImageView           swapImageViews[FRAME_COUNT];
 static VkDescriptorSetLayout descriptorSetLayout;
 static VkDescriptorPool      descriptorPool;
-static VkDescriptorSet       descriptorSets[FRAME_COUNT];
+static VkDescriptorSet       descriptorSet;
 static VkPipelineLayout      pipelineLayout;
 static VkPipeline            pipeline;
 static VkCommandPool         commandPool;
@@ -171,22 +171,20 @@ int main(void)
 
     vkCreateDescriptorPool(device, &(VkDescriptorPoolCreateInfo){
         .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets       = FRAME_COUNT,
+        .maxSets       = 1,
         .poolSizeCount = 1,
         .pPoolSizes    = &(VkDescriptorPoolSize){
             .type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .descriptorCount = FRAME_COUNT,
+            .descriptorCount = 1,
         },
     }, NULL, &descriptorPool);
 
-    VkDescriptorSetLayout setLayouts[FRAME_COUNT];
-    for (uint32_t i = 0; i < FRAME_COUNT; i++) setLayouts[i] = descriptorSetLayout;
     vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
         .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool     = descriptorPool,
-        .descriptorSetCount = FRAME_COUNT,
-        .pSetLayouts        = setLayouts,
-    }, descriptorSets);
+        .descriptorSetCount = 1,
+        .pSetLayouts        = &descriptorSetLayout,
+    }, &descriptorSet);
 
     vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
         .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -226,18 +224,7 @@ int main(void)
     }, commandBuffers);
 
     for (uint32_t i = 0; i < FRAME_COUNT; i++) {
-        vkUpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
-            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet          = descriptorSets[i],
-            .descriptorCount = 1,
-            .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo      = &(VkDescriptorImageInfo){
-                .imageView   = swapImageViews[i],
-                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            },
-        }, 0, NULL);
-
-        recordCommandBuffer(commandBuffers[i], descriptorSets[i], swapImages[i]);
+        recordCommandBuffer(commandBuffers[i], descriptorSet, swapImages[i]);
 
         vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
@@ -258,6 +245,17 @@ int main(void)
 
         uint32_t imageIndex;
         vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable[f], VK_NULL_HANDLE, &imageIndex);
+
+        vkUpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = descriptorSet,
+            .descriptorCount = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo      = &(VkDescriptorImageInfo){
+                .imageView   = swapImageViews[imageIndex],
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            },
+        }, 0, NULL);
 
         vkQueueSubmit(queue, 1, &(VkSubmitInfo){
             .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
