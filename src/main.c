@@ -14,11 +14,6 @@
 static const VkFormat SWAP_FORMAT = VK_FORMAT_B8G8R8A8_UNORM;
 static const VkFormat RENDER_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
 
-typedef struct Push {
-    float    time;
-    uint32_t frameIndex;
-} Push;
-
 static const char *const INSTANCE_EXTS[] = {
     VK_KHR_SURFACE_EXTENSION_NAME,
     VK_EXT_METAL_SURFACE_EXTENSION_NAME,
@@ -37,9 +32,9 @@ static VkQueue               queue;
 static VkSwapchainKHR        swapchain;
 static VkExtent2D            swapExtent;
 static VkImage               swapImages[SWAP_IMAGE_COUNT];
-static VkImage               renderImage;
-static VkDeviceMemory        renderMemory;
-static VkImageView           renderImageView;
+static VkImage               offscreenImage;
+static VkDeviceMemory        offscreenMemory;
+static VkImageView           offscreenView;
 static VkDescriptorSetLayout descriptorSetLayout;
 static VkDescriptorPool      descriptorPool;
 static VkDescriptorSet       descriptorSet;
@@ -101,42 +96,31 @@ static void imageBarrier(
         });
 }
 
-static void recordCommandBuffer(
-    VkCommandBuffer cb,
-    VkDescriptorSet ds,
-    VkImage renderImage,
-    VkImage swapImage,
-    VkImageLayout renderOldLayout,
-    Push push)
+static void recordCommandBuffer(VkImage swapImage, float time)
 {
-    VkImageBlit blit = {
-        .srcSubresource = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .layerCount = 1,
-        },
-        .srcOffsets = {
-            { 0, 0, 0 },
-            { (int32_t)swapExtent.width, (int32_t)swapExtent.height, 1 },
-        },
-        .dstSubresource = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .layerCount = 1,
-        },
-        .dstOffsets = {
-            { 0, 0, 0 },
-            { (int32_t)swapExtent.width, (int32_t)swapExtent.height, 1 },
-        },
-    };
-
     vkBeginCommandBuffer(cb, &(VkCommandBufferBeginInfo){
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     });
 
     imageBarrier(cb,
-        renderImage,
-        renderOldLayout, VK_IMAGE_LAYOUT_GENERAL,
-        0, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        offscreenImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, NULL);
+    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(time), &time);
+    vkCmdDispatch(cb,
+        (swapExtent.width  + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
+        (swapExtent.height + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
+        1);
+
+    imageBarrier(cb,
+        offscreenImage,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     imageBarrier(cb,
         swapImage,
@@ -144,31 +128,24 @@ static void recordCommandBuffer(
         0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &ds, 0, NULL);
-    vkCmdPushConstants(cb, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cb,
-        (swapExtent.width  + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
-        (swapExtent.height + COMPUTE_TILE_SIZE - 1) / COMPUTE_TILE_SIZE,
-        1);
-
-    imageBarrier(cb,
-        renderImage,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-    vkCmdBlitImage(cb,
-        renderImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &blit,
-        VK_FILTER_NEAREST);
-
-    imageBarrier(cb,
-        renderImage,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-        VK_ACCESS_TRANSFER_READ_BIT, 0,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    vkCmdCopyImage(cb,
+        offscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        swapImage,      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &(VkImageCopy){
+            .srcSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1,
+            },
+            .dstSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1,
+            },
+            .extent = {
+                .width  = swapExtent.width,
+                .height = swapExtent.height,
+                .depth  = 1,
+            },
+        });
 
     imageBarrier(cb,
         swapImage,
@@ -179,7 +156,7 @@ static void recordCommandBuffer(
     vkEndCommandBuffer(cb);
 }
 
-static void createRenderImage(void)
+static void createOffscreenImage(void)
 {
     VkFormatProperties renderProps;
     VkFormatProperties swapProps;
@@ -187,8 +164,8 @@ static void createRenderImage(void)
     vkGetPhysicalDeviceFormatProperties(physicalDevice, SWAP_FORMAT, &swapProps);
 
     if ((renderProps.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0 ||
-        (renderProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0 ||
-        (swapProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0)
+        (renderProps.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) == 0 ||
+        (swapProps.optimalTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) == 0)
         abort();
 
     vkCreateImage(device, &(VkImageCreateInfo){
@@ -207,20 +184,20 @@ static void createRenderImage(void)
         .usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    }, NULL, &renderImage);
+    }, NULL, &offscreenImage);
 
     VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(device, renderImage, &req);
+    vkGetImageMemoryRequirements(device, offscreenImage, &req);
     vkAllocateMemory(device, &(VkMemoryAllocateInfo){
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize  = req.size,
         .memoryTypeIndex = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
-    }, NULL, &renderMemory);
-    vkBindImageMemory(device, renderImage, renderMemory, 0);
+    }, NULL, &offscreenMemory);
+    vkBindImageMemory(device, offscreenImage, offscreenMemory, 0);
 
     vkCreateImageView(device, &(VkImageViewCreateInfo){
         .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image            = renderImage,
+        .image            = offscreenImage,
         .viewType         = VK_IMAGE_VIEW_TYPE_2D,
         .format           = RENDER_FORMAT,
         .subresourceRange = {
@@ -228,10 +205,10 @@ static void createRenderImage(void)
             .levelCount = 1,
             .layerCount = 1,
         },
-    }, NULL, &renderImageView);
+    }, NULL, &offscreenView);
 }
 
-static void updateRenderDescriptor(void)
+static void bindOffscreenImage(void)
 {
     vkUpdateDescriptorSets(device, 1, &(VkWriteDescriptorSet){
         .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -239,10 +216,35 @@ static void updateRenderDescriptor(void)
         .descriptorCount = 1,
         .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         .pImageInfo      = &(VkDescriptorImageInfo){
-            .imageView   = renderImageView,
+            .imageView   = offscreenView,
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         },
     }, 0, NULL);
+}
+
+static void initOffscreenImageLayout(void)
+{
+    vkResetCommandBuffer(cb, 0);
+
+    vkBeginCommandBuffer(cb, &(VkCommandBufferBeginInfo){
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    });
+
+    imageBarrier(cb,
+        offscreenImage,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        0, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    vkEndCommandBuffer(cb);
+
+    vkQueueSubmit(queue, 1, &(VkSubmitInfo){
+        .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers    = &cb,
+    }, VK_NULL_HANDLE);
+
+    vkQueueWaitIdle(queue);
 }
 
 int main(void)
@@ -303,7 +305,7 @@ int main(void)
     }, NULL, &swapchain);
 
     vkGetSwapchainImagesKHR(device, swapchain, &(uint32_t){SWAP_IMAGE_COUNT}, swapImages);
-    createRenderImage();
+    createOffscreenImage();
 
     vkCreateDescriptorSetLayout(device, &(VkDescriptorSetLayoutCreateInfo){
         .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -331,7 +333,7 @@ int main(void)
         .descriptorSetCount = 1,
         .pSetLayouts        = &descriptorSetLayout,
     }, &descriptorSet);
-    updateRenderDescriptor();
+    bindOffscreenImage();
 
     vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -341,7 +343,7 @@ int main(void)
         .pPushConstantRanges    = &(VkPushConstantRange){
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
             .offset     = 0,
-            .size       = sizeof(Push),
+            .size       = sizeof(float),
         },
     }, NULL, &pipelineLayout);
 
@@ -377,6 +379,8 @@ int main(void)
         .commandBufferCount = 1,
     }, &cb);
 
+    initOffscreenImageLayout();
+
     vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
     }, NULL, &imageAvailable);
@@ -389,7 +393,6 @@ int main(void)
     }, NULL, &inFlight);
 
     double startTime = nowSeconds();
-    uint32_t frameIndex = 0;
 
     while (rtrPumpEventsOnce() == 0) {
         vkWaitForFences(device, 1, &inFlight, VK_TRUE, UINT64_MAX);
@@ -399,17 +402,9 @@ int main(void)
         vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, imageAvailable, VK_NULL_HANDLE, &imageIndex);
 
         float time = (float)(nowSeconds() - startTime);
-        Push push = {
-            .time = time,
-            .frameIndex = frameIndex,
-        };
-        VkImageLayout renderOldLayout = frameIndex == 0 ?
-            VK_IMAGE_LAYOUT_UNDEFINED :
-            VK_IMAGE_LAYOUT_GENERAL;
 
         vkResetCommandBuffer(cb, 0);
-        recordCommandBuffer(cb, descriptorSet, renderImage, swapImages[imageIndex], renderOldLayout, push);
-        frameIndex++;
+        recordCommandBuffer(swapImages[imageIndex], time);
 
         vkQueueSubmit(queue, 1, &(VkSubmitInfo){
             .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
