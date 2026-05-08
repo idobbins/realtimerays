@@ -11,7 +11,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 const int MAX_BOUNCES = 3;
-const int SAMPLES_PER_PIXEL = 2;
+const int SAMPLES_PER_PIXEL = 12;
 const float SURFACE_EPSILON = 0.001;
 const float MAX_RAY_DISTANCE = 80.0;
 const float AXIS_NEVER = 1.0e20;
