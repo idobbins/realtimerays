@@ -10,6 +10,7 @@ __pycache__/
 /build
 /target
 /result
+/renders
 /.nix-zsh
 /compile_commands.json
 /raw

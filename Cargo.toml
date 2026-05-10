@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
+png = "0.18.1"
 pollster = "0.4"
 wgpu = { version = "29", default-features = false, features = ["std", "metal", "wgsl"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }

@@ -1,0 +1,3 @@
+[alias]
+"record-x" = "run --release -- record-x"
+remux = "run --release -- remux"

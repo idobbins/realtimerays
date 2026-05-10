@@ -1,4 +1,9 @@
 use std::error::Error;
+use std::fs::{self, File};
+use std::io::{self, BufWriter};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,6 +18,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const TILE_SIZE: u32 = 8;
+const RECORD_FPS: u32 = 60;
+const RECORD_SECONDS: u32 = 10;
+const RECORD_FRAME_COUNT: u32 = RECORD_FPS * RECORD_SECONDS;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
 const CAMERA_ORBIT_ANGLE: f32 = 0.45;
@@ -124,6 +132,17 @@ struct Renderer {
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
     blit_pipeline: wgpu::RenderPipeline,
+}
+
+struct Recorder {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    width: u32,
+    height: u32,
+    camera_buffer: wgpu::Buffer,
+    offscreen: wgpu::Texture,
+    compute_bind_group: wgpu::BindGroup,
+    compute_pipeline: wgpu::ComputePipeline,
 }
 
 impl Renderer {
@@ -442,6 +461,206 @@ impl Renderer {
     }
 }
 
+impl Recorder {
+    fn new(width: u32, height: u32) -> Result<Self, Box<dyn Error>> {
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = wgpu::Backends::METAL;
+        let instance = wgpu::Instance::new(instance_descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "request Metal adapter"))?;
+
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("record device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            }))?;
+
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("record camera uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("record compute bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("record trace shader"),
+            source: wgpu::ShaderSource::Wgsl(TRACE_SHADER.into()),
+        });
+        let compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("record compute pipeline layout"),
+                bind_group_layouts: &[Some(&compute_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("record trace pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &trace_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let offscreen = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("record offscreen image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let offscreen_view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("record compute bind group"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&offscreen_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            width,
+            height,
+            camera_buffer,
+            offscreen,
+            compute_bind_group,
+            compute_pipeline,
+        })
+    }
+
+    fn capture_frame(&self, camera: &CameraUniform) -> Result<Vec<u8>, Box<dyn Error>> {
+        let bytes_per_pixel = 4;
+        let unpadded_bytes_per_row = self.width * bytes_per_pixel;
+        let padded_bytes_per_row =
+            align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let output_buffer_size = u64::from(padded_bytes_per_row) * u64::from(self.height);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("record readback"),
+            size: output_buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("record frame encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("record trace pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.compute_pipeline);
+            pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.offscreen,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        receiver
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "readback callback dropped"))?
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = vec![0u8; (self.width * self.height * bytes_per_pixel) as usize];
+        for y in 0..self.height as usize {
+            let src_offset = y * padded_bytes_per_row as usize;
+            let dst_offset = y * unpadded_bytes_per_row as usize;
+            let src = &mapped[src_offset..src_offset + unpadded_bytes_per_row as usize];
+            let dst = &mut pixels[dst_offset..dst_offset + unpadded_bytes_per_row as usize];
+            dst.copy_from_slice(src);
+        }
+        drop(mapped);
+        readback.unmap();
+
+        Ok(pixels)
+    }
+}
+
 struct App {
     renderer: Option<Renderer>,
     stats: FrameStats,
@@ -547,7 +766,139 @@ fn center_window(window: &Window) {
     window.set_outer_position(PhysicalPosition::new(x, y));
 }
 
+fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
+fn write_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), Box<dyn Error>> {
+    let file = File::create(path)?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(pixels)?;
+    Ok(())
+}
+
+fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output_dir = args
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("renders/shot01"));
+    let frame_count = parse_frame_count(args)?;
+
+    fs::create_dir_all(&output_dir)?;
+    let recorder = Recorder::new(WIDTH, HEIGHT)?;
+
+    for frame_index in 0..frame_count {
+        let time = frame_index as f32 / RECORD_FPS as f32;
+        let pixels = recorder.capture_frame(&camera_uniform(time))?;
+        let path = output_dir.join(format!("frame_{frame_index:06}.png"));
+        write_png(&path, WIDTH, HEIGHT, &pixels)?;
+
+        if frame_index % RECORD_FPS == 0 || frame_index + 1 == frame_count {
+            println!(
+                "recorded {}/{} frames to {}",
+                frame_index + 1,
+                frame_count,
+                output_dir.display()
+            );
+        }
+    }
+
+    run_remux(&output_dir)?;
+    Ok(())
+}
+
+fn parse_frame_count(args: &[String]) -> Result<u32, Box<dyn Error>> {
+    let Some(frames_index) = args.iter().position(|arg| arg == "--frames") else {
+        return Ok(RECORD_FRAME_COUNT);
+    };
+    let value = args.get(frames_index + 1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--frames requires a frame count",
+        )
+    })?;
+    let frame_count = value.parse::<u32>()?;
+    if frame_count == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--frames must be > 0").into());
+    }
+    Ok(frame_count)
+}
+
+fn run_remux(output_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let input = output_dir.join("frame_%06d.png");
+    let output = output_dir.join("x_upload.mp4");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-framerate",
+            &RECORD_FPS.to_string(),
+            "-i",
+            input
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 path"))?,
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.2",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            &RECORD_FPS.to_string(),
+            "-b:v",
+            "20000k",
+            "-maxrate",
+            "25000k",
+            "-bufsize",
+            "50000k",
+            "-movflags",
+            "+faststart",
+            output
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 path"))?,
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "ffmpeg remux failed").into());
+    }
+
+    println!("wrote {}", output.display());
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match args.first().map(String::as_str) {
+        Some("record-x") | Some("--record-x") => return run_record_x(&args[1..]),
+        Some("remux") => {
+            let output_dir = args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("renders/shot01"));
+            return run_remux(&output_dir);
+        }
+        Some("--help") | Some("-h") => {
+            println!("usage:");
+            println!("  realtimerays");
+            println!("  realtimerays record-x [output-dir] [--frames N]");
+            println!("  realtimerays remux [output-dir]");
+            return Ok(());
+        }
+        Some(other) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown command: {other}"),
+            )
+            .into());
+        }
+        None => {}
+    }
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
