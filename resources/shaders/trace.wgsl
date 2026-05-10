@@ -3,18 +3,21 @@ struct CameraUniform {
     camera_right: vec4<f32>,
     camera_up: vec4<f32>,
     camera_forward: vec4<f32>,
+    render: vec4<u32>,
 }
 
 struct SceneBuffer {
     words: array<u32>,
 }
 
-@group(0) @binding(0) var out_image: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(1) var<uniform> pc: CameraUniform;
-@group(0) @binding(2) var<storage, read> scene: SceneBuffer;
+@group(0) @binding(0) var color_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(1) var normal_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var albedo_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var depth_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var<uniform> pc: CameraUniform;
+@group(0) @binding(5) var<storage, read> scene: SceneBuffer;
 
 const MAX_BOUNCES: i32 = 3;
-const SAMPLES_PER_PIXEL: i32 = 2;
 const SURFACE_EPSILON: f32 = 0.001;
 const MAX_RAY_DISTANCE: f32 = 80.0;
 const AXIS_NEVER: f32 = 1.0e20;
@@ -53,6 +56,12 @@ struct Camera {
     right: vec3<f32>,
     up: vec3<f32>,
     forward: vec3<f32>,
+}
+
+struct Guides {
+    normal: vec3<f32>,
+    albedo: vec3<f32>,
+    depth: f32,
 }
 
 fn scene_i32(index: u32) -> i32 {
@@ -115,6 +124,7 @@ fn seed(px: vec2<i32>, sample_index: i32) -> u32 {
         (u32(px.x) * 1973u) ^
         (u32(px.y) * 9277u) ^
         (u32(sample_index) * 26699u) ^
+        (pc.render.y * 374761393u) ^
         (bitcast<u32>(pc.camera_ro_time.w) * 747796405u)
     );
 }
@@ -465,10 +475,20 @@ fn tonemap(x: vec3<f32>) -> vec3<f32> {
     return x / (x + vec3<f32>(1.0));
 }
 
+fn first_hit_guides(ro: vec3<f32>, rd: vec3<f32>) -> Guides {
+    var hit = Hit(MAX_RAY_DISTANCE, vec3<f32>(0.0), MAT_EMPTY);
+    if !trace(ro, rd, MAX_RAY_DISTANCE, &hit) {
+        return Guides(vec3<f32>(0.5), vec3<f32>(0.0), 1.0);
+    }
+
+    let encoded_normal = hit.n * 0.5 + vec3<f32>(0.5);
+    return Guides(encoded_normal, albedo(hit.mat), clamp(hit.t / MAX_RAY_DISTANCE, 0.0, 1.0));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let px = vec2<i32>(i32(id.x), i32(id.y));
-    let size_u = textureDimensions(out_image);
+    let size_u = textureDimensions(color_image);
     let size = vec2<i32>(i32(size_u.x), i32(size_u.y));
 
     if any(px >= size) {
@@ -476,15 +496,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let cam = camera();
+    let sample_count = max(i32(pc.render.x), 1);
     var color = vec3<f32>(0.0);
-    for (var i = 0; i < SAMPLES_PER_PIXEL; i = i + 1) {
+    let center_ray = camera_ray(cam, pixel_uv(px, size, vec2<f32>(0.0)));
+    let guides = first_hit_guides(cam.ro, center_ray);
+
+    for (var i = 0; i < sample_count; i = i + 1) {
         var rng = seed(px, i);
         let jitter = vec2<f32>(rand(&rng), rand(&rng)) - vec2<f32>(0.5);
         color += path_trace(cam.ro, camera_ray(cam, pixel_uv(px, size, jitter)), &rng);
     }
 
-    color /= f32(SAMPLES_PER_PIXEL);
-    color = pow(tonemap(color), vec3<f32>(1.0 / 2.2));
-
-    textureStore(out_image, px, vec4<f32>(color, 1.0));
+    color /= f32(sample_count);
+    color = tonemap(color);
+    textureStore(color_image, px, vec4<f32>(color, 1.0));
+    textureStore(normal_image, px, vec4<f32>(guides.normal, 1.0));
+    textureStore(albedo_image, px, vec4<f32>(guides.albedo, 1.0));
+    textureStore(depth_image, px, vec4<f32>(guides.depth, 0.0, 0.0, 1.0));
 }
