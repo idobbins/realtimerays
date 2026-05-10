@@ -14,6 +14,7 @@ MAX_FILTER_SIZE = MAX_FILTER_RADIUS * 2 + 1
 MAX_FILTER_TAPS = MAX_FILTER_SIZE * MAX_FILTER_SIZE
 DISABLED_PENALTY = -20.0
 MAX_LUMA_BLEND = 0.45
+MAX_CNN_LUMA_DELTA = 0.12
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
 
 
@@ -90,6 +91,60 @@ class LearnedFilter(torch.nn.Module):
         center_luma = luminance(color)
         blend = MAX_LUMA_BLEND * torch.sigmoid(self.blend)
         out_luma = torch.lerp(center_luma, filtered_luma, blend)
+        chroma = color / torch.clamp(center_luma, min=0.0001)
+        return torch.clamp(chroma * out_luma, 0.0, 1.0)
+
+
+class TinyCnnDenoiser(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv0_weight = torch.nn.Parameter(torch.empty(8, 10, 3, 3))
+        self.conv0_bias = torch.nn.Parameter(torch.zeros(8))
+        self.conv1_weight = torch.nn.Parameter(torch.zeros(8))
+        self.conv1_bias = torch.nn.Parameter(torch.zeros(1))
+        torch.nn.init.kaiming_uniform_(self.conv0_weight, nonlinearity="relu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        color = x[:, 0:3]
+        normal = x[:, 3:6]
+        albedo = x[:, 6:9]
+        depth = x[:, 9:10]
+        center_luma = luminance(color)
+        b, _, h, w = x.shape
+
+        padded = F.pad(x, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 10, 9, h * w)
+        patch_color = patches[:, 0:3]
+        patch_normal = patches[:, 3:6]
+        patch_albedo = patches[:, 6:9]
+        patch_depth = patches[:, 9:10]
+        patch_luma = torch.sum(
+            patch_color * LUMA_WEIGHTS.to(device=x.device, dtype=x.dtype).view(1, 3, 1, 1),
+            dim=1,
+            keepdim=True,
+        )
+
+        center_luma_flat = center_luma.reshape(b, 1, 1, h * w)
+        center_normal = normal.reshape(b, 3, 1, h * w)
+        center_albedo = albedo.reshape(b, 3, 1, h * w)
+        center_depth = depth.reshape(b, 1, 1, h * w)
+        features = torch.cat(
+            [
+                patch_luma,
+                patch_luma - center_luma_flat,
+                patch_normal - center_normal,
+                patch_albedo - center_albedo,
+                patch_depth - center_depth,
+                center_luma_flat.expand(-1, -1, 9, -1),
+            ],
+            dim=1,
+        )
+
+        hidden = torch.einsum("hct,bctn->bhn", self.conv0_weight.view(8, 10, 9), features)
+        hidden = F.relu(hidden + self.conv0_bias.view(1, 8, 1))
+        raw_delta = torch.einsum("h,bhn->bn", self.conv1_weight, hidden) + self.conv1_bias.view(1, 1)
+        delta_luma = MAX_CNN_LUMA_DELTA * torch.tanh(raw_delta.view(b, 1, h, w))
+        out_luma = torch.clamp(center_luma + delta_luma, min=0.0, max=1.0)
         chroma = color / torch.clamp(center_luma, min=0.0001)
         return torch.clamp(chroma * out_luma, 0.0, 1.0)
 
@@ -206,7 +261,7 @@ def loss_for(pred: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor, hi
 
 @torch.no_grad()
 def validate(
-    model: LearnedFilter,
+    model: torch.nn.Module,
     dataset: DenoiserDataset,
     batch_size: int,
     steps: int,
@@ -243,10 +298,25 @@ def export_weights(model: LearnedFilter, output: Path) -> None:
     print(f"wrote {output} ({weights.size} f32 values)")
 
 
+def export_cnn_weights(model: TinyCnnDenoiser, output: Path) -> None:
+    weights = np.concatenate(
+        [
+            model.conv0_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv0_bias.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv1_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv1_bias.detach().cpu().numpy().astype("<f4").reshape(-1),
+        ]
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    weights.tofile(output)
+    print(f"wrote {output} ({weights.size} f32 values)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("resources/denoiser_weights.bin"))
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--model", choices=["filter", "tiny-cnn"], default="filter")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--steps-per-epoch", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -297,7 +367,18 @@ def main() -> None:
         args.importance_prob,
         args.importance_stride,
     )
-    model = LearnedFilter(args.radius, guides).to(args.device)
+    output = args.output
+    if output is None:
+        output = (
+            Path("resources/denoiser_cnn_weights.bin")
+            if args.model == "tiny-cnn"
+            else Path("resources/denoiser_weights.bin")
+        )
+
+    if args.model == "tiny-cnn":
+        model = TinyCnnDenoiser().to(args.device)
+    else:
+        model = LearnedFilter(args.radius, guides).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
@@ -317,7 +398,10 @@ def main() -> None:
 
     val_loss = validate(model, val_dataset, args.batch_size, args.val_steps, args.device, args.high_weight)
     print(f"val_loss {val_loss:.6f}")
-    export_weights(model, args.output)
+    if isinstance(model, TinyCnnDenoiser):
+        export_cnn_weights(model, output)
+    else:
+        export_weights(model, output)
 
 
 if __name__ == "__main__":
