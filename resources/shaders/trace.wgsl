@@ -26,10 +26,16 @@ const MAT_RED: u32 = 2u;
 const MAT_GREEN: u32 = 3u;
 const MAT_BLUE: u32 = 4u;
 const MAT_LIGHT: u32 = 5u;
+const MAT_WOOD: u32 = 6u;
+const MAT_LEAVES: u32 = 7u;
+const MAT_WALL: u32 = 8u;
+const MAT_ROOF: u32 = 9u;
+const MAT_PATH: u32 = 10u;
+const MAT_GLASS: u32 = 11u;
 
-const LIGHT_LO: vec3<i32> = vec3<i32>(-3, 8, 1);
-const LIGHT_HI: vec3<i32> = vec3<i32>(2, 9, 5);
-const LIGHT_AREA: f32 = 20.0;
+const LIGHT_LO: vec3<i32> = vec3<i32>(-2, 15, 1);
+const LIGHT_HI: vec3<i32> = vec3<i32>(3, 16, 4);
+const LIGHT_AREA: f32 = 15.0;
 
 const CHUNK_SIZE: i32 = 4;
 const SCENE_CHUNK_WORDS: u32 = 8u;
@@ -129,8 +135,26 @@ fn albedo(m: u32) -> vec3<f32> {
     if m == MAT_BLUE {
         return vec3<f32>(0.2, 0.4, 0.9);
     }
+    if m == MAT_WOOD {
+        return vec3<f32>(0.48, 0.28, 0.12);
+    }
+    if m == MAT_LEAVES {
+        return vec3<f32>(0.18, 0.52, 0.16);
+    }
+    if m == MAT_WALL {
+        return vec3<f32>(0.72, 0.58, 0.40);
+    }
+    if m == MAT_ROOF {
+        return vec3<f32>(0.62, 0.16, 0.12);
+    }
+    if m == MAT_PATH {
+        return vec3<f32>(0.52, 0.43, 0.32);
+    }
+    if m == MAT_GLASS {
+        return vec3<f32>(0.45, 0.68, 0.85);
+    }
     if m == MAT_FLOOR {
-        return vec3<f32>(0.8);
+        return vec3<f32>(0.36, 0.54, 0.30);
     }
     return vec3<f32>(0.0);
 }

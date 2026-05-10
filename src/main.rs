@@ -30,9 +30,14 @@ const CAMERA_HEIGHT: f32 = 6.0;
 const CAMERA_FOCAL_LENGTH: f32 = 1.5;
 
 const MAT_RED: u32 = 2;
-const MAT_GREEN: u32 = 3;
 const MAT_BLUE: u32 = 4;
 const MAT_LIGHT: u32 = 5;
+const MAT_WOOD: u32 = 6;
+const MAT_LEAVES: u32 = 7;
+const MAT_WALL: u32 = 8;
+const MAT_ROOF: u32 = 9;
+const MAT_PATH: u32 = 10;
+const MAT_GLASS: u32 = 11;
 
 const SCENE_HEADER_WORDS: usize = 16;
 const SCENE_CHUNK_WORDS: usize = 8;
@@ -83,36 +88,96 @@ struct SceneBox {
     mat: u32,
 }
 
-const SCENE_BOXES: [SceneBox; 6] = [
+const SCENE_BOXES: [SceneBox; 18] = [
     SceneBox {
-        lo: [-1, 0, -1],
-        hi: [2, 5, 2],
-        mat: MAT_GREEN,
-    },
-    SceneBox {
-        lo: [-5, 0, 2],
-        hi: [-2, 2, 5],
-        mat: MAT_RED,
-    },
-    SceneBox {
-        lo: [3, 0, -4],
-        hi: [5, 6, -2],
-        mat: MAT_BLUE,
-    },
-    SceneBox {
-        lo: [-4, 0, -3],
-        hi: [-2, 3, -1],
-        mat: MAT_RED,
-    },
-    SceneBox {
-        lo: [1, 6, -2],
-        hi: [3, 7, 0],
-        mat: MAT_BLUE,
-    },
-    SceneBox {
-        lo: [-3, 8, 1],
-        hi: [2, 9, 5],
+        lo: [-2, 15, 1],
+        hi: [3, 16, 4],
         mat: MAT_LIGHT,
+    },
+    SceneBox {
+        lo: [-2, 0, 4],
+        hi: [0, 1, 11],
+        mat: MAT_PATH,
+    },
+    SceneBox {
+        lo: [0, 0, 7],
+        hi: [2, 1, 9],
+        mat: MAT_PATH,
+    },
+    SceneBox {
+        lo: [-4, 0, 9],
+        hi: [-2, 1, 11],
+        mat: MAT_PATH,
+    },
+    SceneBox {
+        lo: [-2, 0, 3],
+        hi: [0, 3, 4],
+        mat: MAT_WOOD,
+    },
+    SceneBox {
+        lo: [0, 2, 3],
+        hi: [1, 3, 4],
+        mat: MAT_GLASS,
+    },
+    SceneBox {
+        lo: [-4, 2, 0],
+        hi: [-3, 3, 2],
+        mat: MAT_GLASS,
+    },
+    SceneBox {
+        lo: [-4, 6, 1],
+        hi: [-3, 9, 2],
+        mat: MAT_RED,
+    },
+    SceneBox {
+        lo: [-5, 4, -3],
+        hi: [3, 5, 5],
+        mat: MAT_ROOF,
+    },
+    SceneBox {
+        lo: [-4, 5, -2],
+        hi: [2, 6, 4],
+        mat: MAT_ROOF,
+    },
+    SceneBox {
+        lo: [-3, 6, -1],
+        hi: [1, 7, 3],
+        mat: MAT_ROOF,
+    },
+    SceneBox {
+        lo: [-4, 0, -2],
+        hi: [2, 4, 4],
+        mat: MAT_WALL,
+    },
+    SceneBox {
+        lo: [5, 0, -1],
+        hi: [6, 5, 0],
+        mat: MAT_WOOD,
+    },
+    SceneBox {
+        lo: [3, 4, -3],
+        hi: [8, 7, 2],
+        mat: MAT_LEAVES,
+    },
+    SceneBox {
+        lo: [4, 6, -2],
+        hi: [7, 9, 1],
+        mat: MAT_LEAVES,
+    },
+    SceneBox {
+        lo: [2, 5, -2],
+        hi: [4, 7, 1],
+        mat: MAT_LEAVES,
+    },
+    SceneBox {
+        lo: [-7, 0, 4],
+        hi: [-6, 1, 5],
+        mat: MAT_RED,
+    },
+    SceneBox {
+        lo: [3, 0, 5],
+        hi: [4, 1, 6],
+        mat: MAT_BLUE,
     },
 ];
 
