@@ -58,7 +58,7 @@ fn create_trusted_wgsl_shader_module(
     // The trace shader bounds-checks its storage texture writes against
     // textureDimensions, reads only scene-buffer ranges written by this binary,
     // and uses bounded loops. The denoise shader bounds-checks storage texture
-    // writes and samples a 3x3 clamped neighborhood from a bound texture. The
+    // writes and samples a 5x5 clamped neighborhood from a bound texture. The
     // blit shader only samples a bound texture using interpolated UVs from a
     // fullscreen triangle.
     unsafe {
@@ -111,16 +111,16 @@ const SCENE_BOXES: [SceneBox; 18] = [
     },
     SceneBox {
         lo: [-2, 0, 3],
-        hi: [0, 3, 4],
+        hi: [0, 3, 5],
         mat: MAT_WOOD,
     },
     SceneBox {
         lo: [0, 2, 3],
-        hi: [1, 3, 4],
+        hi: [1, 3, 5],
         mat: MAT_GLASS,
     },
     SceneBox {
-        lo: [-4, 2, 0],
+        lo: [-5, 2, 0],
         hi: [-3, 3, 2],
         mat: MAT_GLASS,
     },
