@@ -26,17 +26,10 @@ const LIGHT_LO: vec3<i32> = vec3<i32>(-3, 8, 1);
 const LIGHT_HI: vec3<i32> = vec3<i32>(2, 9, 5);
 const LIGHT_AREA: f32 = 20.0;
 
-const HIT_FLOOR: i32 = -2;
-
 struct Hit {
     t: f32,
     n: vec3<f32>,
-    id: i32,
-}
-
-struct TraceResult {
-    found: bool,
-    hit: Hit,
+    mat: u32,
 }
 
 struct Aabb {
@@ -87,17 +80,6 @@ fn seed(px: vec2<i32>, sample_index: i32) -> u32 {
     );
 }
 
-fn hit_mat(h: Hit) -> u32 {
-    if h.id == HIT_FLOOR {
-        return MAT_FLOOR;
-    }
-
-    if h.id < 0 {
-        return MAT_EMPTY;
-    }
-    return BOXES[u32(h.id)].mat;
-}
-
 fn albedo(m: u32) -> vec3<f32> {
     if m == MAT_RED {
         return vec3<f32>(0.8, 0.2, 0.2);
@@ -128,11 +110,13 @@ fn safe_inv(x: f32) -> f32 {
     return 1.0 / x;
 }
 
-fn miss(max_distance: f32) -> TraceResult {
-    return TraceResult(false, Hit(max_distance, vec3<f32>(0.0), -1));
-}
-
-fn trace_box(ro: vec3<f32>, rd: vec3<f32>, id: i32, max_distance: f32) -> TraceResult {
+fn trace_box(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    id: i32,
+    max_distance: f32,
+    out_hit: ptr<function, Hit>,
+) -> bool {
     let box = BOXES[u32(id)];
     let lo = vec3<f32>(box.lo);
     let hi = vec3<f32>(box.hi);
@@ -147,7 +131,7 @@ fn trace_box(ro: vec3<f32>, rd: vec3<f32>, id: i32, max_distance: f32) -> TraceR
     let t0 = max(max(near_t.x, near_t.y), near_t.z);
     let t1 = min(min(far_t.x, far_t.y), far_t.z);
     if t1 < max(t0, SURFACE_EPSILON) || t0 > max_distance {
-        return miss(max_distance);
+        return false;
     }
 
     var near_normal: vec3<f32>;
@@ -176,13 +160,19 @@ fn trace_box(ro: vec3<f32>, rd: vec3<f32>, id: i32, max_distance: f32) -> TraceR
     }
 
     if t < SURFACE_EPSILON || t > max_distance {
-        return miss(max_distance);
+        return false;
     }
 
-    return TraceResult(true, Hit(t, n, id));
+    *out_hit = Hit(t, n, box.mat);
+    return true;
 }
 
-fn trace(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> TraceResult {
+fn trace(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    max_distance: f32,
+    out_hit: ptr<function, Hit>,
+) -> bool {
     var floor_t = AXIS_NEVER;
 
     if rd.y < 0.0 {
@@ -192,25 +182,24 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> TraceResult {
         }
     }
 
-    var hit = Hit(max_distance, vec3<f32>(0.0), -1);
     var found = false;
     var closest = max_distance;
     if floor_t <= max_distance {
-        hit = Hit(floor_t, vec3<f32>(0.0, 1.0, 0.0), HIT_FLOOR);
+        *out_hit = Hit(floor_t, vec3<f32>(0.0, 1.0, 0.0), MAT_FLOOR);
         closest = floor_t;
         found = true;
     }
 
     for (var i = 0; i < BOX_COUNT; i = i + 1) {
-        let box_hit = trace_box(ro, rd, i, closest);
-        if box_hit.found {
-            hit = box_hit.hit;
-            closest = box_hit.hit.t;
+        var box_hit = Hit(max_distance, vec3<f32>(0.0), MAT_EMPTY);
+        if trace_box(ro, rd, i, closest, &box_hit) {
+            *out_hit = box_hit;
+            closest = box_hit.t;
             found = true;
         }
     }
 
-    return TraceResult(found, hit);
+    return found;
 }
 
 fn sky(rd: vec3<f32>) -> vec3<f32> {
@@ -263,8 +252,8 @@ fn sample_direct_light(p: vec3<f32>, n: vec3<f32>, mat: u32, rng: ptr<function, 
         return vec3<f32>(0.0);
     }
 
-    let shadow_hit = trace(p, wi, distance_to_light - SURFACE_EPSILON);
-    if shadow_hit.found {
+    var shadow_hit = Hit(distance_to_light, vec3<f32>(0.0), MAT_EMPTY);
+    if trace(p, wi, distance_to_light - SURFACE_EPSILON, &shadow_hit) {
         return vec3<f32>(0.0);
     }
 
@@ -281,14 +270,13 @@ fn path_trace(ro_in: vec3<f32>, rd_in: vec3<f32>, rng: ptr<function, u32>) -> ve
     var throughput = vec3<f32>(1.0);
 
     for (var bounce = 0; bounce < MAX_BOUNCES; bounce = bounce + 1) {
-        let hit_result = trace(ro, rd, MAX_RAY_DISTANCE);
-        if !hit_result.found {
+        var hit = Hit(MAX_RAY_DISTANCE, vec3<f32>(0.0), MAT_EMPTY);
+        if !trace(ro, rd, MAX_RAY_DISTANCE, &hit) {
             radiance += throughput * sky(rd);
             break;
         }
 
-        let hit = hit_result.hit;
-        let mat = hit_mat(hit);
+        let mat = hit.mat;
 
         let e = emission(mat);
         if max(e.r, max(e.g, e.b)) > 0.0 {

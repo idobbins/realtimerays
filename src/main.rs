@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
@@ -77,10 +77,10 @@ fn camera_uniform(time: f32) -> CameraUniform {
 
 struct FrameStats {
     start: Instant,
-    last_frame: Instant,
-    stats_time: Instant,
-    frame_ms_sum: f64,
-    frame_ms_count: u32,
+    last: Instant,
+    last_print: Instant,
+    ms_sum: f64,
+    frames: u32,
 }
 
 impl FrameStats {
@@ -88,30 +88,25 @@ impl FrameStats {
         let now = Instant::now();
         Self {
             start: now,
-            last_frame: now,
-            stats_time: now,
-            frame_ms_sum: 0.0,
-            frame_ms_count: 0,
+            last: now,
+            last_print: now,
+            ms_sum: 0.0,
+            frames: 0,
         }
     }
 
-    fn sample(&mut self) -> f32 {
+    fn tick(&mut self) -> f32 {
         let now = Instant::now();
-        let frame_ms = (now - self.last_frame).as_secs_f64() * 1000.0;
-        self.last_frame = now;
-        self.frame_ms_sum += frame_ms;
-        self.frame_ms_count += 1;
+        self.ms_sum += (now - self.last).as_secs_f64() * 1000.0;
+        self.frames += 1;
+        self.last = now;
 
-        if (now - self.stats_time).as_secs_f64() >= 1.0 {
-            let average_ms = self.frame_ms_sum / f64::from(self.frame_ms_count);
-            println!(
-                "frame {:.2} ms ({:.1} fps)",
-                average_ms,
-                1000.0 / average_ms
-            );
-            self.stats_time = now;
-            self.frame_ms_sum = 0.0;
-            self.frame_ms_count = 0;
+        if (now - self.last_print).as_secs_f64() >= 1.0 {
+            let ms = self.ms_sum / f64::from(self.frames);
+            println!("frame {:.2} ms ({:.1} fps)", ms, 1000.0 / ms);
+            self.last_print = now;
+            self.ms_sum = 0.0;
+            self.frames = 0;
         }
 
         (now - self.start).as_secs_f32()
@@ -119,27 +114,16 @@ impl FrameStats {
 }
 
 struct Renderer {
-    instance: wgpu::Instance,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    size: PhysicalSize<u32>,
     camera_buffer: wgpu::Buffer,
-    compute_bind_group_layout: wgpu::BindGroupLayout,
-    blit_bind_group_layout: wgpu::BindGroupLayout,
     compute_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
     blit_pipeline: wgpu::RenderPipeline,
-}
-
-enum RenderOutcome {
-    Drawn,
-    Skip,
-    Reconfigure,
-    RecreateSurface,
 }
 
 impl Renderer {
@@ -319,16 +303,12 @@ impl Renderer {
         );
 
         Self {
-            instance,
             window,
             surface,
             device,
             queue,
             config,
-            size,
             camera_buffer,
-            compute_bind_group_layout,
-            blit_bind_group_layout,
             compute_bind_group,
             blit_bind_group,
             compute_pipeline,
@@ -400,51 +380,17 @@ impl Renderer {
         (compute_bind_group, blit_bind_group)
     }
 
-    fn resize(&mut self, size: PhysicalSize<u32>) {
-        self.size = size;
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-
-        self.config.width = size.width;
-        self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
-        (self.compute_bind_group, self.blit_bind_group) = Self::create_frame_bind_groups(
-            &self.device,
-            &self.camera_buffer,
-            &self.compute_bind_group_layout,
-            &self.blit_bind_group_layout,
-            self.config.width,
-            self.config.height,
-        );
-    }
-
-    fn recreate_surface(&mut self) {
-        self.surface = self
-            .instance
-            .create_surface(Arc::clone(&self.window))
-            .expect("recreate WGPU surface");
-
-        if self.config.width > 0 && self.config.height > 0 {
-            self.surface.configure(&self.device, &self.config);
-        }
-    }
-
-    fn render(&mut self, camera: &CameraUniform) -> RenderOutcome {
-        if self.size.width == 0 || self.size.height == 0 {
-            return RenderOutcome::Skip;
-        }
-
+    fn render(&mut self, camera: &CameraUniform) {
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
-        let (frame, reconfigure_after_present) = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return RenderOutcome::Skip,
-            wgpu::CurrentSurfaceTexture::Outdated => return RenderOutcome::Reconfigure,
-            wgpu::CurrentSurfaceTexture::Lost => return RenderOutcome::RecreateSurface,
+            | wgpu::CurrentSurfaceTexture::Validation
+            | wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Lost => return,
         };
         let frame_view = frame
             .texture
@@ -493,16 +439,10 @@ impl Renderer {
 
         self.queue.submit([encoder.finish()]);
         frame.present();
-        if reconfigure_after_present {
-            RenderOutcome::Reconfigure
-        } else {
-            RenderOutcome::Drawn
-        }
     }
 }
 
 struct App {
-    window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     stats: FrameStats,
 }
@@ -510,7 +450,6 @@ struct App {
 impl App {
     fn new() -> Self {
         Self {
-            window: None,
             renderer: None,
             stats: FrameStats::new(),
         }
@@ -519,7 +458,7 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.renderer.is_some() {
             return;
         }
 
@@ -534,14 +473,13 @@ impl ApplicationHandler for App {
         window.request_redraw();
 
         self.renderer = Some(renderer);
-        self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Some(window) = self.window.as_ref() else {
+        let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        if id != window.id() {
+        if id != renderer.window.id() {
             return;
         }
 
@@ -553,34 +491,18 @@ impl ApplicationHandler for App {
             {
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(size);
-                }
-            }
-            WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(window.inner_size());
-                }
-            }
             WindowEvent::RedrawRequested => {
-                let time = self.stats.sample();
+                let time = self.stats.tick();
                 let camera = camera_uniform(time);
-                if let Some(renderer) = self.renderer.as_mut() {
-                    match renderer.render(&camera) {
-                        RenderOutcome::Drawn | RenderOutcome::Skip => {}
-                        RenderOutcome::Reconfigure => renderer.resize(renderer.size),
-                        RenderOutcome::RecreateSurface => renderer.recreate_surface(),
-                    }
-                }
+                renderer.render(&camera);
             }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.window.request_redraw();
         }
     }
 }
@@ -588,7 +510,8 @@ impl ApplicationHandler for App {
 fn window_attributes() -> WindowAttributes {
     let attributes = Window::default_attributes()
         .with_title("realtimerays")
-        .with_inner_size(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)));
+        .with_inner_size(LogicalSize::new(f64::from(WIDTH), f64::from(HEIGHT)))
+        .with_resizable(false);
 
     #[cfg(target_os = "macos")]
     {
