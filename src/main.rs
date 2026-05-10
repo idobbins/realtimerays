@@ -1,5 +1,5 @@
-use std::error::Error;
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ const SCENE_MATERIAL_BOX_WORDS: usize = 8;
 const CHUNK_SIZE: i32 = 4;
 
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
+const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
 
 fn create_trusted_wgsl_shader_module(
@@ -51,8 +52,10 @@ fn create_trusted_wgsl_shader_module(
     // SAFETY: These WGSL sources are static application assets, not user input.
     // The trace shader bounds-checks its storage texture writes against
     // textureDimensions, reads only scene-buffer ranges written by this binary,
-    // and uses bounded loops. The blit shader only samples a bound texture
-    // using interpolated UVs from a fullscreen triangle.
+    // and uses bounded loops. The denoise shader bounds-checks storage texture
+    // writes and samples a 3x3 clamped neighborhood from a bound texture. The
+    // blit shader only samples a bound texture using interpolated UVs from a
+    // fullscreen triangle.
     unsafe {
         device.create_shader_module_trusted(
             wgpu::ShaderModuleDescriptor {
@@ -132,18 +135,15 @@ fn build_scene_words() -> Vec<u32> {
         for z in b.lo[2]..b.hi[2] {
             for y in b.lo[1]..b.hi[1] {
                 for x in b.lo[0]..b.hi[0] {
-                    let chunk = [
-                        floor_div_chunk(x),
-                        floor_div_chunk(y),
-                        floor_div_chunk(z),
-                    ];
+                    let chunk = [floor_div_chunk(x), floor_div_chunk(y), floor_div_chunk(z)];
                     let local = [
                         x - chunk[0] * CHUNK_SIZE,
                         y - chunk[1] * CHUNK_SIZE,
                         z - chunk[2] * CHUNK_SIZE,
                     ];
-                    let bit = (local[0] + local[1] * CHUNK_SIZE + local[2] * CHUNK_SIZE * CHUNK_SIZE)
-                        as u32;
+                    let bit = (local[0]
+                        + local[1] * CHUNK_SIZE
+                        + local[2] * CHUNK_SIZE * CHUNK_SIZE) as u32;
                     let mask = chunks.entry(chunk).or_insert([0; 2]);
                     if bit < 32 {
                         mask[0] |= 1 << bit;
@@ -312,8 +312,10 @@ struct Renderer {
     camera_buffer: wgpu::Buffer,
     _scene_buffer: wgpu::Buffer,
     compute_bind_group: wgpu::BindGroup,
+    denoise_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
+    denoise_pipeline: wgpu::ComputePipeline,
     blit_pipeline: wgpu::RenderPipeline,
 }
 
@@ -324,9 +326,11 @@ struct Recorder {
     height: u32,
     camera_buffer: wgpu::Buffer,
     _scene_buffer: wgpu::Buffer,
-    offscreen: wgpu::Texture,
+    denoised: wgpu::Texture,
     compute_bind_group: wgpu::BindGroup,
+    denoise_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
+    denoise_pipeline: wgpu::ComputePipeline,
 }
 
 impl Renderer {
@@ -452,6 +456,32 @@ impl Renderer {
                     },
                 ],
             });
+        let denoise_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("denoise bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let trace_shader = create_trusted_wgsl_shader_module(&device, "trace shader", TRACE_SHADER);
         let compute_pipeline_layout =
@@ -464,6 +494,23 @@ impl Renderer {
             label: Some("trace pipeline"),
             layout: Some(&compute_pipeline_layout),
             module: &trace_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let denoise_shader =
+            create_trusted_wgsl_shader_module(&device, "denoise shader", DENOISE_SHADER);
+        let denoise_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("denoise pipeline layout"),
+                bind_group_layouts: &[Some(&denoise_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let denoise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("denoise pipeline"),
+            layout: Some(&denoise_pipeline_layout),
+            module: &denoise_shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
@@ -501,15 +548,17 @@ impl Renderer {
             cache: None,
         });
 
-        let (compute_bind_group, blit_bind_group) = Self::create_frame_bind_groups(
-            &device,
-            &camera_buffer,
-            &scene_buffer,
-            &compute_bind_group_layout,
-            &blit_bind_group_layout,
-            config.width,
-            config.height,
-        );
+        let (compute_bind_group, denoise_bind_group, blit_bind_group) =
+            Self::create_frame_bind_groups(
+                &device,
+                &camera_buffer,
+                &scene_buffer,
+                &compute_bind_group_layout,
+                &denoise_bind_group_layout,
+                &blit_bind_group_layout,
+                config.width,
+                config.height,
+            );
 
         Self {
             window,
@@ -520,8 +569,10 @@ impl Renderer {
             camera_buffer,
             _scene_buffer: scene_buffer,
             compute_bind_group,
+            denoise_bind_group,
             blit_bind_group,
             compute_pipeline,
+            denoise_pipeline,
             blit_pipeline,
         }
     }
@@ -531,12 +582,13 @@ impl Renderer {
         camera_buffer: &wgpu::Buffer,
         scene_buffer: &wgpu::Buffer,
         compute_layout: &wgpu::BindGroupLayout,
+        denoise_layout: &wgpu::BindGroupLayout,
         blit_layout: &wgpu::BindGroupLayout,
         width: u32,
         height: u32,
-    ) -> (wgpu::BindGroup, wgpu::BindGroup) {
-        let offscreen = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen image"),
+    ) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
+        let noisy = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("noisy image"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -549,7 +601,22 @@ impl Renderer {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
+        let denoised = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("denoised image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let noisy_view = noisy.create_view(&wgpu::TextureViewDescriptor::default());
+        let denoised_view = denoised.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("blit sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -565,7 +632,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&noisy_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -577,13 +644,27 @@ impl Renderer {
                 },
             ],
         });
+        let denoise_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("denoise bind group"),
+            layout: denoise_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&noisy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&denoised_view),
+                },
+            ],
+        });
         let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blit bind group"),
             layout: blit_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&denoised_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -592,7 +673,7 @@ impl Renderer {
             ],
         });
 
-        (compute_bind_group, blit_bind_group)
+        (compute_bind_group, denoise_bind_group, blit_bind_group)
     }
 
     fn render(&mut self, camera: &CameraUniform) {
@@ -623,6 +704,20 @@ impl Renderer {
             });
             pass.set_pipeline(&self.compute_pipeline);
             pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.config.width.div_ceil(TILE_SIZE),
+                self.config.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("denoise pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.denoise_pipeline);
+            pass.set_bind_group(0, &self.denoise_bind_group, &[]);
             pass.dispatch_workgroups(
                 self.config.width.div_ceil(TILE_SIZE),
                 self.config.height.div_ceil(TILE_SIZE),
@@ -722,6 +817,32 @@ impl Recorder {
                     },
                 ],
             });
+        let denoise_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("record denoise bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let trace_shader =
             create_trusted_wgsl_shader_module(&device, "record trace shader", TRACE_SHADER);
@@ -740,8 +861,39 @@ impl Recorder {
             cache: None,
         });
 
-        let offscreen = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("record offscreen image"),
+        let denoise_shader =
+            create_trusted_wgsl_shader_module(&device, "record denoise shader", DENOISE_SHADER);
+        let denoise_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("record denoise pipeline layout"),
+                bind_group_layouts: &[Some(&denoise_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let denoise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("record denoise pipeline"),
+            layout: Some(&denoise_pipeline_layout),
+            module: &denoise_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let noisy = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("record noisy image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let denoised = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("record denoised image"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -754,14 +906,15 @@ impl Recorder {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let offscreen_view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
+        let noisy_view = noisy.create_view(&wgpu::TextureViewDescriptor::default());
+        let denoised_view = denoised.create_view(&wgpu::TextureViewDescriptor::default());
         let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("record compute bind group"),
             layout: &compute_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&offscreen_view),
+                    resource: wgpu::BindingResource::TextureView(&noisy_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -773,6 +926,20 @@ impl Recorder {
                 },
             ],
         });
+        let denoise_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("record denoise bind group"),
+            layout: &denoise_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&noisy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&denoised_view),
+                },
+            ],
+        });
 
         Ok(Self {
             device,
@@ -781,9 +948,11 @@ impl Recorder {
             height,
             camera_buffer,
             _scene_buffer: scene_buffer,
-            offscreen,
+            denoised,
             compute_bind_group,
+            denoise_bind_group,
             compute_pipeline,
+            denoise_pipeline,
         })
     }
 
@@ -821,9 +990,22 @@ impl Recorder {
                 1,
             );
         }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("record denoise pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.denoise_pipeline);
+            pass.set_bind_group(0, &self.denoise_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.offscreen,
+                texture: &self.denoised,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,

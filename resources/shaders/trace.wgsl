@@ -14,7 +14,7 @@ struct SceneBuffer {
 @group(0) @binding(2) var<storage, read> scene: SceneBuffer;
 
 const MAX_BOUNCES: i32 = 3;
-const SAMPLES_PER_PIXEL: i32 = 2;
+const SAMPLES_PER_PIXEL: i32 = 3;
 const SURFACE_EPSILON: f32 = 0.001;
 const MAX_RAY_DISTANCE: f32 = 80.0;
 const AXIS_NEVER: f32 = 1.0e20;
@@ -462,7 +462,12 @@ fn pixel_uv(px: vec2<i32>, sz: vec2<i32>, jitter: vec2<f32>) -> vec2<f32> {
 }
 
 fn tonemap(x: vec3<f32>) -> vec3<f32> {
-    return x / (x + vec3<f32>(1.0));
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + vec3<f32>(b))) / (x * (c * x + vec3<f32>(d)) + vec3<f32>(e)), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 @compute @workgroup_size(8, 8, 1)
