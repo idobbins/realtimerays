@@ -1,0 +1,360 @@
+struct CameraUniform {
+    camera_ro_time: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
+    camera_forward: vec4<f32>,
+}
+
+@group(0) @binding(0) var out_image: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<uniform> pc: CameraUniform;
+
+const MAX_BOUNCES: i32 = 3;
+const SAMPLES_PER_PIXEL: i32 = 12;
+const SURFACE_EPSILON: f32 = 0.001;
+const MAX_RAY_DISTANCE: f32 = 80.0;
+const AXIS_NEVER: f32 = 1.0e20;
+const PI: f32 = 3.14159265359;
+
+const MAT_EMPTY: u32 = 0u;
+const MAT_FLOOR: u32 = 1u;
+const MAT_RED: u32 = 2u;
+const MAT_GREEN: u32 = 3u;
+const MAT_BLUE: u32 = 4u;
+const MAT_LIGHT: u32 = 5u;
+
+const LIGHT_LO: vec3<i32> = vec3<i32>(-3, 8, 1);
+const LIGHT_HI: vec3<i32> = vec3<i32>(2, 9, 5);
+const LIGHT_AREA: f32 = 20.0;
+
+const HIT_FLOOR: i32 = -2;
+
+struct Hit {
+    t: f32,
+    n: vec3<f32>,
+    id: i32,
+}
+
+struct TraceResult {
+    found: bool,
+    hit: Hit,
+}
+
+struct Aabb {
+    lo: vec3<i32>,
+    hi: vec3<i32>,
+    mat: u32,
+}
+
+const BOX_COUNT: i32 = 6;
+
+const BOXES: array<Aabb, 6> = array<Aabb, 6>(
+    Aabb(vec3<i32>(-1, 0, -1), vec3<i32>(2, 5, 2), MAT_GREEN),
+    Aabb(vec3<i32>(-5, 0, 2), vec3<i32>(-2, 2, 5), MAT_RED),
+    Aabb(vec3<i32>(3, 0, -4), vec3<i32>(5, 6, -2), MAT_BLUE),
+    Aabb(vec3<i32>(-4, 0, -3), vec3<i32>(-2, 3, -1), MAT_RED),
+    Aabb(vec3<i32>(1, 6, -2), vec3<i32>(3, 7, 0), MAT_BLUE),
+    Aabb(LIGHT_LO, LIGHT_HI, MAT_LIGHT),
+);
+
+struct Camera {
+    ro: vec3<f32>,
+    right: vec3<f32>,
+    up: vec3<f32>,
+    forward: vec3<f32>,
+}
+
+fn hash(x_in: u32) -> u32 {
+    var x = x_in;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    x = x ^ (x >> 16u);
+    return x;
+}
+
+fn rand(s: ptr<function, u32>) -> f32 {
+    *s = hash(*s);
+    return f32(*s) / 4294967295.0;
+}
+
+fn seed(px: vec2<i32>, sample_index: i32) -> u32 {
+    return hash(
+        (u32(px.x) * 1973u) ^
+        (u32(px.y) * 9277u) ^
+        (u32(sample_index) * 26699u) ^
+        (bitcast<u32>(pc.camera_ro_time.w) * 747796405u)
+    );
+}
+
+fn hit_mat(h: Hit) -> u32 {
+    if h.id == HIT_FLOOR {
+        return MAT_FLOOR;
+    }
+
+    if h.id < 0 {
+        return MAT_EMPTY;
+    }
+    return BOXES[u32(h.id)].mat;
+}
+
+fn albedo(m: u32) -> vec3<f32> {
+    if m == MAT_RED {
+        return vec3<f32>(0.8, 0.2, 0.2);
+    }
+    if m == MAT_GREEN {
+        return vec3<f32>(0.2, 0.8, 0.2);
+    }
+    if m == MAT_BLUE {
+        return vec3<f32>(0.2, 0.4, 0.9);
+    }
+    if m == MAT_FLOOR {
+        return vec3<f32>(0.8);
+    }
+    return vec3<f32>(0.0);
+}
+
+fn emission(m: u32) -> vec3<f32> {
+    if m == MAT_LIGHT {
+        return vec3<f32>(8.0, 7.0, 6.0);
+    }
+    return vec3<f32>(0.0);
+}
+
+fn safe_inv(x: f32) -> f32 {
+    if abs(x) < 0.000001 {
+        return 1.0e20;
+    }
+    return 1.0 / x;
+}
+
+fn miss(max_distance: f32) -> TraceResult {
+    return TraceResult(false, Hit(max_distance, vec3<f32>(0.0), -1));
+}
+
+fn trace_box(ro: vec3<f32>, rd: vec3<f32>, id: i32, max_distance: f32) -> TraceResult {
+    let box = BOXES[u32(id)];
+    let lo = vec3<f32>(box.lo);
+    let hi = vec3<f32>(box.hi);
+    let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+    let a = (lo - ro) * inv;
+    let b = (hi - ro) * inv;
+
+    let near_t = min(a, b);
+    let far_t = max(a, b);
+
+    let t0 = max(max(near_t.x, near_t.y), near_t.z);
+    let t1 = min(min(far_t.x, far_t.y), far_t.z);
+    if t1 < max(t0, SURFACE_EPSILON) || t0 > max_distance {
+        return miss(max_distance);
+    }
+
+    var near_normal: vec3<f32>;
+    if t0 == near_t.x {
+        near_normal = vec3<f32>(select(1.0, -1.0, rd.x > 0.0), 0.0, 0.0);
+    } else if t0 == near_t.y {
+        near_normal = vec3<f32>(0.0, select(1.0, -1.0, rd.y > 0.0), 0.0);
+    } else {
+        near_normal = vec3<f32>(0.0, 0.0, select(1.0, -1.0, rd.z > 0.0));
+    }
+
+    var far_normal: vec3<f32>;
+    if t1 == far_t.x {
+        far_normal = vec3<f32>(select(-1.0, 1.0, rd.x > 0.0), 0.0, 0.0);
+    } else if t1 == far_t.y {
+        far_normal = vec3<f32>(0.0, select(-1.0, 1.0, rd.y > 0.0), 0.0);
+    } else {
+        far_normal = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, rd.z > 0.0));
+    }
+
+    var t = t0;
+    var n = near_normal;
+    if t < SURFACE_EPSILON {
+        t = t1;
+        n = far_normal;
+    }
+
+    if t < SURFACE_EPSILON || t > max_distance {
+        return miss(max_distance);
+    }
+
+    return TraceResult(true, Hit(t, n, id));
+}
+
+fn trace(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> TraceResult {
+    var floor_t = AXIS_NEVER;
+
+    if rd.y < 0.0 {
+        floor_t = -ro.y / rd.y;
+        if floor_t < SURFACE_EPSILON {
+            floor_t = AXIS_NEVER;
+        }
+    }
+
+    var hit = Hit(max_distance, vec3<f32>(0.0), -1);
+    var found = false;
+    var closest = max_distance;
+    if floor_t <= max_distance {
+        hit = Hit(floor_t, vec3<f32>(0.0, 1.0, 0.0), HIT_FLOOR);
+        closest = floor_t;
+        found = true;
+    }
+
+    for (var i = 0; i < BOX_COUNT; i = i + 1) {
+        let box_hit = trace_box(ro, rd, i, closest);
+        if box_hit.found {
+            hit = box_hit.hit;
+            closest = box_hit.hit.t;
+            found = true;
+        }
+    }
+
+    return TraceResult(found, hit);
+}
+
+fn sky(rd: vec3<f32>) -> vec3<f32> {
+    let t = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+    return mix(vec3<f32>(0.78, 0.84, 0.92), vec3<f32>(0.30, 0.40, 0.58), t);
+}
+
+fn tangent_for(n: vec3<f32>) -> vec3<f32> {
+    var up = vec3<f32>(1.0, 0.0, 0.0);
+    if abs(n.y) < 0.999 {
+        up = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    return normalize(cross(up, n));
+}
+
+fn cosine_hemisphere(n: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    let r1 = rand(rng);
+    let r2 = rand(rng);
+    let a = 2.0 * PI * r1;
+    let r = sqrt(r2);
+
+    let t = tangent_for(n);
+    let b = cross(n, t);
+    let d = t * (cos(a) * r) +
+        b * (sin(a) * r) +
+        n * sqrt(max(0.0, 1.0 - r2));
+
+    return normalize(d);
+}
+
+fn sample_light(rng: ptr<function, u32>) -> vec3<f32> {
+    return vec3<f32>(
+        mix(f32(LIGHT_LO.x), f32(LIGHT_HI.x), rand(rng)),
+        f32(LIGHT_LO.y),
+        mix(f32(LIGHT_LO.z), f32(LIGHT_HI.z), rand(rng)),
+    );
+}
+
+fn sample_direct_light(p: vec3<f32>, n: vec3<f32>, mat: u32, rng: ptr<function, u32>) -> vec3<f32> {
+    let light_point = sample_light(rng);
+    let to_light = light_point - p;
+    let distance_squared = dot(to_light, to_light);
+    let distance_to_light = sqrt(distance_squared);
+    let wi = to_light / distance_to_light;
+    let surface_cos = max(dot(n, wi), 0.0);
+    let light_cos = max(dot(vec3<f32>(0.0, -1.0, 0.0), -wi), 0.0);
+    let w = surface_cos * light_cos;
+
+    if w <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+
+    let shadow_hit = trace(p, wi, distance_to_light - SURFACE_EPSILON);
+    if shadow_hit.found {
+        return vec3<f32>(0.0);
+    }
+
+    return albedo(mat) / PI *
+        emission(MAT_LIGHT) *
+        w / max(distance_squared, 0.0001) *
+        LIGHT_AREA;
+}
+
+fn path_trace(ro_in: vec3<f32>, rd_in: vec3<f32>, rng: ptr<function, u32>) -> vec3<f32> {
+    var ro = ro_in;
+    var rd = rd_in;
+    var radiance = vec3<f32>(0.0);
+    var throughput = vec3<f32>(1.0);
+
+    for (var bounce = 0; bounce < MAX_BOUNCES; bounce = bounce + 1) {
+        let hit_result = trace(ro, rd, MAX_RAY_DISTANCE);
+        if !hit_result.found {
+            radiance += throughput * sky(rd);
+            break;
+        }
+
+        let hit = hit_result.hit;
+        let mat = hit_mat(hit);
+
+        let e = emission(mat);
+        if max(e.r, max(e.g, e.b)) > 0.0 {
+            if bounce == 0 {
+                radiance += throughput * e;
+            }
+            break;
+        }
+
+        let p = ro + rd * hit.t;
+        let n = hit.n;
+
+        radiance += throughput * sample_direct_light(p + n * SURFACE_EPSILON, n, mat, rng);
+
+        ro = p + n * SURFACE_EPSILON;
+        rd = cosine_hemisphere(n, rng);
+        throughput *= albedo(mat);
+    }
+
+    return radiance;
+}
+
+fn camera() -> Camera {
+    return Camera(
+        pc.camera_ro_time.xyz,
+        pc.camera_right.xyz,
+        pc.camera_up.xyz,
+        pc.camera_forward.xyz,
+    );
+}
+
+fn camera_ray(c: Camera, uv: vec2<f32>) -> vec3<f32> {
+    return normalize(c.right * uv.x + c.up * uv.y + c.forward * pc.camera_forward.w);
+}
+
+fn pixel_uv(px: vec2<i32>, sz: vec2<i32>, jitter: vec2<f32>) -> vec2<f32> {
+    var uv = (vec2<f32>(px) + vec2<f32>(0.5) + jitter) / vec2<f32>(sz) * 2.0 - vec2<f32>(1.0);
+    uv.x *= f32(sz.x) / f32(sz.y);
+    uv.y = -uv.y;
+    return uv;
+}
+
+fn tonemap(x: vec3<f32>) -> vec3<f32> {
+    return x / (x + vec3<f32>(1.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let px = vec2<i32>(i32(id.x), i32(id.y));
+    let size_u = textureDimensions(out_image);
+    let size = vec2<i32>(i32(size_u.x), i32(size_u.y));
+
+    if any(px >= size) {
+        return;
+    }
+
+    let cam = camera();
+    var color = vec3<f32>(0.0);
+    for (var i = 0; i < SAMPLES_PER_PIXEL; i = i + 1) {
+        var rng = seed(px, i);
+        let jitter = vec2<f32>(rand(&rng), rand(&rng)) - vec2<f32>(0.5);
+        color += path_trace(cam.ro, camera_ray(cam, pixel_uv(px, size, jitter)), &rng);
+    }
+
+    color /= f32(SAMPLES_PER_PIXEL);
+    color = pow(tonemap(color), vec3<f32>(1.0 / 2.2));
+
+    textureStore(out_image, px, vec4<f32>(color, 1.0));
+}

@@ -8,6 +8,8 @@ __pycache__/
 *.pyc
 
 /build
+/target
+/result
 /.nix-zsh
 /compile_commands.json
 /raw

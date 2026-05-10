@@ -1,5 +1,5 @@
 {
-  description = "CMake-based build and development shell for realtimerays";
+  description = "Rust/WGPU realtime rays experiment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -19,44 +19,22 @@
         let
           pkgs = import nixpkgs { inherit system; };
           lib = pkgs.lib;
-
-          moltenvkIcd = "${pkgs.moltenvk}/share/vulkan/icd.d/MoltenVK_icd.json";
-          vulkanRuntimeLibPath = lib.makeLibraryPath [
-            pkgs.vulkan-loader
-            pkgs.moltenvk
-          ];
         in
         {
-          default = pkgs.stdenv.mkDerivation {
+          default = pkgs.rustPlatform.buildRustPackage {
             pname = "realtimerays";
             version = "0.1.0";
             src = ./.;
 
-            nativeBuildInputs = [
-              pkgs.cmake
-              pkgs.ninja
-              pkgs.shaderc.bin
-              pkgs.makeWrapper
-            ];
+            cargoLock.lockFile = ./Cargo.lock;
 
             buildInputs = [
-              pkgs.vulkan-headers
-              pkgs.vulkan-loader
-              pkgs.moltenvk
               pkgs.apple-sdk
             ];
 
-            cmakeBuildType = "Release";
-
-            postInstall = ''
-              wrapProgram "$out/bin/greatbadbeyond" \
-                --set-default VK_ICD_FILENAMES ${moltenvkIcd} \
-                --prefix DYLD_LIBRARY_PATH : ${vulkanRuntimeLibPath}
-            '';
-
             meta = {
-              description = "GLFW-free Vulkan/MoltenVK realtime rays experiment";
-              mainProgram = "greatbadbeyond";
+              description = "WGPU/Metal realtime rays experiment";
+              mainProgram = "realtimerays";
               platforms = lib.platforms.darwin;
             };
           };
@@ -65,76 +43,50 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/greatbadbeyond";
+          program = "${self.packages.${system}.default}/bin/realtimerays";
         };
       });
 
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          lib = pkgs.lib;
-
-          moltenvkIcd = "${pkgs.moltenvk}/share/vulkan/icd.d/MoltenVK_icd.json";
-          vulkanRuntimeLibPath = lib.makeLibraryPath [
-            pkgs.vulkan-loader
-            pkgs.moltenvk
-          ];
-          vulkanSdk = pkgs.symlinkJoin {
-            name = "realtimerays-vulkan-sdk";
-            paths = [
-              pkgs.shaderc.bin
-              pkgs.vulkan-headers
-              pkgs.vulkan-loader
-            ];
-          };
           devCommands = [
             (pkgs.writeShellApplication {
-              name = "configure";
-              runtimeInputs = [ pkgs.cmake ];
-              text = ''
-                exec cmake --preset dev "$@"
-              '';
-            })
-            (pkgs.writeShellApplication {
               name = "build";
-              runtimeInputs = [ pkgs.cmake pkgs.ninja ];
+              runtimeInputs = [ pkgs.cargo ];
               text = ''
-                exec cmake --build --preset dev "$@"
+                exec cargo build "$@"
               '';
             })
             (pkgs.writeShellApplication {
               name = "run";
+              runtimeInputs = [ pkgs.cargo ];
               text = ''
-                exec ./build/greatbadbeyond "$@"
+                exec cargo run "$@"
               '';
             })
             (pkgs.writeShellApplication {
               name = "clean-build";
-              runtimeInputs = [ pkgs.cmake pkgs.ninja ];
+              runtimeInputs = [ pkgs.cargo ];
               text = ''
-                rm -rf build compile_commands.json
-                cmake --preset dev
-                exec cmake --build --preset dev "$@"
+                rm -rf target
+                exec cargo build "$@"
               '';
             })
           ];
         in
         {
           default = pkgs.mkShell {
-            inputsFrom = [ self.packages.${system}.default ];
-
-            VULKAN_SDK = vulkanSdk;
-            VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
-            VK_ICD_FILENAMES = moltenvkIcd;
-            DYLD_LIBRARY_PATH = vulkanRuntimeLibPath;
+            buildInputs = [
+              pkgs.apple-sdk
+            ];
 
             packages = [
-              pkgs.cmake
-              pkgs.ninja
+              pkgs.cargo
+              pkgs.clippy
               pkgs.pkg-config
-              pkgs.shaderc.bin
-              pkgs.vulkan-tools
-              pkgs.vulkan-validation-layers
+              pkgs.rustc
+              pkgs.rustfmt
               pkgs.zsh
             ] ++ devCommands;
 
