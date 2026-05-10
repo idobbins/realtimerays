@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,17 @@ const CAMERA_ORBIT_RADIUS: f32 = 16.0;
 const CAMERA_HEIGHT: f32 = 6.0;
 const CAMERA_FOCAL_LENGTH: f32 = 1.5;
 
+const MAT_RED: u32 = 2;
+const MAT_GREEN: u32 = 3;
+const MAT_BLUE: u32 = 4;
+const MAT_LIGHT: u32 = 5;
+
+const SCENE_HEADER_WORDS: usize = 16;
+const SCENE_CHUNK_WORDS: usize = 8;
+const SCENE_ACCEL_BOX_WORDS: usize = 8;
+const SCENE_MATERIAL_BOX_WORDS: usize = 8;
+const CHUNK_SIZE: i32 = 4;
+
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
 
@@ -38,9 +50,9 @@ fn create_trusted_wgsl_shader_module(
 ) -> wgpu::ShaderModule {
     // SAFETY: These WGSL sources are static application assets, not user input.
     // The trace shader bounds-checks its storage texture writes against
-    // textureDimensions, uses only fixed-size constant arrays with bounded
-    // loops, and has no unbounded loops. The blit shader only samples a bound
-    // texture using interpolated UVs from a fullscreen triangle.
+    // textureDimensions, reads only scene-buffer ranges written by this binary,
+    // and uses bounded loops. The blit shader only samples a bound texture
+    // using interpolated UVs from a fullscreen triangle.
     unsafe {
         device.create_shader_module_trusted(
             wgpu::ShaderModuleDescriptor {
@@ -59,6 +71,155 @@ struct CameraUniform {
     right: [f32; 4],
     up: [f32; 4],
     forward: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+struct SceneBox {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    mat: u32,
+}
+
+const SCENE_BOXES: [SceneBox; 6] = [
+    SceneBox {
+        lo: [-1, 0, -1],
+        hi: [2, 5, 2],
+        mat: MAT_GREEN,
+    },
+    SceneBox {
+        lo: [-5, 0, 2],
+        hi: [-2, 2, 5],
+        mat: MAT_RED,
+    },
+    SceneBox {
+        lo: [3, 0, -4],
+        hi: [5, 6, -2],
+        mat: MAT_BLUE,
+    },
+    SceneBox {
+        lo: [-4, 0, -3],
+        hi: [-2, 3, -1],
+        mat: MAT_RED,
+    },
+    SceneBox {
+        lo: [1, 6, -2],
+        hi: [3, 7, 0],
+        mat: MAT_BLUE,
+    },
+    SceneBox {
+        lo: [-3, 8, 1],
+        hi: [2, 9, 5],
+        mat: MAT_LIGHT,
+    },
+];
+
+fn floor_div_chunk(v: i32) -> i32 {
+    if v >= 0 {
+        v / CHUNK_SIZE
+    } else {
+        -((-v + CHUNK_SIZE - 1) / CHUNK_SIZE)
+    }
+}
+
+fn push_i32_word(words: &mut Vec<u32>, value: i32) {
+    words.push(value as u32);
+}
+
+fn build_scene_words() -> Vec<u32> {
+    let mut chunks = BTreeMap::<[i32; 3], [u32; 2]>::new();
+
+    for b in SCENE_BOXES {
+        for z in b.lo[2]..b.hi[2] {
+            for y in b.lo[1]..b.hi[1] {
+                for x in b.lo[0]..b.hi[0] {
+                    let chunk = [
+                        floor_div_chunk(x),
+                        floor_div_chunk(y),
+                        floor_div_chunk(z),
+                    ];
+                    let local = [
+                        x - chunk[0] * CHUNK_SIZE,
+                        y - chunk[1] * CHUNK_SIZE,
+                        z - chunk[2] * CHUNK_SIZE,
+                    ];
+                    let bit = (local[0] + local[1] * CHUNK_SIZE + local[2] * CHUNK_SIZE * CHUNK_SIZE)
+                        as u32;
+                    let mask = chunks.entry(chunk).or_insert([0; 2]);
+                    if bit < 32 {
+                        mask[0] |= 1 << bit;
+                    } else {
+                        mask[1] |= 1 << (bit - 32);
+                    }
+                }
+            }
+        }
+    }
+
+    let chunk_count = chunks.len();
+    let accel_box_count = SCENE_BOXES.len();
+    let material_box_count = SCENE_BOXES.len();
+    let chunks_base = SCENE_HEADER_WORDS;
+    let accel_boxes_base = chunks_base + chunk_count * SCENE_CHUNK_WORDS;
+    let material_boxes_base = accel_boxes_base + accel_box_count * SCENE_ACCEL_BOX_WORDS;
+    let total_words = material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS;
+
+    let mut words = vec![0; SCENE_HEADER_WORDS];
+    words[0] = chunk_count as u32;
+    words[1] = accel_box_count as u32;
+    words[2] = material_box_count as u32;
+    words[3] = chunks_base as u32;
+    words[4] = accel_boxes_base as u32;
+    words[5] = material_boxes_base as u32;
+    words.reserve(total_words - words.len());
+
+    for (chunk, mask) in chunks {
+        push_i32_word(&mut words, chunk[0]);
+        push_i32_word(&mut words, chunk[1]);
+        push_i32_word(&mut words, chunk[2]);
+        words.push(mask[0]);
+        words.push(mask[1]);
+        words.extend([0, 0, 0]);
+    }
+
+    for b in SCENE_BOXES {
+        push_i32_word(&mut words, b.lo[0]);
+        push_i32_word(&mut words, b.lo[1]);
+        push_i32_word(&mut words, b.lo[2]);
+        push_i32_word(&mut words, b.hi[0]);
+        push_i32_word(&mut words, b.hi[1]);
+        push_i32_word(&mut words, b.hi[2]);
+        words.extend([0, 0]);
+    }
+
+    for b in SCENE_BOXES {
+        push_i32_word(&mut words, b.lo[0]);
+        push_i32_word(&mut words, b.lo[1]);
+        push_i32_word(&mut words, b.lo[2]);
+        push_i32_word(&mut words, b.hi[0]);
+        push_i32_word(&mut words, b.hi[1]);
+        push_i32_word(&mut words, b.hi[2]);
+        words.push(b.mat);
+        words.push(0);
+    }
+
+    debug_assert_eq!(words.len(), total_words);
+    words
+}
+
+fn create_scene_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    let scene_words = build_scene_words();
+    let scene_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("scene buffer"),
+        size: (scene_words.len() * std::mem::size_of::<u32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: true,
+    });
+    scene_buffer
+        .slice(..)
+        .get_mapped_range_mut()
+        .copy_from_slice(bytemuck::cast_slice(&scene_words));
+    scene_buffer.unmap();
+    scene_buffer
 }
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -149,6 +310,7 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     camera_buffer: wgpu::Buffer,
+    _scene_buffer: wgpu::Buffer,
     compute_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
@@ -161,6 +323,7 @@ struct Recorder {
     width: u32,
     height: u32,
     camera_buffer: wgpu::Buffer,
+    _scene_buffer: wgpu::Buffer,
     offscreen: wgpu::Texture,
     compute_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
@@ -229,6 +392,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let scene_buffer = create_scene_buffer(&device);
 
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -249,6 +413,16 @@ impl Renderer {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -330,6 +504,7 @@ impl Renderer {
         let (compute_bind_group, blit_bind_group) = Self::create_frame_bind_groups(
             &device,
             &camera_buffer,
+            &scene_buffer,
             &compute_bind_group_layout,
             &blit_bind_group_layout,
             config.width,
@@ -343,6 +518,7 @@ impl Renderer {
             queue,
             config,
             camera_buffer,
+            _scene_buffer: scene_buffer,
             compute_bind_group,
             blit_bind_group,
             compute_pipeline,
@@ -353,6 +529,7 @@ impl Renderer {
     fn create_frame_bind_groups(
         device: &wgpu::Device,
         camera_buffer: &wgpu::Buffer,
+        scene_buffer: &wgpu::Buffer,
         compute_layout: &wgpu::BindGroupLayout,
         blit_layout: &wgpu::BindGroupLayout,
         width: u32,
@@ -393,6 +570,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scene_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -503,6 +684,7 @@ impl Recorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let scene_buffer = create_scene_buffer(&device);
 
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -523,6 +705,16 @@ impl Recorder {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -575,6 +767,10 @@ impl Recorder {
                     binding: 1,
                     resource: camera_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scene_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -584,6 +780,7 @@ impl Recorder {
             width,
             height,
             camera_buffer,
+            _scene_buffer: scene_buffer,
             offscreen,
             compute_bind_group,
             compute_pipeline,
