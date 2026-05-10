@@ -31,6 +31,27 @@ const CAMERA_FOCAL_LENGTH: f32 = 1.5;
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
 
+fn create_trusted_wgsl_shader_module(
+    device: &wgpu::Device,
+    label: &'static str,
+    source: &'static str,
+) -> wgpu::ShaderModule {
+    // SAFETY: These WGSL sources are static application assets, not user input.
+    // The trace shader bounds-checks its storage texture writes against
+    // textureDimensions, uses only fixed-size constant arrays with bounded
+    // loops, and has no unbounded loops. The blit shader only samples a bound
+    // texture using interpolated UVs from a fullscreen triangle.
+    unsafe {
+        device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        )
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -258,10 +279,7 @@ impl Renderer {
                 ],
             });
 
-        let trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("trace shader"),
-            source: wgpu::ShaderSource::Wgsl(TRACE_SHADER.into()),
-        });
+        let trace_shader = create_trusted_wgsl_shader_module(&device, "trace shader", TRACE_SHADER);
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("compute pipeline layout"),
@@ -277,10 +295,7 @@ impl Renderer {
             cache: None,
         });
 
-        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit shader"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
-        });
+        let blit_shader = create_trusted_wgsl_shader_module(&device, "blit shader", BLIT_SHADER);
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit pipeline layout"),
             bind_group_layouts: &[Some(&blit_bind_group_layout)],
@@ -516,10 +531,8 @@ impl Recorder {
                 ],
             });
 
-        let trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("record trace shader"),
-            source: wgpu::ShaderSource::Wgsl(TRACE_SHADER.into()),
-        });
+        let trace_shader =
+            create_trusted_wgsl_shader_module(&device, "record trace shader", TRACE_SHADER);
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("record compute pipeline layout"),
