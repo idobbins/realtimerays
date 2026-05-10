@@ -9,8 +9,8 @@ struct Weights {
 @group(0) @binding(6) var<storage, read> weights: Weights;
 @group(0) @binding(20) var final_image: texture_storage_2d<rgba8unorm, write>;
 
-const MAX_FILTER_RADIUS: i32 = 2;
-const MAX_FILTER_SIZE: u32 = 5u;
+const MAX_FILTER_RADIUS: i32 = 4;
+const MAX_FILTER_SIZE: u32 = 9u;
 const MAX_FILTER_TAPS: u32 = MAX_FILTER_SIZE * MAX_FILTER_SIZE;
 
 const RADIUS_OFFSET: u32 = 0u;
@@ -21,6 +21,7 @@ const ALBEDO_PENALTY_OFFSET: u32 = 4u;
 const DEPTH_PENALTY_OFFSET: u32 = 5u;
 const SPATIAL_OFFSET: u32 = 6u;
 const DISABLED_PENALTY: f32 = -10.0;
+const MAX_LUMA_BLEND: f32 = 0.45;
 
 fn clamp_px(px: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
     return clamp(px, vec2<i32>(0), size - vec2<i32>(1));
@@ -36,6 +37,10 @@ fn softplus(x: f32) -> f32 {
 
 fn sqr_len3(v: vec3<f32>) -> f32 {
     return dot(v, v);
+}
+
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
 fn tap_index(ox: i32, oy: i32) -> u32 {
@@ -87,7 +92,7 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let normal_penalty = softplus(normal_raw);
     let albedo_penalty = softplus(albedo_raw);
     let depth_penalty = softplus(depth_raw);
-    let blend = sigmoid(weights.values[BLEND_OFFSET]);
+    let blend = MAX_LUMA_BLEND * sigmoid(weights.values[BLEND_OFFSET]);
 
     var center_normal = vec3<f32>(0.0);
     var center_albedo = vec3<f32>(0.0);
@@ -102,7 +107,7 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
         center_depth = textureLoad(depth_image, center, 0).x;
     }
 
-    var sum_color = vec3<f32>(0.0);
+    var sum_luma = 0.0;
     var sum_weight = 0.0;
     for (var oy = -MAX_FILTER_RADIUS; oy <= MAX_FILTER_RADIUS; oy = oy + 1) {
         for (var ox = -MAX_FILTER_RADIUS; ox <= MAX_FILTER_RADIUS; ox = ox + 1) {
@@ -112,6 +117,7 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let q = clamp_px(px + vec2<i32>(ox, oy), size);
             let q_color = textureLoad(noisy_image, q, 0).rgb;
+            let q_luma = luminance(q_color);
             var log_weight = weights.values[SPATIAL_OFFSET + tap_index(ox, oy)];
 
             if use_color {
@@ -132,11 +138,14 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             let w = exp(clamp(log_weight, -20.0, 20.0));
-            sum_color += q_color * w;
+            sum_luma += q_luma * w;
             sum_weight += w;
         }
     }
 
-    let filtered = sum_color / max(sum_weight, 0.000001);
-    display_store(px, mix(center_color, filtered, blend));
+    let center_luma = luminance(center_color);
+    let filtered_luma = sum_luma / max(sum_weight, 0.000001);
+    let out_luma = mix(center_luma, filtered_luma, blend);
+    let chroma = center_color / max(center_luma, 0.0001);
+    display_store(px, chroma * out_luma);
 }

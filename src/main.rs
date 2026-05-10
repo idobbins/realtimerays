@@ -22,9 +22,10 @@ const TILE_SIZE: u32 = 8;
 const RECORD_FPS: u32 = 60;
 const RECORD_SECONDS: u32 = 10;
 const RECORD_FRAME_COUNT: u32 = RECORD_FPS * RECORD_SECONDS;
-const DATASET_INPUT_SPP: u32 = 1;
+const RUNTIME_SPP: u32 = 2;
+const DATASET_INPUT_SPP: u32 = 2;
 const DATASET_TARGET_SPP: u32 = 12;
-const DENOISER_WEIGHT_COUNT: usize = 31;
+const DENOISER_WEIGHT_COUNT: usize = 87;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
 const CAMERA_ORBIT_ANGLE: f32 = 0.45;
@@ -1513,7 +1514,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let time = self.stats.tick();
                 let seed_offset = renderer.frame_index;
-                let camera = camera_uniform(time, 1, seed_offset);
+                let camera = camera_uniform(time, RUNTIME_SPP, seed_offset);
                 renderer.render(&camera);
             }
             _ => {}
@@ -1685,7 +1686,7 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        let pixels = recorder.capture_frame(&camera_uniform(time, 1, frame_index))?;
+        let pixels = recorder.capture_frame(&camera_uniform(time, RUNTIME_SPP, frame_index))?;
         let path = output_dir.join(format!("frame_{frame_index:06}.png"));
         write_png(&path, WIDTH, HEIGHT, &pixels)?;
 
@@ -1795,13 +1796,13 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     for frame_index in 0..warmup {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        recorder.submit_frame(&camera_uniform(time, 1, frame_index))?;
+        recorder.submit_frame(&camera_uniform(time, RUNTIME_SPP, frame_index))?;
     }
 
     let start = Instant::now();
     for frame_index in 0..frames {
         let time = (warmup + frame_index) as f32 / RECORD_FPS as f32;
-        recorder.submit_frame(&camera_uniform(time, 1, warmup + frame_index))?;
+        recorder.submit_frame(&camera_uniform(time, RUNTIME_SPP, warmup + frame_index))?;
     }
     let seconds = start.elapsed().as_secs_f64();
     let ms = seconds * 1000.0 / f64::from(frames);
