@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
@@ -30,22 +31,33 @@ const CNN_DENOISER_WEIGHT_COUNT: usize = 737;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
 const CAMERA_ORBIT_ANGLE: f32 = 0.45;
-const CAMERA_ORBIT_RADIUS: f32 = 16.0;
-const CAMERA_HEIGHT: f32 = 6.0;
-const CAMERA_FOCAL_LENGTH: f32 = 1.5;
+const CAMERA_ORBIT_RADIUS: f32 = 34.0;
+const CAMERA_HEIGHT: f32 = 13.0;
+const CAMERA_FOCAL_LENGTH: f32 = 1.35;
 
-const MAT_RED: u32 = 2;
-const MAT_GREEN: u32 = 3;
-const MAT_BLUE: u32 = 4;
-const MAT_LIGHT: u32 = 5;
+const MAT_GRASS: u32 = 2;
+const MAT_LEAF: u32 = 3;
+const MAT_WOOD: u32 = 4;
+const MAT_ROCK: u32 = 5;
+const MAT_SNOW: u32 = 6;
+const MAT_LIGHT: u32 = 7;
+const MAT_WATER: u32 = 8;
 
 const SCENE_HEADER_WORDS: usize = 16;
-const SCENE_CHUNK_WORDS: usize = 8;
-const SCENE_ACCEL_BOX_WORDS: usize = 8;
+const SCENE_SVO_NODE_WORDS: usize = 16;
+const SCENE_SVO_LEAF_WORDS: usize = 8;
 const SCENE_MATERIAL_BOX_WORDS: usize = 8;
+const TRACE_SVO_LEAF_THRESHOLD: usize = 64;
+#[cfg(test)]
+const SVO_SHADER_STACK_SIZE: usize = 32;
+#[cfg(test)]
+const SVO_SHADER_MAX_VISITS: usize = 256;
 const CHUNK_SIZE: i32 = 4;
+const MOUNTAIN_LAYERS: i32 = 11;
 
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
+const TRACE_USE_SVO_DECL: &str = "const USE_SVO: bool = true;";
+const TRACE_USE_SVO_BRANCH: &str = "if !USE_SVO {";
 const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
 const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.wgsl");
 const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
@@ -105,8 +117,8 @@ impl DenoiserKind {
 
 fn create_trusted_wgsl_shader_module(
     device: &wgpu::Device,
-    label: &'static str,
-    source: &'static str,
+    label: &str,
+    source: &str,
 ) -> wgpu::ShaderModule {
     // SAFETY: These WGSL sources are static application assets, not user input.
     // The trace shader bounds-checks its storage texture writes against
@@ -120,6 +132,18 @@ fn create_trusted_wgsl_shader_module(
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             },
             wgpu::ShaderRuntimeChecks::unchecked(),
+        )
+    }
+}
+
+fn trace_shader_source(use_svo: bool) -> Cow<'static, str> {
+    if use_svo {
+        Cow::Borrowed(TRACE_SHADER)
+    } else {
+        Cow::Owned(
+            TRACE_SHADER
+                .replace(TRACE_USE_SVO_DECL, "const USE_SVO: bool = false;")
+                .replace(TRACE_USE_SVO_BRANCH, "if true {"),
         )
     }
 }
@@ -141,39 +165,6 @@ struct SceneBox {
     mat: u32,
 }
 
-const SCENE_BOXES: [SceneBox; 6] = [
-    SceneBox {
-        lo: [-1, 0, -1],
-        hi: [2, 5, 2],
-        mat: MAT_GREEN,
-    },
-    SceneBox {
-        lo: [-5, 0, 2],
-        hi: [-2, 2, 5],
-        mat: MAT_RED,
-    },
-    SceneBox {
-        lo: [3, 0, -4],
-        hi: [5, 6, -2],
-        mat: MAT_BLUE,
-    },
-    SceneBox {
-        lo: [-4, 0, -3],
-        hi: [-2, 3, -1],
-        mat: MAT_RED,
-    },
-    SceneBox {
-        lo: [1, 6, -2],
-        hi: [3, 7, 0],
-        mat: MAT_BLUE,
-    },
-    SceneBox {
-        lo: [-3, 8, 1],
-        hi: [2, 9, 5],
-        mat: MAT_LIGHT,
-    },
-];
-
 fn floor_div_chunk(v: i32) -> i32 {
     if v >= 0 {
         v / CHUNK_SIZE
@@ -186,10 +177,142 @@ fn push_i32_word(words: &mut Vec<u32>, value: i32) {
     words.push(value as u32);
 }
 
-fn build_scene_words() -> Vec<u32> {
+fn mountain_layer_bounds(y: i32) -> ([i32; 3], [i32; 3]) {
+    let x_radius = 15 - y;
+    let z_radius = 11 - y;
+    let x_shift = y / 3 - 1;
+    let z_shift = if y >= 5 { 1 } else { 0 };
+
+    (
+        [x_shift - x_radius, y, z_shift - z_radius],
+        [x_shift + x_radius + 1, y + 1, z_shift + z_radius + 1],
+    )
+}
+
+fn mountain_height_at(x: i32, z: i32) -> i32 {
+    let mut height = 0;
+    for y in 0..MOUNTAIN_LAYERS {
+        let (lo, hi) = mountain_layer_bounds(y);
+        if x >= lo[0] && x < hi[0] && z >= lo[2] && z < hi[2] {
+            height = y + 1;
+        }
+    }
+    height
+}
+
+fn push_tree(boxes: &mut Vec<SceneBox>, x: i32, z: i32, height: i32) {
+    let y = mountain_height_at(x, z);
+    boxes.push(SceneBox {
+        lo: [x, y, z],
+        hi: [x + 1, y + height, z + 1],
+        mat: MAT_WOOD,
+    });
+    boxes.push(SceneBox {
+        lo: [x - 2, y + height - 2, z - 2],
+        hi: [x + 3, y + height, z + 3],
+        mat: MAT_LEAF,
+    });
+    boxes.push(SceneBox {
+        lo: [x - 1, y + height, z - 1],
+        hi: [x + 2, y + height + 2, z + 2],
+        mat: MAT_LEAF,
+    });
+    boxes.push(SceneBox {
+        lo: [x, y + height + 2, z],
+        hi: [x + 1, y + height + 3, z + 1],
+        mat: MAT_LEAF,
+    });
+}
+
+fn scene_boxes() -> Vec<SceneBox> {
+    let mut boxes = Vec::new();
+
+    for y in 0..MOUNTAIN_LAYERS {
+        let (lo, hi) = mountain_layer_bounds(y);
+        let mat = if y >= 8 {
+            MAT_SNOW
+        } else if y >= 3 {
+            MAT_ROCK
+        } else {
+            MAT_GRASS
+        };
+        boxes.push(SceneBox { lo, hi, mat });
+    }
+
+    boxes.extend([
+        SceneBox {
+            lo: [-22, 0, -16],
+            hi: [-9, 1, -10],
+            mat: MAT_WATER,
+        },
+        SceneBox {
+            lo: [-20, 0, -10],
+            hi: [-16, 1, 4],
+            mat: MAT_WATER,
+        },
+        SceneBox {
+            lo: [13, 0, -15],
+            hi: [22, 1, -11],
+            mat: MAT_WATER,
+        },
+        SceneBox {
+            lo: [-15, 1, 8],
+            hi: [-12, 4, 11],
+            mat: MAT_ROCK,
+        },
+        SceneBox {
+            lo: [14, 1, 5],
+            hi: [17, 3, 8],
+            mat: MAT_ROCK,
+        },
+        SceneBox {
+            lo: [3, 11, 0],
+            hi: [8, 12, 3],
+            mat: MAT_SNOW,
+        },
+    ]);
+
+    for (x, z, height) in [
+        (-20, -7, 6),
+        (-18, 7, 5),
+        (-12, -4, 6),
+        (-9, 9, 5),
+        (-2, -12, 5),
+        (8, -7, 6),
+        (10, 6, 5),
+        (17, 9, 6),
+        (20, -4, 5),
+    ] {
+        push_tree(&mut boxes, x, z, height);
+    }
+
+    boxes.push(SceneBox {
+        lo: [-7, 16, -7],
+        hi: [8, 17, 8],
+        mat: MAT_LIGHT,
+    });
+
+    boxes
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OccupancyChunk {
+    coord: [i32; 3],
+    mask: [u32; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SvoNode {
+    origin: [i32; 3],
+    size: i32,
+    child_mask: u32,
+    child_refs: [i32; 8],
+}
+
+fn build_occupancy_chunks(scene_boxes: &[SceneBox]) -> Vec<OccupancyChunk> {
     let mut chunks = BTreeMap::<[i32; 3], [u32; 2]>::new();
 
-    for b in SCENE_BOXES {
+    for b in scene_boxes {
         for z in b.lo[2]..b.hi[2] {
             for y in b.lo[1]..b.hi[1] {
                 for x in b.lo[0]..b.hi[0] {
@@ -213,43 +336,145 @@ fn build_scene_words() -> Vec<u32> {
         }
     }
 
-    let chunk_count = chunks.len();
-    let accel_box_count = SCENE_BOXES.len();
-    let material_box_count = SCENE_BOXES.len();
-    let chunks_base = SCENE_HEADER_WORDS;
-    let accel_boxes_base = chunks_base + chunk_count * SCENE_CHUNK_WORDS;
-    let material_boxes_base = accel_boxes_base + accel_box_count * SCENE_ACCEL_BOX_WORDS;
+    chunks
+        .into_iter()
+        .map(|(coord, mask)| OccupancyChunk { coord, mask })
+        .collect()
+}
+
+fn contains_chunk(origin: [i32; 3], size: i32, chunk: [i32; 3]) -> bool {
+    chunk[0] >= origin[0]
+        && chunk[1] >= origin[1]
+        && chunk[2] >= origin[2]
+        && chunk[0] < origin[0] + size
+        && chunk[1] < origin[1] + size
+        && chunk[2] < origin[2] + size
+}
+
+fn build_svo_subtree(
+    origin: [i32; 3],
+    size: i32,
+    chunks: &[OccupancyChunk],
+    nodes: &mut Vec<SvoNode>,
+    leaves: &mut Vec<OccupancyChunk>,
+) -> i32 {
+    if chunks.is_empty() {
+        return 0;
+    }
+
+    if size == 1 {
+        debug_assert_eq!(chunks.len(), 1);
+        debug_assert_eq!(chunks[0].coord, origin);
+        let leaf_id = leaves.len() as i32;
+        leaves.push(chunks[0]);
+        return -(leaf_id + 1);
+    }
+
+    let node_id = nodes.len();
+    nodes.push(SvoNode {
+        origin,
+        size,
+        child_mask: 0,
+        child_refs: [0; 8],
+    });
+
+    let child_size = size / 2;
+    for child in 0..8 {
+        let child_origin = [
+            origin[0] + if child & 1 != 0 { child_size } else { 0 },
+            origin[1] + if child & 2 != 0 { child_size } else { 0 },
+            origin[2] + if child & 4 != 0 { child_size } else { 0 },
+        ];
+        let child_chunks = chunks
+            .iter()
+            .copied()
+            .filter(|chunk| contains_chunk(child_origin, child_size, chunk.coord))
+            .collect::<Vec<_>>();
+
+        let child_ref = build_svo_subtree(child_origin, child_size, &child_chunks, nodes, leaves);
+        if child_ref != 0 {
+            nodes[node_id].child_mask |= 1u32 << child;
+            nodes[node_id].child_refs[child] = child_ref;
+        }
+    }
+
+    node_id as i32 + 1
+}
+
+fn build_svo(chunks: &[OccupancyChunk]) -> (Vec<SvoNode>, Vec<OccupancyChunk>, i32) {
+    if chunks.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+
+    let min = [
+        chunks.iter().map(|chunk| chunk.coord[0]).min().unwrap(),
+        chunks.iter().map(|chunk| chunk.coord[1]).min().unwrap(),
+        chunks.iter().map(|chunk| chunk.coord[2]).min().unwrap(),
+    ];
+    let max = [
+        chunks.iter().map(|chunk| chunk.coord[0]).max().unwrap(),
+        chunks.iter().map(|chunk| chunk.coord[1]).max().unwrap(),
+        chunks.iter().map(|chunk| chunk.coord[2]).max().unwrap(),
+    ];
+    let extent = [
+        max[0] - min[0] + 1,
+        max[1] - min[1] + 1,
+        max[2] - min[2] + 1,
+    ];
+    let max_extent = extent.into_iter().max().unwrap();
+    let root_size = (max_extent as u32).next_power_of_two() as i32;
+
+    let mut nodes = Vec::new();
+    let mut leaves = Vec::new();
+    let root_ref = build_svo_subtree(min, root_size, chunks, &mut nodes, &mut leaves);
+    (nodes, leaves, root_ref)
+}
+
+fn build_scene_words() -> Vec<u32> {
+    let scene_boxes = scene_boxes();
+    let chunks = build_occupancy_chunks(&scene_boxes);
+    let (nodes, leaves, root_ref) = build_svo(&chunks);
+
+    let node_count = nodes.len();
+    let leaf_count = leaves.len();
+    let material_box_count = scene_boxes.len();
+    let nodes_base = SCENE_HEADER_WORDS;
+    let leaves_base = nodes_base + node_count * SCENE_SVO_NODE_WORDS;
+    let material_boxes_base = leaves_base + leaf_count * SCENE_SVO_LEAF_WORDS;
     let total_words = material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS;
 
     let mut words = vec![0; SCENE_HEADER_WORDS];
-    words[0] = chunk_count as u32;
-    words[1] = accel_box_count as u32;
+    words[0] = node_count as u32;
+    words[1] = leaf_count as u32;
     words[2] = material_box_count as u32;
-    words[3] = chunks_base as u32;
-    words[4] = accel_boxes_base as u32;
+    words[3] = nodes_base as u32;
+    words[4] = leaves_base as u32;
     words[5] = material_boxes_base as u32;
+    words[6] = root_ref as u32;
     words.reserve(total_words - words.len());
 
-    for (chunk, mask) in chunks {
-        push_i32_word(&mut words, chunk[0]);
-        push_i32_word(&mut words, chunk[1]);
-        push_i32_word(&mut words, chunk[2]);
-        words.push(mask[0]);
-        words.push(mask[1]);
+    for node in nodes {
+        push_i32_word(&mut words, node.origin[0]);
+        push_i32_word(&mut words, node.origin[1]);
+        push_i32_word(&mut words, node.origin[2]);
+        push_i32_word(&mut words, node.size);
+        words.push(node.child_mask);
+        for child_ref in node.child_refs {
+            push_i32_word(&mut words, child_ref);
+        }
         words.extend([0, 0, 0]);
     }
 
-    for b in SCENE_BOXES {
-        push_i32_word(&mut words, b.lo[0]);
-        push_i32_word(&mut words, b.lo[1]);
-        push_i32_word(&mut words, b.lo[2]);
-        push_i32_word(&mut words, b.hi[0]);
-        push_i32_word(&mut words, b.hi[1]);
-        push_i32_word(&mut words, b.hi[2]);
-        words.extend([0, 0]);
+    for leaf in leaves {
+        push_i32_word(&mut words, leaf.coord[0]);
+        push_i32_word(&mut words, leaf.coord[1]);
+        push_i32_word(&mut words, leaf.coord[2]);
+        words.push(leaf.mask[0]);
+        words.push(leaf.mask[1]);
+        words.extend([0, 0, 0]);
     }
 
-    for b in SCENE_BOXES {
+    for b in scene_boxes {
         push_i32_word(&mut words, b.lo[0]);
         push_i32_word(&mut words, b.lo[1]);
         push_i32_word(&mut words, b.lo[2]);
@@ -264,8 +489,9 @@ fn build_scene_words() -> Vec<u32> {
     words
 }
 
-fn create_scene_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+fn create_scene_buffer(device: &wgpu::Device) -> (wgpu::Buffer, bool) {
     let scene_words = build_scene_words();
+    let use_svo = scene_words[1] as usize > TRACE_SVO_LEAF_THRESHOLD;
     let scene_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scene buffer"),
         size: (scene_words.len() * std::mem::size_of::<u32>()) as u64,
@@ -277,7 +503,128 @@ fn create_scene_buffer(device: &wgpu::Device) -> wgpu::Buffer {
         .get_mapped_range_mut()
         .copy_from_slice(bytemuck::cast_slice(&scene_words));
     scene_buffer.unmap();
-    scene_buffer
+    (scene_buffer, use_svo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect_reachable_leaves(root_ref: i32, nodes: &[SvoNode], leaves: &mut Vec<usize>) {
+        if root_ref < 0 {
+            leaves.push((-root_ref - 1) as usize);
+            return;
+        }
+
+        if root_ref == 0 {
+            return;
+        }
+
+        let node = nodes[(root_ref - 1) as usize];
+        for child_ref in node.child_refs {
+            collect_reachable_leaves(child_ref, nodes, leaves);
+        }
+    }
+
+    fn max_unpruned_node_stack_use(root_ref: i32, nodes: &[SvoNode]) -> (usize, usize) {
+        let mut stack = vec![root_ref];
+        let mut max_stack = stack.len();
+        let mut visits = 0;
+
+        while let Some(current_ref) = stack.pop() {
+            visits += 1;
+            if current_ref <= 0 {
+                continue;
+            }
+
+            let node = nodes[(current_ref - 1) as usize];
+            for child_ref in node.child_refs {
+                if child_ref > 0 {
+                    stack.push(child_ref);
+                }
+            }
+            max_stack = max_stack.max(stack.len());
+        }
+
+        (max_stack, visits)
+    }
+
+    #[test]
+    fn scene_occupancy_matches_current_boxes() {
+        let scene_boxes = scene_boxes();
+        let chunks = build_occupancy_chunks(&scene_boxes);
+        let occupied_voxels: u32 = chunks
+            .iter()
+            .map(|chunk| chunk.mask[0].count_ones() + chunk.mask[1].count_ones())
+            .sum();
+
+        assert!(scene_boxes.len() > 40);
+        assert!(chunks.len() > TRACE_SVO_LEAF_THRESHOLD);
+        assert!(occupied_voxels > 3_500);
+    }
+
+    #[test]
+    fn svo_root_contains_all_chunks() {
+        let scene_boxes = scene_boxes();
+        let chunks = build_occupancy_chunks(&scene_boxes);
+        let (nodes, _leaves, root_ref) = build_svo(&chunks);
+        assert!(root_ref > 0);
+
+        let root = nodes[(root_ref - 1) as usize];
+        assert!((root.size as u32).is_power_of_two());
+        for chunk in chunks {
+            assert!(contains_chunk(root.origin, root.size, chunk.coord));
+        }
+    }
+
+    #[test]
+    fn svo_reaches_every_occupied_chunk_once() {
+        let scene_boxes = scene_boxes();
+        let chunks = build_occupancy_chunks(&scene_boxes);
+        let (nodes, leaves, root_ref) = build_svo(&chunks);
+        let mut reachable = Vec::new();
+        collect_reachable_leaves(root_ref, &nodes, &mut reachable);
+        reachable.sort_unstable();
+
+        let expected = (0..leaves.len()).collect::<Vec<_>>();
+        assert_eq!(reachable, expected);
+        assert_eq!(leaves.len(), chunks.len());
+    }
+
+    #[test]
+    fn svo_shader_stack_covers_current_scene() {
+        let scene_boxes = scene_boxes();
+        let chunks = build_occupancy_chunks(&scene_boxes);
+        let (nodes, _leaves, root_ref) = build_svo(&chunks);
+        let (max_stack, visits) = max_unpruned_node_stack_use(root_ref, &nodes);
+
+        assert!(max_stack <= SVO_SHADER_STACK_SIZE);
+        assert!(visits <= SVO_SHADER_MAX_VISITS);
+    }
+
+    #[test]
+    fn serialized_scene_layout_is_consistent() {
+        let words = build_scene_words();
+        let node_count = words[0] as usize;
+        let leaf_count = words[1] as usize;
+        let material_box_count = words[2] as usize;
+        let nodes_base = words[3] as usize;
+        let leaves_base = words[4] as usize;
+        let material_boxes_base = words[5] as usize;
+        let root_ref = words[6] as i32;
+
+        assert_eq!(nodes_base, SCENE_HEADER_WORDS);
+        assert_eq!(leaves_base, nodes_base + node_count * SCENE_SVO_NODE_WORDS);
+        assert_eq!(
+            material_boxes_base,
+            leaves_base + leaf_count * SCENE_SVO_LEAF_WORDS
+        );
+        assert_eq!(
+            words.len(),
+            material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS
+        );
+        assert_ne!(root_ref, 0);
+    }
 }
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -399,8 +746,9 @@ struct Recorder {
     atrous_denoiser: Option<AtrousDenoiser>,
     trace_pipeline: wgpu::ComputePipeline,
     denoise_pipeline: Option<wgpu::ComputePipeline>,
+    display_copy_bind_group: Option<wgpu::BindGroup>,
     display_copy_pipeline: Option<wgpu::ComputePipeline>,
-    denoiser_kind: DenoiserKind,
+    denoiser: Option<DenoiserKind>,
 }
 
 struct DatasetRecorder {
@@ -1124,7 +1472,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let scene_buffer = create_scene_buffer(&device);
+        let (scene_buffer, use_svo) = create_scene_buffer(&device);
 
         let trace_bind_group_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
@@ -1133,7 +1481,9 @@ impl Renderer {
         let display_copy_layout = create_display_copy_layout(&device);
         let blit_bind_group_layout = create_blit_bind_group_layout(&device);
 
-        let trace_shader = create_trusted_wgsl_shader_module(&device, "trace shader", TRACE_SHADER);
+        let trace_source = trace_shader_source(use_svo);
+        let trace_shader =
+            create_trusted_wgsl_shader_module(&device, "trace shader", &trace_source);
         let trace_pipeline = create_compute_pipeline(
             &device,
             "trace pipeline",
@@ -1395,7 +1745,11 @@ impl Renderer {
 }
 
 impl Recorder {
-    fn new(width: u32, height: u32, denoiser_kind: DenoiserKind) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        width: u32,
+        height: u32,
+        denoiser: Option<DenoiserKind>,
+    ) -> Result<Self, Box<dyn Error>> {
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = wgpu::Backends::METAL;
         let instance = wgpu::Instance::new(instance_descriptor);
@@ -1421,15 +1775,18 @@ impl Recorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let scene_buffer = create_scene_buffer(&device);
+        let (scene_buffer, use_svo) = create_scene_buffer(&device);
 
         let trace_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
         let atrous_layout = create_atrous_layout(&device);
         let atrous_display_layout = create_atrous_display_layout(&device);
+        let display_copy_layout = create_display_copy_layout(&device);
+        let denoiser_shader_kind = denoiser.unwrap_or(DenoiserKind::Filter);
 
+        let trace_source = trace_shader_source(use_svo);
         let trace_shader =
-            create_trusted_wgsl_shader_module(&device, "record trace shader", TRACE_SHADER);
+            create_trusted_wgsl_shader_module(&device, "record trace shader", &trace_source);
         let trace_pipeline = create_compute_pipeline(
             &device,
             "record trace pipeline",
@@ -1440,14 +1797,12 @@ impl Recorder {
         let denoise_shader = create_trusted_wgsl_shader_module(
             &device,
             "record denoise shader",
-            denoiser_kind.shader_source(),
+            denoiser_shader_kind.shader_source(),
         );
         let frame_textures = create_frame_textures(&device, width, height);
-        let denoiser_weight_buffer = if denoiser_kind.is_single_pass() {
-            Some(create_denoiser_weight_buffer(&device, denoiser_kind))
-        } else {
-            None
-        };
+        let denoiser_weight_buffer = denoiser
+            .filter(|kind| kind.is_single_pass())
+            .map(|kind| create_denoiser_weight_buffer(&device, kind));
         let trace_bind_group = create_trace_bind_group(
             &device,
             &trace_layout,
@@ -1455,23 +1810,29 @@ impl Recorder {
             &camera_buffer,
             &scene_buffer,
         );
-        let denoise_pipeline = if denoiser_kind.is_single_pass() {
-            Some(create_compute_pipeline(
+        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|_| {
+            create_compute_pipeline(
                 &device,
                 "record denoise filter pipeline",
                 &denoise_shader,
                 &denoise_filter_layout,
                 "filter_main",
-            ))
-        } else {
-            None
-        };
-        let display_copy_pipeline = if matches!(denoiser_kind, DenoiserKind::Atrous) {
+            )
+        });
+        let display_copy_pipeline = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
             Some(create_compute_pipeline(
                 &device,
                 "record atrous display copy pipeline",
                 &denoise_shader,
                 &atrous_display_layout,
+                "copy_main",
+            ))
+        } else if denoiser.is_none() {
+            Some(create_compute_pipeline(
+                &device,
+                "record display copy pipeline",
+                &denoise_shader,
+                &display_copy_layout,
                 "copy_main",
             ))
         } else {
@@ -1485,7 +1846,16 @@ impl Recorder {
                 weights,
             )
         });
-        let atrous_denoiser = if matches!(denoiser_kind, DenoiserKind::Atrous) {
+        let display_copy_bind_group = if denoiser.is_none() {
+            Some(create_display_copy_bind_group(
+                &device,
+                &display_copy_layout,
+                &frame_textures.trace,
+            ))
+        } else {
+            None
+        };
+        let atrous_denoiser = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
             Some(create_atrous_denoiser(
                 &device,
                 &denoise_shader,
@@ -1511,8 +1881,9 @@ impl Recorder {
             atrous_denoiser,
             trace_pipeline,
             denoise_pipeline,
+            display_copy_bind_group,
             display_copy_pipeline,
-            denoiser_kind,
+            denoiser,
         })
     }
 
@@ -1567,9 +1938,10 @@ impl Recorder {
                 1,
             );
         }
-        match self.denoiser_kind {
-            DenoiserKind::Filter | DenoiserKind::Cnn => self.dispatch_denoiser(encoder),
-            DenoiserKind::Atrous => self.dispatch_atrous_denoiser(encoder),
+        match self.denoiser {
+            Some(DenoiserKind::Filter | DenoiserKind::Cnn) => self.dispatch_denoiser(encoder),
+            Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
+            None => self.dispatch_display_copy(encoder),
         }
     }
 
@@ -1631,6 +2003,30 @@ impl Recorder {
             1,
         );
     }
+
+    fn dispatch_display_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("record display copy pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(
+            self.display_copy_pipeline
+                .as_ref()
+                .expect("record display copy pipeline"),
+        );
+        pass.set_bind_group(
+            0,
+            self.display_copy_bind_group
+                .as_ref()
+                .expect("record display copy bind group"),
+            &[],
+        );
+        pass.dispatch_workgroups(
+            self.width.div_ceil(TILE_SIZE),
+            self.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
 }
 
 struct DatasetFrame {
@@ -1676,11 +2072,12 @@ impl DatasetRecorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let scene_buffer = create_scene_buffer(&device);
+        let (scene_buffer, use_svo) = create_scene_buffer(&device);
         let trace_layout = create_trace_bind_group_layout(&device);
         let display_copy_layout = create_display_copy_layout(&device);
+        let trace_source = trace_shader_source(use_svo);
         let trace_shader =
-            create_trusted_wgsl_shader_module(&device, "dataset trace shader", TRACE_SHADER);
+            create_trusted_wgsl_shader_module(&device, "dataset trace shader", &trace_source);
         let denoise_shader =
             create_trusted_wgsl_shader_module(&device, "dataset display shader", DENOISE_SHADER);
         let trace_pipeline = create_compute_pipeline(
@@ -2102,11 +2499,14 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("renders/shot01"));
     let frame_count = parse_frame_count(args)?;
-    let denoiser_kind = parse_denoiser_kind(args);
-    let sample_count = parse_sample_count(args, denoiser_kind.runtime_spp())?;
+    let denoiser = parse_optional_denoiser_kind(args);
+    let default_spp = denoiser
+        .map(DenoiserKind::runtime_spp)
+        .unwrap_or(RUNTIME_SPP);
+    let sample_count = parse_sample_count(args, default_spp)?;
 
     fs::create_dir_all(&output_dir)?;
-    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser_kind)?;
+    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
@@ -2235,12 +2635,23 @@ fn parse_denoiser_kind(args: &[String]) -> DenoiserKind {
     }
 }
 
+fn parse_optional_denoiser_kind(args: &[String]) -> Option<DenoiserKind> {
+    if args.iter().any(|arg| arg == "--no-denoise") {
+        None
+    } else {
+        Some(parse_denoiser_kind(args))
+    }
+}
+
 fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
     let frames = parse_arg_u32(args, "--frames", 120)?;
     let warmup = parse_arg_u32(args, "--warmup", 10)?;
-    let denoiser_kind = parse_denoiser_kind(args);
-    let sample_count = parse_sample_count(args, denoiser_kind.runtime_spp())?;
-    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser_kind)?;
+    let denoiser = parse_optional_denoiser_kind(args);
+    let default_spp = denoiser
+        .map(DenoiserKind::runtime_spp)
+        .unwrap_or(RUNTIME_SPP);
+    let sample_count = parse_sample_count(args, default_spp)?;
+    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     for frame_index in 0..warmup {
         let time = frame_index as f32 / RECORD_FPS as f32;
@@ -2346,11 +2757,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("  realtimerays --atrous-denoise");
             println!("  realtimerays --spp N");
             println!(
-                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--cnn-denoise|--atrous-denoise]"
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--cnn-denoise|--atrous-denoise]"
             );
             println!("  realtimerays dataset [output-dir] [--frames N]");
             println!(
-                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--cnn-denoise|--atrous-denoise]"
+                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--cnn-denoise|--atrous-denoise]"
             );
             println!("  realtimerays remux [output-dir]");
             return Ok(());
@@ -2372,7 +2783,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let denoiser = if matches!(args.first().map(String::as_str), Some("--no-denoise")) {
+    let denoiser = if args.iter().any(|arg| arg == "--no-denoise") {
         None
     } else if args.iter().any(|arg| arg == "--atrous-denoise") {
         Some(DenoiserKind::Atrous)
