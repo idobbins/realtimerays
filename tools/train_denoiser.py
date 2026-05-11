@@ -8,6 +8,11 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+try:
+    import lpips
+except ImportError:
+    lpips = None
+
 
 MAX_FILTER_RADIUS = 4
 MAX_FILTER_SIZE = MAX_FILTER_RADIUS * 2 + 1
@@ -15,6 +20,9 @@ MAX_FILTER_TAPS = MAX_FILTER_SIZE * MAX_FILTER_SIZE
 DISABLED_PENALTY = -20.0
 MAX_LUMA_BLEND = 0.45
 MAX_CNN_LUMA_DELTA = 0.12
+CNN_HIDDEN_CHANNELS = 16
+CNN_INPUT_CHANNELS = 16
+MAX_CNN_RGB_DELTA = 0.22
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
 
 
@@ -149,6 +157,59 @@ class TinyCnnDenoiser(torch.nn.Module):
         return torch.clamp(chroma * out_luma, 0.0, 1.0)
 
 
+class ResidualCnnDenoiser(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv0_weight = torch.nn.Parameter(
+            torch.empty(CNN_HIDDEN_CHANNELS, CNN_INPUT_CHANNELS, 3, 3)
+        )
+        self.conv0_bias = torch.nn.Parameter(torch.zeros(CNN_HIDDEN_CHANNELS))
+        self.conv1_weight = torch.nn.Parameter(torch.zeros(3, CNN_HIDDEN_CHANNELS))
+        self.conv1_bias = torch.nn.Parameter(torch.zeros(3))
+        torch.nn.init.kaiming_uniform_(self.conv0_weight, nonlinearity="relu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        color = x[:, 0:3]
+        normal = x[:, 3:6]
+        albedo = x[:, 6:9]
+        depth = x[:, 9:10]
+        b, _, h, w = x.shape
+
+        padded = F.pad(x, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 10, 9, h * w)
+        patch_color = patches[:, 0:3]
+        patch_normal = patches[:, 3:6]
+        patch_albedo = patches[:, 6:9]
+        patch_depth = patches[:, 9:10]
+
+        center_color = color.reshape(b, 3, 1, h * w)
+        center_normal = normal.reshape(b, 3, 1, h * w)
+        center_albedo = albedo.reshape(b, 3, 1, h * w)
+        center_depth = depth.reshape(b, 1, 1, h * w)
+        features = torch.cat(
+            [
+                patch_color,
+                patch_color - center_color,
+                patch_normal - center_normal,
+                patch_albedo - center_albedo,
+                patch_depth - center_depth,
+                center_color.expand(-1, -1, 9, -1),
+            ],
+            dim=1,
+        )
+
+        hidden = torch.einsum(
+            "hct,bctn->bhn",
+            self.conv0_weight.view(CNN_HIDDEN_CHANNELS, CNN_INPUT_CHANNELS, 9),
+            features,
+        )
+        hidden = F.relu(hidden + self.conv0_bias.view(1, CNN_HIDDEN_CHANNELS, 1))
+        raw_delta = torch.einsum("oh,bhn->bon", self.conv1_weight, hidden)
+        raw_delta = raw_delta + self.conv1_bias.view(1, 3, 1)
+        delta = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta.view(b, 3, h, w))
+        return torch.clamp(color + delta, 0.0, 1.0)
+
+
 class DenoiserDataset:
     def __init__(
         self,
@@ -243,20 +304,85 @@ def make_batch(dataset: DenoiserDataset, batch_size: int, device: str) -> tuple[
     return inputs, targets
 
 
-def loss_for(pred: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor, high_weight: float) -> torch.Tensor:
-    pred_luma = luminance(pred)
-    target_luma = luminance(targets)
-    input_luma = luminance(inputs[:, 0:3])
-    luma_error = pred_luma - target_luma
-    per_pixel = torch.abs(luma_error) + 0.25 * luma_error * luma_error
+def weighted_image_loss(
+    per_pixel: torch.Tensor,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    high_weight: float,
+) -> torch.Tensor:
     if high_weight <= 0.0:
         return torch.mean(per_pixel)
 
     with torch.no_grad():
-        source_error = torch.abs(target_luma - input_luma)
+        source_error = torch.abs(luminance(targets) - luminance(inputs[:, 0:3]))
         source_error = source_error / (torch.mean(source_error) + 0.000001)
         pixel_weight = 1.0 + high_weight * torch.clamp(source_error, 0.0, 6.0)
     return torch.sum(per_pixel * pixel_weight) / torch.sum(pixel_weight)
+
+
+def legacy_loss_for(
+    pred: torch.Tensor,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    high_weight: float,
+) -> torch.Tensor:
+    pred_luma = luminance(pred)
+    target_luma = luminance(targets)
+    luma_error = pred_luma - target_luma
+    per_pixel = torch.abs(luma_error) + 0.25 * luma_error * luma_error
+    return weighted_image_loss(per_pixel, inputs, targets, high_weight)
+
+
+def gradient_loss(pred: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    dx = torch.abs(
+        (pred[:, :, :, 1:] - pred[:, :, :, :-1])
+        - (targets[:, :, :, 1:] - targets[:, :, :, :-1])
+    )
+    dy = torch.abs(
+        (pred[:, :, 1:, :] - pred[:, :, :-1, :])
+        - (targets[:, :, 1:, :] - targets[:, :, :-1, :])
+    )
+    return 0.5 * (torch.mean(dx) + torch.mean(dy))
+
+
+class PerceptualLoss(torch.nn.Module):
+    def __init__(
+        self,
+        high_weight: float,
+        l1_weight: float,
+        lpips_weight: float,
+        gradient_weight: float,
+        lpips_net: str,
+        device: str,
+    ) -> None:
+        super().__init__()
+        self.high_weight = high_weight
+        self.l1_weight = l1_weight
+        self.lpips_weight = lpips_weight
+        self.gradient_weight = gradient_weight
+        self.lpips_model = None
+        if lpips_weight > 0.0:
+            if lpips is None:
+                print("warning: lpips package is not installed; continuing with --lpips-weight 0")
+                self.lpips_weight = 0.0
+            else:
+                self.lpips_model = lpips.LPIPS(net=lpips_net).to(device).eval()
+                for param in self.lpips_model.parameters():
+                    param.requires_grad_(False)
+
+    def forward(self, pred: torch.Tensor, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        rgb_error = torch.abs(pred - targets)
+        luma_error = torch.abs(luminance(pred) - luminance(targets))
+        per_pixel = torch.mean(rgb_error, dim=1, keepdim=True) + 0.25 * luma_error
+        loss = self.l1_weight * weighted_image_loss(per_pixel, inputs, targets, self.high_weight)
+
+        if self.lpips_weight > 0.0 and self.lpips_model is not None:
+            loss = loss + self.lpips_weight * torch.mean(
+                self.lpips_model(pred * 2.0 - 1.0, targets * 2.0 - 1.0)
+            )
+        if self.gradient_weight > 0.0:
+            loss = loss + self.gradient_weight * gradient_loss(pred, targets)
+        return loss
 
 
 @torch.no_grad()
@@ -266,13 +392,13 @@ def validate(
     batch_size: int,
     steps: int,
     device: str,
-    high_weight: float,
+    loss_fn: torch.nn.Module,
 ) -> float:
     model.eval()
     losses = []
     for _ in range(steps):
         inputs, targets = make_batch(dataset, batch_size, device)
-        losses.append(float(loss_for(model(inputs), inputs, targets, high_weight).detach().cpu()))
+        losses.append(float(loss_fn(model(inputs), inputs, targets).detach().cpu()))
     return sum(losses) / len(losses)
 
 
@@ -298,7 +424,21 @@ def export_weights(model: LearnedFilter, output: Path) -> None:
     print(f"wrote {output} ({weights.size} f32 values)")
 
 
-def export_cnn_weights(model: TinyCnnDenoiser, output: Path) -> None:
+def export_tiny_cnn_weights(model: TinyCnnDenoiser, output: Path) -> None:
+    weights = np.concatenate(
+        [
+            model.conv0_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv0_bias.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv1_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv1_bias.detach().cpu().numpy().astype("<f4").reshape(-1),
+        ]
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    weights.tofile(output)
+    print(f"wrote {output} ({weights.size} f32 values)")
+
+
+def export_residual_cnn_weights(model: ResidualCnnDenoiser, output: Path) -> None:
     weights = np.concatenate(
         [
             model.conv0_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
@@ -316,7 +456,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--model", choices=["filter", "tiny-cnn"], default="filter")
+    parser.add_argument("--model", choices=["filter", "tiny-cnn", "cnn"], default="cnn")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--steps-per-epoch", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -327,6 +467,10 @@ def main() -> None:
     parser.add_argument("--importance-prob", type=float, default=0.7)
     parser.add_argument("--importance-stride", type=int, default=16)
     parser.add_argument("--high-weight", type=float, default=3.0)
+    parser.add_argument("--l1-weight", type=float, default=0.75)
+    parser.add_argument("--lpips-weight", type=float, default=0.20)
+    parser.add_argument("--gradient-weight", type=float, default=0.05)
+    parser.add_argument("--lpips-net", choices=["alex", "vgg", "squeeze"], default="squeeze")
     parser.add_argument("--radius", type=int, choices=[1, 2, 3, 4], default=1)
     parser.add_argument(
         "--guides",
@@ -371,14 +515,38 @@ def main() -> None:
     if output is None:
         output = (
             Path("resources/denoiser_cnn_weights.bin")
-            if args.model == "tiny-cnn"
+            if args.model in {"tiny-cnn", "cnn"}
             else Path("resources/denoiser_weights.bin")
         )
 
     if args.model == "tiny-cnn":
         model = TinyCnnDenoiser().to(args.device)
+        loss_fn: torch.nn.Module = PerceptualLoss(
+            args.high_weight,
+            args.l1_weight,
+            0.0,
+            args.gradient_weight,
+            args.lpips_net,
+            args.device,
+        )
+    elif args.model == "cnn":
+        model = ResidualCnnDenoiser().to(args.device)
+        loss_fn = PerceptualLoss(
+            args.high_weight,
+            args.l1_weight,
+            args.lpips_weight,
+            args.gradient_weight,
+            args.lpips_net,
+            args.device,
+        )
     else:
         model = LearnedFilter(args.radius, guides).to(args.device)
+        loss_fn = lambda pred, inputs, targets: legacy_loss_for(
+            pred,
+            inputs,
+            targets,
+            args.high_weight,
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
@@ -388,7 +556,7 @@ def main() -> None:
             inputs, targets = make_batch(train_dataset, args.batch_size, args.device)
 
             pred = model(inputs)
-            loss = loss_for(pred, inputs, targets, args.high_weight)
+            loss = loss_fn(pred, inputs, targets)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -396,10 +564,12 @@ def main() -> None:
 
         print(f"epoch {epoch + 1}/{args.epochs} loss {sum(losses) / len(losses):.6f}")
 
-    val_loss = validate(model, val_dataset, args.batch_size, args.val_steps, args.device, args.high_weight)
+    val_loss = validate(model, val_dataset, args.batch_size, args.val_steps, args.device, loss_fn)
     print(f"val_loss {val_loss:.6f}")
-    if isinstance(model, TinyCnnDenoiser):
-        export_cnn_weights(model, output)
+    if isinstance(model, ResidualCnnDenoiser):
+        export_residual_cnn_weights(model, output)
+    elif isinstance(model, TinyCnnDenoiser):
+        export_tiny_cnn_weights(model, output)
     else:
         export_weights(model, output)
 

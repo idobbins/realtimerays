@@ -9,14 +9,14 @@ struct Weights {
 @group(0) @binding(6) var<storage, read> weights: Weights;
 @group(0) @binding(20) var final_image: texture_storage_2d<rgba8unorm, write>;
 
-const HIDDEN_CHANNELS: u32 = 8u;
-const INPUT_CHANNELS: u32 = 10u;
+const HIDDEN_CHANNELS: u32 = 16u;
+const INPUT_CHANNELS: u32 = 16u;
 const KERNEL_SIZE: u32 = 3u;
 const CONV0_WEIGHT_OFFSET: u32 = 0u;
-const CONV0_BIAS_OFFSET: u32 = 720u;
-const CONV1_WEIGHT_OFFSET: u32 = 728u;
-const CONV1_BIAS_OFFSET: u32 = 736u;
-const MAX_LUMA_DELTA: f32 = 0.12;
+const CONV0_BIAS_OFFSET: u32 = 2304u;
+const CONV1_WEIGHT_OFFSET: u32 = 2320u;
+const CONV1_BIAS_OFFSET: u32 = 2368u;
+const MAX_RGB_DELTA: f32 = 0.22;
 
 fn clamp_px(px: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
     return clamp(px, vec2<i32>(0), size - vec2<i32>(1));
@@ -64,12 +64,11 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let center = clamp_px(px, size);
     let center_color = textureLoad(noisy_image, center, 0).rgb;
-    let center_luma = luminance(center_color);
     let center_normal = textureLoad(normal_image, center, 0).rgb;
     let center_albedo = textureLoad(albedo_image, center, 0).rgb;
     let center_depth = textureLoad(depth_image, center, 0).x;
 
-    var hidden: array<f32, 8>;
+    var hidden: array<f32, 16>;
     for (var h = 0u; h < HIDDEN_CHANNELS; h = h + 1u) {
         hidden[h] = weights.values[CONV0_BIAS_OFFSET + h];
     }
@@ -81,21 +80,26 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
             let q_normal = textureLoad(normal_image, q, 0).rgb;
             let q_albedo = textureLoad(albedo_image, q, 0).rgb;
             let q_depth = textureLoad(depth_image, q, 0).x;
-            let q_luma = luminance(q_color);
             let ky = u32(oy + 1);
             let kx = u32(ox + 1);
 
-            var channels: array<f32, 10>;
-            channels[0] = q_luma;
-            channels[1] = q_luma - center_luma;
-            channels[2] = q_normal.x - center_normal.x;
-            channels[3] = q_normal.y - center_normal.y;
-            channels[4] = q_normal.z - center_normal.z;
-            channels[5] = q_albedo.x - center_albedo.x;
-            channels[6] = q_albedo.y - center_albedo.y;
-            channels[7] = q_albedo.z - center_albedo.z;
-            channels[8] = q_depth - center_depth;
-            channels[9] = center_luma;
+            var channels: array<f32, 16>;
+            channels[0] = q_color.x;
+            channels[1] = q_color.y;
+            channels[2] = q_color.z;
+            channels[3] = q_color.x - center_color.x;
+            channels[4] = q_color.y - center_color.y;
+            channels[5] = q_color.z - center_color.z;
+            channels[6] = q_normal.x - center_normal.x;
+            channels[7] = q_normal.y - center_normal.y;
+            channels[8] = q_normal.z - center_normal.z;
+            channels[9] = q_albedo.x - center_albedo.x;
+            channels[10] = q_albedo.y - center_albedo.y;
+            channels[11] = q_albedo.z - center_albedo.z;
+            channels[12] = q_depth - center_depth;
+            channels[13] = center_color.x;
+            channels[14] = center_color.y;
+            channels[15] = center_color.z;
 
             for (var h = 0u; h < HIDDEN_CHANNELS; h = h + 1u) {
                 for (var c = 0u; c < INPUT_CHANNELS; c = c + 1u) {
@@ -105,14 +109,22 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    var raw_delta_luma = weights.values[CONV1_BIAS_OFFSET];
+    var raw_delta = vec3<f32>(
+        weights.values[CONV1_BIAS_OFFSET + 0u],
+        weights.values[CONV1_BIAS_OFFSET + 1u],
+        weights.values[CONV1_BIAS_OFFSET + 2u],
+    );
     for (var h = 0u; h < HIDDEN_CHANNELS; h = h + 1u) {
         let activation = max(hidden[h], 0.0);
-        raw_delta_luma = raw_delta_luma + activation * weights.values[CONV1_WEIGHT_OFFSET + h];
+        raw_delta.x = raw_delta.x + activation * weights.values[CONV1_WEIGHT_OFFSET + 0u * HIDDEN_CHANNELS + h];
+        raw_delta.y = raw_delta.y + activation * weights.values[CONV1_WEIGHT_OFFSET + 1u * HIDDEN_CHANNELS + h];
+        raw_delta.z = raw_delta.z + activation * weights.values[CONV1_WEIGHT_OFFSET + 2u * HIDDEN_CHANNELS + h];
     }
 
-    let delta_luma = MAX_LUMA_DELTA * tanh_approx(raw_delta_luma);
-    let out_luma = max(center_luma + delta_luma, 0.0);
-    let chroma = center_color / max(center_luma, 0.0001);
-    display_store(px, chroma * out_luma);
+    let delta = MAX_RGB_DELTA * vec3<f32>(
+        tanh_approx(raw_delta.x),
+        tanh_approx(raw_delta.y),
+        tanh_approx(raw_delta.z),
+    );
+    display_store(px, center_color + delta);
 }

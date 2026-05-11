@@ -38,11 +38,17 @@ const LIGHT_HI: vec3<i32> = vec3<i32>(8, 17, 8);
 const LIGHT_AREA: f32 = 225.0;
 
 const CHUNK_SIZE: i32 = 4;
-const SCENE_SVO_NODE_WORDS: u32 = 16u;
-const SCENE_SVO_LEAF_WORDS: u32 = 8u;
+const GRID_BRICK_SIZE: i32 = 4;
+const GRID_WORLD_SIZE: i32 = CHUNK_SIZE * GRID_BRICK_SIZE;
+const GRID_TRACE_MAX_CELLS: i32 = 256;
+const GRID_BRICK_SLOT_COUNT: u32 = 64u;
+const SCENE_GRID_CELL_WORDS: u32 = 1u;
+const SCENE_GRID_BRICK_WORDS: u32 = GRID_BRICK_SLOT_COUNT;
+const SCENE_GRID_LEAF_MATERIAL_WORDS: u32 = 16u;
+const SCENE_GRID_LEAF_WORDS: u32 = 8u + SCENE_GRID_LEAF_MATERIAL_WORDS;
 const SCENE_MATERIAL_BOX_WORDS: u32 = 8u;
-const SVO_STACK_SIZE: i32 = 32;
-const USE_SVO: bool = true;
+const RENDER_FLAG_GUIDES: u32 = 1u;
+const USE_TWO_LEVEL_GRID: bool = true;
 
 struct Hit {
     t: f32,
@@ -54,6 +60,7 @@ struct VoxelHit {
     t: f32,
     n: vec3<f32>,
     voxel: vec3<i32>,
+    mat: u32,
 }
 
 struct AabbHit {
@@ -79,7 +86,7 @@ fn scene_i32(index: u32) -> i32 {
     return bitcast<i32>(scene.words[index]);
 }
 
-fn node_count() -> u32 {
+fn grid_cell_count() -> u32 {
     return scene.words[0u];
 }
 
@@ -91,28 +98,44 @@ fn material_box_count() -> u32 {
     return scene.words[2u];
 }
 
-fn nodes_base() -> u32 {
+fn grid_cells_base() -> u32 {
     return scene.words[3u];
 }
 
-fn leaves_base() -> u32 {
+fn grid_bricks_base() -> u32 {
     return scene.words[4u];
 }
 
-fn material_boxes_base() -> u32 {
+fn leaves_base() -> u32 {
     return scene.words[5u];
 }
 
-fn root_ref() -> i32 {
-    return scene_i32(6u);
+fn material_boxes_base() -> u32 {
+    return scene.words[6u];
 }
 
-fn node_base(id: u32) -> u32 {
-    return nodes_base() + id * SCENE_SVO_NODE_WORDS;
+fn grid_origin() -> vec3<i32> {
+    return vec3<i32>(scene_i32(7u), scene_i32(8u), scene_i32(9u));
+}
+
+fn grid_dims() -> vec3<i32> {
+    return vec3<i32>(scene_i32(10u), scene_i32(11u), scene_i32(12u));
+}
+
+fn grid_brick_count() -> u32 {
+    return scene.words[13u];
+}
+
+fn grid_cell_base(id: u32) -> u32 {
+    return grid_cells_base() + id * SCENE_GRID_CELL_WORDS;
+}
+
+fn grid_brick_base(id: u32) -> u32 {
+    return grid_bricks_base() + id * SCENE_GRID_BRICK_WORDS;
 }
 
 fn leaf_base(id: u32) -> u32 {
-    return leaves_base() + id * SCENE_SVO_LEAF_WORDS;
+    return leaves_base() + id * SCENE_GRID_LEAF_WORDS;
 }
 
 fn material_box_base(id: u32) -> u32 {
@@ -195,11 +218,37 @@ fn mask_test(mask: vec2<u32>, local_voxel: vec3<i32>) -> bool {
     return (mask.y & (1u << (bit - 32u))) != 0u;
 }
 
-fn floor_div_4(v: i32) -> i32 {
+fn material_test(base: u32, local_voxel: vec3<i32>) -> u32 {
+    let bit = u32(local_voxel.x + local_voxel.y * CHUNK_SIZE + local_voxel.z * CHUNK_SIZE * CHUNK_SIZE);
+    let word = scene.words[base + 5u + bit / 8u];
+    return (word >> ((bit & 7u) * 4u)) & 0xfu;
+}
+
+fn floor_div_i(v: i32, divisor: i32) -> i32 {
     if v >= 0 {
-        return v / CHUNK_SIZE;
+        return v / divisor;
     }
-    return -((-v + CHUNK_SIZE - 1) / CHUNK_SIZE);
+    return -((-v + divisor - 1) / divisor);
+}
+
+fn floor_div_4(v: i32) -> i32 {
+    return floor_div_i(v, CHUNK_SIZE);
+}
+
+fn floor_div_grid(v: i32) -> i32 {
+    return floor_div_i(v, GRID_BRICK_SIZE);
+}
+
+fn grid_cell_index(cell: vec3<i32>, dims: vec3<i32>) -> u32 {
+    return u32(cell.x + cell.y * dims.x + cell.z * dims.x * dims.y);
+}
+
+fn grid_brick_slot(local_chunk: vec3<i32>) -> u32 {
+    return u32(
+        local_chunk.x +
+        local_chunk.y * GRID_BRICK_SIZE +
+        local_chunk.z * GRID_BRICK_SIZE * GRID_BRICK_SIZE
+    );
 }
 
 fn leaf_occupied(v: vec3<i32>) -> bool {
@@ -309,7 +358,7 @@ fn trace_tiny_accel_box(
         return false;
     }
 
-    *out_hit = VoxelHit(t, n, voxel);
+    *out_hit = VoxelHit(t, n, voxel, material_at_voxel(voxel));
     return true;
 }
 
@@ -324,7 +373,7 @@ fn trace_tiny_voxels(
     let count = material_box_count();
 
     for (var i = 0u; i < count; i = i + 1u) {
-        var hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0));
+        var hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0), MAT_EMPTY);
         if trace_tiny_accel_box(ro, rd, i, closest, &hit) {
             *out_hit = hit;
             closest = hit.t;
@@ -338,7 +387,7 @@ fn trace_tiny_voxels(
 fn trace_tiny_any_voxel(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
     let count = material_box_count();
     for (var i = 0u; i < count; i = i + 1u) {
-        var hit = VoxelHit(max_distance, vec3<f32>(0.0), vec3<i32>(0));
+        var hit = VoxelHit(max_distance, vec3<f32>(0.0), vec3<i32>(0), MAT_EMPTY);
         if trace_tiny_accel_box(ro, rd, i, max_distance, &hit) {
             return true;
         }
@@ -379,7 +428,7 @@ fn trace_aabb(
     return true;
 }
 
-fn trace_svo_leaf(
+fn trace_grid_leaf(
     ro: vec3<f32>,
     rd: vec3<f32>,
     leaf_id: u32,
@@ -441,7 +490,7 @@ fn trace_svo_leaf(
 
     for (var i = 0; i < 64; i = i + 1) {
         if mask_test(mask, local) {
-            *out_hit = VoxelHit(t, n, chunk_lo_i + local);
+            *out_hit = VoxelHit(t, n, chunk_lo_i + local, material_test(base, local));
             return true;
         }
 
@@ -470,91 +519,219 @@ fn trace_svo_leaf(
     return false;
 }
 
+fn trace_grid_brick(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    brick_id: u32,
+    brick_coord: vec3<i32>,
+    max_distance: f32,
+    out_hit: ptr<function, VoxelHit>,
+) -> bool {
+    let brick_chunk_lo = brick_coord * GRID_BRICK_SIZE;
+    let brick_chunk_hi = brick_chunk_lo + vec3<i32>(GRID_BRICK_SIZE);
+    let brick_lo = vec3<f32>(brick_chunk_lo * CHUNK_SIZE);
+    let brick_hi = vec3<f32>(brick_chunk_hi * CHUNK_SIZE);
+
+    var box_hit = AabbHit(0.0, 0.0, vec3<f32>(0.0));
+    if !trace_aabb(ro, rd, brick_lo, brick_hi, max_distance, &box_hit) {
+        return false;
+    }
+
+    var t = max(box_hit.t0, SURFACE_EPSILON);
+    if t > box_hit.t1 || t > max_distance {
+        return false;
+    }
+
+    var start = ro + rd * t;
+    if box_hit.t0 >= SURFACE_EPSILON {
+        start = start - box_hit.n0 * 0.0001;
+    } else {
+        start = start + rd * 0.0001;
+    }
+
+    let start_voxel = vec3<i32>(floor(start));
+    let start_chunk = vec3<i32>(
+        floor_div_4(start_voxel.x),
+        floor_div_4(start_voxel.y),
+        floor_div_4(start_voxel.z),
+    );
+    var local = clamp(start_chunk - brick_chunk_lo, vec3<i32>(0), vec3<i32>(GRID_BRICK_SIZE - 1));
+
+    let step = vec3<i32>(
+        select(select(0, -1, rd.x < 0.0), 1, rd.x > 0.0),
+        select(select(0, -1, rd.y < 0.0), 1, rd.y > 0.0),
+        select(select(0, -1, rd.z < 0.0), 1, rd.z > 0.0),
+    );
+    let t_delta = vec3<f32>(
+        select(AXIS_NEVER, abs(f32(CHUNK_SIZE) / rd.x), step.x != 0),
+        select(AXIS_NEVER, abs(f32(CHUNK_SIZE) / rd.y), step.y != 0),
+        select(AXIS_NEVER, abs(f32(CHUNK_SIZE) / rd.z), step.z != 0),
+    );
+    let next_boundary = vec3<f32>(
+        f32((brick_chunk_lo.x + local.x + select(0, 1, step.x > 0)) * CHUNK_SIZE),
+        f32((brick_chunk_lo.y + local.y + select(0, 1, step.y > 0)) * CHUNK_SIZE),
+        f32((brick_chunk_lo.z + local.z + select(0, 1, step.z > 0)) * CHUNK_SIZE),
+    );
+    var t_max = vec3<f32>(
+        select(AXIS_NEVER, (next_boundary.x - ro.x) / rd.x, step.x != 0),
+        select(AXIS_NEVER, (next_boundary.y - ro.y) / rd.y, step.y != 0),
+        select(AXIS_NEVER, (next_boundary.z - ro.z) / rd.z, step.z != 0),
+    );
+
+    let base = grid_brick_base(brick_id);
+    for (var i = 0u; i < GRID_BRICK_SLOT_COUNT; i = i + 1u) {
+        let slot = grid_brick_slot(local);
+        let chunk_ref = scene_i32(base + slot);
+        if chunk_ref > 0 {
+            let leaf_id = u32(chunk_ref - 1);
+            if leaf_id < leaf_count() && trace_grid_leaf(ro, rd, leaf_id, min(max_distance, box_hit.t1), out_hit) {
+                return true;
+            }
+        }
+
+        if t_max.x <= t_max.y && t_max.x <= t_max.z {
+            t = t_max.x;
+            t_max.x += t_delta.x;
+            local.x += step.x;
+        } else if t_max.y <= t_max.z {
+            t = t_max.y;
+            t_max.y += t_delta.y;
+            local.y += step.y;
+        } else {
+            t = t_max.z;
+            t_max.z += t_delta.z;
+            local.z += step.z;
+        }
+
+        if t > box_hit.t1 || t > max_distance || any(local < vec3<i32>(0)) || any(local >= vec3<i32>(GRID_BRICK_SIZE)) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+fn trace_grid_voxels(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    max_distance: f32,
+    out_hit: ptr<function, VoxelHit>,
+) -> bool {
+    let origin = grid_origin();
+    let dims = grid_dims();
+    if any(dims <= vec3<i32>(0)) {
+        return false;
+    }
+
+    let grid_lo = vec3<f32>(origin * GRID_WORLD_SIZE);
+    let grid_hi = vec3<f32>((origin + dims) * GRID_WORLD_SIZE);
+
+    var box_hit = AabbHit(0.0, 0.0, vec3<f32>(0.0));
+    if !trace_aabb(ro, rd, grid_lo, grid_hi, max_distance, &box_hit) {
+        return false;
+    }
+
+    var t = max(box_hit.t0, SURFACE_EPSILON);
+    if t > box_hit.t1 || t > max_distance {
+        return false;
+    }
+
+    var n = box_hit.n0;
+    var start = ro + rd * t;
+    if box_hit.t0 >= SURFACE_EPSILON {
+        start = start - n * 0.0001;
+    } else {
+        start = start + rd * 0.0001;
+        n = vec3<f32>(0.0);
+    }
+
+    let start_voxel = vec3<i32>(floor(start));
+    let start_chunk = vec3<i32>(
+        floor_div_4(start_voxel.x),
+        floor_div_4(start_voxel.y),
+        floor_div_4(start_voxel.z),
+    );
+    let start_brick = vec3<i32>(
+        floor_div_grid(start_chunk.x),
+        floor_div_grid(start_chunk.y),
+        floor_div_grid(start_chunk.z),
+    );
+    var cell = clamp(start_brick - origin, vec3<i32>(0), dims - vec3<i32>(1));
+
+    let step = vec3<i32>(
+        select(select(0, -1, rd.x < 0.0), 1, rd.x > 0.0),
+        select(select(0, -1, rd.y < 0.0), 1, rd.y > 0.0),
+        select(select(0, -1, rd.z < 0.0), 1, rd.z > 0.0),
+    );
+    let brick_coord = origin + cell;
+    let next_boundary = vec3<f32>(
+        f32((brick_coord.x + select(0, 1, step.x > 0)) * GRID_WORLD_SIZE),
+        f32((brick_coord.y + select(0, 1, step.y > 0)) * GRID_WORLD_SIZE),
+        f32((brick_coord.z + select(0, 1, step.z > 0)) * GRID_WORLD_SIZE),
+    );
+    let t_delta = vec3<f32>(
+        select(AXIS_NEVER, abs(f32(GRID_WORLD_SIZE) / rd.x), step.x != 0),
+        select(AXIS_NEVER, abs(f32(GRID_WORLD_SIZE) / rd.y), step.y != 0),
+        select(AXIS_NEVER, abs(f32(GRID_WORLD_SIZE) / rd.z), step.z != 0),
+    );
+    var t_max = vec3<f32>(
+        select(AXIS_NEVER, (next_boundary.x - ro.x) / rd.x, step.x != 0),
+        select(AXIS_NEVER, (next_boundary.y - ro.y) / rd.y, step.y != 0),
+        select(AXIS_NEVER, (next_boundary.z - ro.z) / rd.z, step.z != 0),
+    );
+
+    for (var iter = 0; iter < GRID_TRACE_MAX_CELLS; iter = iter + 1) {
+        if any(cell < vec3<i32>(0)) || any(cell >= dims) {
+            return false;
+        }
+
+        let cell_index = grid_cell_index(cell, dims);
+        if cell_index < grid_cell_count() {
+            let brick_ref = scene_i32(grid_cell_base(cell_index));
+            if brick_ref > 0 {
+                let brick_id = u32(brick_ref - 1);
+                if brick_id < grid_brick_count() && trace_grid_brick(ro, rd, brick_id, origin + cell, max_distance, out_hit) {
+                    return true;
+                }
+            }
+        }
+
+        if t_max.x <= t_max.y && t_max.x <= t_max.z {
+            t = t_max.x;
+            t_max.x += t_delta.x;
+            cell.x += step.x;
+        } else if t_max.y <= t_max.z {
+            t = t_max.y;
+            t_max.y += t_delta.y;
+            cell.y += step.y;
+        } else {
+            t = t_max.z;
+            t_max.z += t_delta.z;
+            cell.z += step.z;
+        }
+
+        if t > box_hit.t1 || t > max_distance {
+            return false;
+        }
+    }
+
+    return false;
+}
+
 fn trace_voxels(
     ro: vec3<f32>,
     rd: vec3<f32>,
     max_distance: f32,
     out_hit: ptr<function, VoxelHit>,
 ) -> bool {
-    var closest = max_distance;
-    var found = false;
-    if !USE_SVO {
+    if !USE_TWO_LEVEL_GRID {
         return trace_tiny_voxels(ro, rd, max_distance, out_hit);
     }
 
-    let root = root_ref();
-    if root == 0 {
-        return false;
-    }
-
-    var stack: array<i32, 32>;
-    var stack_size = 0;
-    stack[stack_size] = root;
-    stack_size += 1;
-
-    for (var iter = 0; iter < 256; iter = iter + 1) {
-        if stack_size <= 0 {
-            break;
-        }
-
-        stack_size -= 1;
-        let current_ref = stack[stack_size];
-
-        if current_ref < 0 {
-            let leaf_id = u32(-current_ref - 1);
-            if leaf_id < leaf_count() {
-                var leaf_hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0));
-                if trace_svo_leaf(ro, rd, leaf_id, closest, &leaf_hit) {
-                    *out_hit = leaf_hit;
-                    closest = leaf_hit.t;
-                    found = true;
-                }
-            }
-        } else if current_ref > 0 {
-            let node_id = u32(current_ref - 1);
-            if node_id < node_count() {
-                let base = node_base(node_id);
-                let origin = vec3<i32>(
-                    scene_i32(base + 0u),
-                    scene_i32(base + 1u),
-                    scene_i32(base + 2u),
-                );
-                let size = scene_i32(base + 3u);
-                let lo = vec3<f32>(origin * CHUNK_SIZE);
-                let hi = vec3<f32>((origin + vec3<i32>(size)) * CHUNK_SIZE);
-
-                var node_hit = AabbHit(0.0, 0.0, vec3<f32>(0.0));
-                if trace_aabb(ro, rd, lo, hi, closest, &node_hit) {
-                    let child_mask = scene.words[base + 4u];
-                    let child_size = size / 2;
-                    for (var child = 0u; child < 8u; child = child + 1u) {
-                        if (child_mask & (1u << child)) != 0u && stack_size < SVO_STACK_SIZE {
-                            let child_i = i32(child);
-                            let child_origin = origin + vec3<i32>(
-                                select(0, child_size, (child_i & 1) != 0),
-                                select(0, child_size, (child_i & 2) != 0),
-                                select(0, child_size, (child_i & 4) != 0),
-                            );
-                            let child_lo = vec3<f32>(child_origin * CHUNK_SIZE);
-                            let child_hi = vec3<f32>((child_origin + vec3<i32>(child_size)) * CHUNK_SIZE);
-                            var child_hit = AabbHit(0.0, 0.0, vec3<f32>(0.0));
-                            if trace_aabb(ro, rd, child_lo, child_hi, closest, &child_hit) {
-                                stack[stack_size] = scene_i32(base + 5u + child);
-                                stack_size += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    return found;
+    return trace_grid_voxels(ro, rd, max_distance, out_hit);
 }
 
 fn trace_any_voxel(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
-    // The scene is authored as solid integer boxes, so shadow rays can use the
-    // material boxes directly instead of walking voxel leaves.
     let box_count = material_box_count();
     for (var i = 0u; i < box_count; i = i + 1u) {
         let base = material_box_base(i);
@@ -598,9 +775,9 @@ fn trace(
         found = true;
     }
 
-    var voxel_hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0));
+    var voxel_hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0), MAT_EMPTY);
     if trace_voxels(ro, rd, closest, &voxel_hit) {
-        let mat = material_at_voxel(voxel_hit.voxel);
+        let mat = voxel_hit.mat;
         if mat != MAT_EMPTY {
             *out_hit = Hit(voxel_hit.t, voxel_hit.n, mat);
             found = true;
@@ -752,8 +929,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let cam = camera();
     let sample_count = max(i32(pc.render.x), 1);
     var color = vec3<f32>(0.0);
-    let center_ray = camera_ray(cam, pixel_uv(px, size, vec2<f32>(0.0)));
-    let guides = first_hit_guides(cam.ro, center_ray);
+    let write_guides = (pc.render.z & RENDER_FLAG_GUIDES) != 0u;
+    var guides = Guides(vec3<f32>(0.5), vec3<f32>(0.0), 1.0);
+    if write_guides {
+        let center_ray = camera_ray(cam, pixel_uv(px, size, vec2<f32>(0.0)));
+        guides = first_hit_guides(cam.ro, center_ray);
+    }
 
     for (var i = 0; i < sample_count; i = i + 1) {
         var rng = seed(px, i);
@@ -764,7 +945,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     color /= f32(sample_count);
     color = tonemap(color);
     textureStore(color_image, px, vec4<f32>(color, 1.0));
-    textureStore(normal_image, px, vec4<f32>(guides.normal, 1.0));
-    textureStore(albedo_image, px, vec4<f32>(guides.albedo, 1.0));
-    textureStore(depth_image, px, vec4<f32>(guides.depth, 0.0, 0.0, 1.0));
+    if write_guides {
+        textureStore(normal_image, px, vec4<f32>(guides.normal, 1.0));
+        textureStore(albedo_image, px, vec4<f32>(guides.albedo, 1.0));
+        textureStore(depth_image, px, vec4<f32>(guides.depth, 0.0, 0.0, 1.0));
+    }
 }

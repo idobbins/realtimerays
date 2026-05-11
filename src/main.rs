@@ -26,8 +26,9 @@ const RECORD_FRAME_COUNT: u32 = RECORD_FPS * RECORD_SECONDS;
 const RUNTIME_SPP: u32 = 2;
 const DATASET_INPUT_SPP: u32 = 2;
 const DATASET_TARGET_SPP: u32 = 12;
+const RENDER_FLAG_GUIDES: u32 = 1;
 const FILTER_DENOISER_WEIGHT_COUNT: usize = 87;
-const CNN_DENOISER_WEIGHT_COUNT: usize = 737;
+const CNN_DENOISER_WEIGHT_COUNT: usize = 2371;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
 const CAMERA_ORBIT_ANGLE: f32 = 0.45;
@@ -44,20 +45,20 @@ const MAT_LIGHT: u32 = 7;
 const MAT_WATER: u32 = 8;
 
 const SCENE_HEADER_WORDS: usize = 16;
-const SCENE_SVO_NODE_WORDS: usize = 16;
-const SCENE_SVO_LEAF_WORDS: usize = 8;
+const SCENE_GRID_CELL_WORDS: usize = 1;
+const SCENE_GRID_BRICK_WORDS: usize = GRID_BRICK_SLOT_COUNT;
+const SCENE_GRID_LEAF_MATERIAL_WORDS: usize = 16;
+const SCENE_GRID_LEAF_WORDS: usize = 8 + SCENE_GRID_LEAF_MATERIAL_WORDS;
 const SCENE_MATERIAL_BOX_WORDS: usize = 8;
-const TRACE_SVO_LEAF_THRESHOLD: usize = 64;
-#[cfg(test)]
-const SVO_SHADER_STACK_SIZE: usize = 32;
-#[cfg(test)]
-const SVO_SHADER_MAX_VISITS: usize = 256;
+const TRACE_GRID_LEAF_THRESHOLD: usize = 64;
 const CHUNK_SIZE: i32 = 4;
+const GRID_BRICK_SIZE: i32 = 4;
+const GRID_BRICK_SLOT_COUNT: usize = 64;
 const MOUNTAIN_LAYERS: i32 = 11;
 
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
-const TRACE_USE_SVO_DECL: &str = "const USE_SVO: bool = true;";
-const TRACE_USE_SVO_BRANCH: &str = "if !USE_SVO {";
+const TRACE_USE_GRID_DECL: &str = "const USE_TWO_LEVEL_GRID: bool = true;";
+const TRACE_USE_GRID_BRANCH: &str = "if !USE_TWO_LEVEL_GRID {";
 const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
 const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.wgsl");
 const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
@@ -136,14 +137,17 @@ fn create_trusted_wgsl_shader_module(
     }
 }
 
-fn trace_shader_source(use_svo: bool) -> Cow<'static, str> {
-    if use_svo {
+fn trace_shader_source(use_grid: bool) -> Cow<'static, str> {
+    if use_grid {
         Cow::Borrowed(TRACE_SHADER)
     } else {
         Cow::Owned(
             TRACE_SHADER
-                .replace(TRACE_USE_SVO_DECL, "const USE_SVO: bool = false;")
-                .replace(TRACE_USE_SVO_BRANCH, "if true {"),
+                .replace(
+                    TRACE_USE_GRID_DECL,
+                    "const USE_TWO_LEVEL_GRID: bool = false;",
+                )
+                .replace(TRACE_USE_GRID_BRANCH, "if true {"),
         )
     }
 }
@@ -165,12 +169,20 @@ struct SceneBox {
     mat: u32,
 }
 
-fn floor_div_chunk(v: i32) -> i32 {
+fn floor_div(v: i32, divisor: i32) -> i32 {
     if v >= 0 {
-        v / CHUNK_SIZE
+        v / divisor
     } else {
-        -((-v + CHUNK_SIZE - 1) / CHUNK_SIZE)
+        -((-v + divisor - 1) / divisor)
     }
+}
+
+fn floor_div_chunk(v: i32) -> i32 {
+    floor_div(v, CHUNK_SIZE)
+}
+
+fn floor_div_grid(v: i32) -> i32 {
+    floor_div(v, GRID_BRICK_SIZE)
 }
 
 fn push_i32_word(words: &mut Vec<u32>, value: i32) {
@@ -299,18 +311,25 @@ fn scene_boxes() -> Vec<SceneBox> {
 struct OccupancyChunk {
     coord: [i32; 3],
     mask: [u32; 2],
+    materials: [u32; SCENE_GRID_LEAF_MATERIAL_WORDS],
 }
 
 #[derive(Clone, Copy, Debug)]
-struct SvoNode {
+struct GridBrick {
+    chunk_refs: [i32; GRID_BRICK_SLOT_COUNT],
+}
+
+#[derive(Clone, Debug)]
+struct VoxelGrid {
     origin: [i32; 3],
-    size: i32,
-    child_mask: u32,
-    child_refs: [i32; 8],
+    dims: [i32; 3],
+    cells: Vec<i32>,
+    bricks: Vec<GridBrick>,
+    leaves: Vec<OccupancyChunk>,
 }
 
 fn build_occupancy_chunks(scene_boxes: &[SceneBox]) -> Vec<OccupancyChunk> {
-    let mut chunks = BTreeMap::<[i32; 3], [u32; 2]>::new();
+    let mut chunks = BTreeMap::<[i32; 3], ([u32; 2], [u32; SCENE_GRID_LEAF_MATERIAL_WORDS])>::new();
 
     for b in scene_boxes {
         for z in b.lo[2]..b.hi[2] {
@@ -325,11 +344,20 @@ fn build_occupancy_chunks(scene_boxes: &[SceneBox]) -> Vec<OccupancyChunk> {
                     let bit = (local[0]
                         + local[1] * CHUNK_SIZE
                         + local[2] * CHUNK_SIZE * CHUNK_SIZE) as u32;
-                    let mask = chunks.entry(chunk).or_insert([0; 2]);
+                    let (mask, materials) = chunks
+                        .entry(chunk)
+                        .or_insert(([0; 2], [0; SCENE_GRID_LEAF_MATERIAL_WORDS]));
                     if bit < 32 {
                         mask[0] |= 1 << bit;
                     } else {
                         mask[1] |= 1 << (bit - 32);
+                    }
+
+                    let material_word = (bit / 8) as usize;
+                    let material_shift = (bit % 8) * 4;
+                    let material_mask = 0xfu32 << material_shift;
+                    if materials[material_word] & material_mask == 0 {
+                        materials[material_word] |= (b.mat & 0xf) << material_shift;
                     }
                 }
             }
@@ -338,139 +366,176 @@ fn build_occupancy_chunks(scene_boxes: &[SceneBox]) -> Vec<OccupancyChunk> {
 
     chunks
         .into_iter()
-        .map(|(coord, mask)| OccupancyChunk { coord, mask })
+        .map(|(coord, (mask, materials))| OccupancyChunk {
+            coord,
+            mask,
+            materials,
+        })
         .collect()
 }
 
-fn contains_chunk(origin: [i32; 3], size: i32, chunk: [i32; 3]) -> bool {
-    chunk[0] >= origin[0]
-        && chunk[1] >= origin[1]
-        && chunk[2] >= origin[2]
-        && chunk[0] < origin[0] + size
-        && chunk[1] < origin[1] + size
-        && chunk[2] < origin[2] + size
+fn grid_cell_index(dims: [i32; 3], cell: [i32; 3]) -> usize {
+    (cell[0] + cell[1] * dims[0] + cell[2] * dims[0] * dims[1]) as usize
 }
 
-fn build_svo_subtree(
-    origin: [i32; 3],
-    size: i32,
-    chunks: &[OccupancyChunk],
-    nodes: &mut Vec<SvoNode>,
-    leaves: &mut Vec<OccupancyChunk>,
-) -> i32 {
+fn grid_brick_slot(local_chunk: [i32; 3]) -> usize {
+    (local_chunk[0]
+        + local_chunk[1] * GRID_BRICK_SIZE
+        + local_chunk[2] * GRID_BRICK_SIZE * GRID_BRICK_SIZE) as usize
+}
+
+fn build_voxel_grid(chunks: &[OccupancyChunk]) -> VoxelGrid {
     if chunks.is_empty() {
-        return 0;
+        return VoxelGrid {
+            origin: [0; 3],
+            dims: [0; 3],
+            cells: Vec::new(),
+            bricks: Vec::new(),
+            leaves: Vec::new(),
+        };
     }
 
-    if size == 1 {
-        debug_assert_eq!(chunks.len(), 1);
-        debug_assert_eq!(chunks[0].coord, origin);
-        let leaf_id = leaves.len() as i32;
-        leaves.push(chunks[0]);
-        return -(leaf_id + 1);
-    }
-
-    let node_id = nodes.len();
-    nodes.push(SvoNode {
-        origin,
-        size,
-        child_mask: 0,
-        child_refs: [0; 8],
-    });
-
-    let child_size = size / 2;
-    for child in 0..8 {
-        let child_origin = [
-            origin[0] + if child & 1 != 0 { child_size } else { 0 },
-            origin[1] + if child & 2 != 0 { child_size } else { 0 },
-            origin[2] + if child & 4 != 0 { child_size } else { 0 },
-        ];
-        let child_chunks = chunks
+    let min_brick = [
+        chunks
             .iter()
-            .copied()
-            .filter(|chunk| contains_chunk(child_origin, child_size, chunk.coord))
-            .collect::<Vec<_>>();
+            .map(|chunk| floor_div_grid(chunk.coord[0]))
+            .min()
+            .unwrap(),
+        chunks
+            .iter()
+            .map(|chunk| floor_div_grid(chunk.coord[1]))
+            .min()
+            .unwrap(),
+        chunks
+            .iter()
+            .map(|chunk| floor_div_grid(chunk.coord[2]))
+            .min()
+            .unwrap(),
+    ];
+    let max_brick = [
+        chunks
+            .iter()
+            .map(|chunk| floor_div_grid(chunk.coord[0]))
+            .max()
+            .unwrap(),
+        chunks
+            .iter()
+            .map(|chunk| floor_div_grid(chunk.coord[1]))
+            .max()
+            .unwrap(),
+        chunks
+            .iter()
+            .map(|chunk| floor_div_grid(chunk.coord[2]))
+            .max()
+            .unwrap(),
+    ];
+    let dims = [
+        max_brick[0] - min_brick[0] + 1,
+        max_brick[1] - min_brick[1] + 1,
+        max_brick[2] - min_brick[2] + 1,
+    ];
+    let cell_count = (dims[0] * dims[1] * dims[2]) as usize;
 
-        let child_ref = build_svo_subtree(child_origin, child_size, &child_chunks, nodes, leaves);
-        if child_ref != 0 {
-            nodes[node_id].child_mask |= 1u32 << child;
-            nodes[node_id].child_refs[child] = child_ref;
-        }
+    let mut cells = vec![0; cell_count];
+    let mut bricks = Vec::new();
+    let mut leaves = Vec::with_capacity(chunks.len());
+
+    for chunk in chunks {
+        let brick_coord = [
+            floor_div_grid(chunk.coord[0]),
+            floor_div_grid(chunk.coord[1]),
+            floor_div_grid(chunk.coord[2]),
+        ];
+        let cell = [
+            brick_coord[0] - min_brick[0],
+            brick_coord[1] - min_brick[1],
+            brick_coord[2] - min_brick[2],
+        ];
+        let cell_index = grid_cell_index(dims, cell);
+        let brick_id = if cells[cell_index] == 0 {
+            bricks.push(GridBrick {
+                chunk_refs: [0; GRID_BRICK_SLOT_COUNT],
+            });
+            cells[cell_index] = bricks.len() as i32;
+            bricks.len() - 1
+        } else {
+            (cells[cell_index] - 1) as usize
+        };
+
+        let local_chunk = [
+            chunk.coord[0] - brick_coord[0] * GRID_BRICK_SIZE,
+            chunk.coord[1] - brick_coord[1] * GRID_BRICK_SIZE,
+            chunk.coord[2] - brick_coord[2] * GRID_BRICK_SIZE,
+        ];
+        debug_assert!(local_chunk
+            .iter()
+            .all(|&v| (0..GRID_BRICK_SIZE).contains(&v)));
+        let slot = grid_brick_slot(local_chunk);
+        debug_assert_eq!(bricks[brick_id].chunk_refs[slot], 0);
+
+        let leaf_ref = leaves.len() as i32 + 1;
+        leaves.push(*chunk);
+        bricks[brick_id].chunk_refs[slot] = leaf_ref;
     }
 
-    node_id as i32 + 1
-}
-
-fn build_svo(chunks: &[OccupancyChunk]) -> (Vec<SvoNode>, Vec<OccupancyChunk>, i32) {
-    if chunks.is_empty() {
-        return (Vec::new(), Vec::new(), 0);
+    VoxelGrid {
+        origin: min_brick,
+        dims,
+        cells,
+        bricks,
+        leaves,
     }
-
-    let min = [
-        chunks.iter().map(|chunk| chunk.coord[0]).min().unwrap(),
-        chunks.iter().map(|chunk| chunk.coord[1]).min().unwrap(),
-        chunks.iter().map(|chunk| chunk.coord[2]).min().unwrap(),
-    ];
-    let max = [
-        chunks.iter().map(|chunk| chunk.coord[0]).max().unwrap(),
-        chunks.iter().map(|chunk| chunk.coord[1]).max().unwrap(),
-        chunks.iter().map(|chunk| chunk.coord[2]).max().unwrap(),
-    ];
-    let extent = [
-        max[0] - min[0] + 1,
-        max[1] - min[1] + 1,
-        max[2] - min[2] + 1,
-    ];
-    let max_extent = extent.into_iter().max().unwrap();
-    let root_size = (max_extent as u32).next_power_of_two() as i32;
-
-    let mut nodes = Vec::new();
-    let mut leaves = Vec::new();
-    let root_ref = build_svo_subtree(min, root_size, chunks, &mut nodes, &mut leaves);
-    (nodes, leaves, root_ref)
 }
 
 fn build_scene_words() -> Vec<u32> {
     let scene_boxes = scene_boxes();
     let chunks = build_occupancy_chunks(&scene_boxes);
-    let (nodes, leaves, root_ref) = build_svo(&chunks);
+    let grid = build_voxel_grid(&chunks);
 
-    let node_count = nodes.len();
-    let leaf_count = leaves.len();
+    let cell_count = grid.cells.len();
+    let brick_count = grid.bricks.len();
+    let leaf_count = grid.leaves.len();
     let material_box_count = scene_boxes.len();
-    let nodes_base = SCENE_HEADER_WORDS;
-    let leaves_base = nodes_base + node_count * SCENE_SVO_NODE_WORDS;
-    let material_boxes_base = leaves_base + leaf_count * SCENE_SVO_LEAF_WORDS;
+    let cells_base = SCENE_HEADER_WORDS;
+    let bricks_base = cells_base + cell_count * SCENE_GRID_CELL_WORDS;
+    let leaves_base = bricks_base + brick_count * SCENE_GRID_BRICK_WORDS;
+    let material_boxes_base = leaves_base + leaf_count * SCENE_GRID_LEAF_WORDS;
     let total_words = material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS;
 
     let mut words = vec![0; SCENE_HEADER_WORDS];
-    words[0] = node_count as u32;
+    words[0] = cell_count as u32;
     words[1] = leaf_count as u32;
     words[2] = material_box_count as u32;
-    words[3] = nodes_base as u32;
-    words[4] = leaves_base as u32;
-    words[5] = material_boxes_base as u32;
-    words[6] = root_ref as u32;
+    words[3] = cells_base as u32;
+    words[4] = bricks_base as u32;
+    words[5] = leaves_base as u32;
+    words[6] = material_boxes_base as u32;
+    words[7] = grid.origin[0] as u32;
+    words[8] = grid.origin[1] as u32;
+    words[9] = grid.origin[2] as u32;
+    words[10] = grid.dims[0] as u32;
+    words[11] = grid.dims[1] as u32;
+    words[12] = grid.dims[2] as u32;
+    words[13] = brick_count as u32;
     words.reserve(total_words - words.len());
 
-    for node in nodes {
-        push_i32_word(&mut words, node.origin[0]);
-        push_i32_word(&mut words, node.origin[1]);
-        push_i32_word(&mut words, node.origin[2]);
-        push_i32_word(&mut words, node.size);
-        words.push(node.child_mask);
-        for child_ref in node.child_refs {
-            push_i32_word(&mut words, child_ref);
-        }
-        words.extend([0, 0, 0]);
+    for cell_ref in grid.cells {
+        push_i32_word(&mut words, cell_ref);
     }
 
-    for leaf in leaves {
+    for brick in grid.bricks {
+        for chunk_ref in brick.chunk_refs {
+            push_i32_word(&mut words, chunk_ref);
+        }
+    }
+
+    for leaf in grid.leaves {
         push_i32_word(&mut words, leaf.coord[0]);
         push_i32_word(&mut words, leaf.coord[1]);
         push_i32_word(&mut words, leaf.coord[2]);
         words.push(leaf.mask[0]);
         words.push(leaf.mask[1]);
+        words.extend(leaf.materials);
         words.extend([0, 0, 0]);
     }
 
@@ -491,7 +556,7 @@ fn build_scene_words() -> Vec<u32> {
 
 fn create_scene_buffer(device: &wgpu::Device) -> (wgpu::Buffer, bool) {
     let scene_words = build_scene_words();
-    let use_svo = scene_words[1] as usize > TRACE_SVO_LEAF_THRESHOLD;
+    let use_grid = scene_words[1] as usize > TRACE_GRID_LEAF_THRESHOLD;
     let scene_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scene buffer"),
         size: (scene_words.len() * std::mem::size_of::<u32>()) as u64,
@@ -503,51 +568,12 @@ fn create_scene_buffer(device: &wgpu::Device) -> (wgpu::Buffer, bool) {
         .get_mapped_range_mut()
         .copy_from_slice(bytemuck::cast_slice(&scene_words));
     scene_buffer.unmap();
-    (scene_buffer, use_svo)
+    (scene_buffer, use_grid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn collect_reachable_leaves(root_ref: i32, nodes: &[SvoNode], leaves: &mut Vec<usize>) {
-        if root_ref < 0 {
-            leaves.push((-root_ref - 1) as usize);
-            return;
-        }
-
-        if root_ref == 0 {
-            return;
-        }
-
-        let node = nodes[(root_ref - 1) as usize];
-        for child_ref in node.child_refs {
-            collect_reachable_leaves(child_ref, nodes, leaves);
-        }
-    }
-
-    fn max_unpruned_node_stack_use(root_ref: i32, nodes: &[SvoNode]) -> (usize, usize) {
-        let mut stack = vec![root_ref];
-        let mut max_stack = stack.len();
-        let mut visits = 0;
-
-        while let Some(current_ref) = stack.pop() {
-            visits += 1;
-            if current_ref <= 0 {
-                continue;
-            }
-
-            let node = nodes[(current_ref - 1) as usize];
-            for child_ref in node.child_refs {
-                if child_ref > 0 {
-                    stack.push(child_ref);
-                }
-            }
-            max_stack = max_stack.max(stack.len());
-        }
-
-        (max_stack, visits)
-    }
 
     #[test]
     fn scene_occupancy_matches_current_boxes() {
@@ -559,71 +585,109 @@ mod tests {
             .sum();
 
         assert!(scene_boxes.len() > 40);
-        assert!(chunks.len() > TRACE_SVO_LEAF_THRESHOLD);
+        assert!(chunks.len() > TRACE_GRID_LEAF_THRESHOLD);
         assert!(occupied_voxels > 3_500);
     }
 
     #[test]
-    fn svo_root_contains_all_chunks() {
+    fn grid_bounds_contain_all_chunks() {
         let scene_boxes = scene_boxes();
         let chunks = build_occupancy_chunks(&scene_boxes);
-        let (nodes, _leaves, root_ref) = build_svo(&chunks);
-        assert!(root_ref > 0);
+        let grid = build_voxel_grid(&chunks);
 
-        let root = nodes[(root_ref - 1) as usize];
-        assert!((root.size as u32).is_power_of_two());
         for chunk in chunks {
-            assert!(contains_chunk(root.origin, root.size, chunk.coord));
+            let brick_coord = [
+                floor_div_grid(chunk.coord[0]),
+                floor_div_grid(chunk.coord[1]),
+                floor_div_grid(chunk.coord[2]),
+            ];
+            let cell = [
+                brick_coord[0] - grid.origin[0],
+                brick_coord[1] - grid.origin[1],
+                brick_coord[2] - grid.origin[2],
+            ];
+            assert!(cell[0] >= 0 && cell[0] < grid.dims[0]);
+            assert!(cell[1] >= 0 && cell[1] < grid.dims[1]);
+            assert!(cell[2] >= 0 && cell[2] < grid.dims[2]);
+
+            let cell_ref = grid.cells[grid_cell_index(grid.dims, cell)];
+            assert!(cell_ref > 0);
+
+            let local_chunk = [
+                chunk.coord[0] - brick_coord[0] * GRID_BRICK_SIZE,
+                chunk.coord[1] - brick_coord[1] * GRID_BRICK_SIZE,
+                chunk.coord[2] - brick_coord[2] * GRID_BRICK_SIZE,
+            ];
+            let chunk_ref =
+                grid.bricks[(cell_ref - 1) as usize].chunk_refs[grid_brick_slot(local_chunk)];
+            assert!(chunk_ref > 0);
+            assert_eq!(grid.leaves[(chunk_ref - 1) as usize].coord, chunk.coord);
         }
     }
 
     #[test]
-    fn svo_reaches_every_occupied_chunk_once() {
+    fn grid_reaches_every_occupied_chunk_once() {
         let scene_boxes = scene_boxes();
         let chunks = build_occupancy_chunks(&scene_boxes);
-        let (nodes, leaves, root_ref) = build_svo(&chunks);
+        let grid = build_voxel_grid(&chunks);
         let mut reachable = Vec::new();
-        collect_reachable_leaves(root_ref, &nodes, &mut reachable);
+
+        for brick in &grid.bricks {
+            for chunk_ref in brick.chunk_refs {
+                if chunk_ref > 0 {
+                    reachable.push((chunk_ref - 1) as usize);
+                }
+            }
+        }
         reachable.sort_unstable();
 
-        let expected = (0..leaves.len()).collect::<Vec<_>>();
+        let expected = (0..grid.leaves.len()).collect::<Vec<_>>();
         assert_eq!(reachable, expected);
-        assert_eq!(leaves.len(), chunks.len());
+        assert_eq!(grid.leaves.len(), chunks.len());
     }
 
     #[test]
-    fn svo_shader_stack_covers_current_scene() {
+    fn grid_has_one_brick_per_populated_cell() {
         let scene_boxes = scene_boxes();
         let chunks = build_occupancy_chunks(&scene_boxes);
-        let (nodes, _leaves, root_ref) = build_svo(&chunks);
-        let (max_stack, visits) = max_unpruned_node_stack_use(root_ref, &nodes);
+        let grid = build_voxel_grid(&chunks);
+        let populated_cells = grid.cells.iter().filter(|&&cell_ref| cell_ref > 0).count();
 
-        assert!(max_stack <= SVO_SHADER_STACK_SIZE);
-        assert!(visits <= SVO_SHADER_MAX_VISITS);
+        assert_eq!(populated_cells, grid.bricks.len());
+        assert!(grid.bricks.len() <= grid.cells.len());
+        assert!(grid.bricks.len() < grid.leaves.len());
     }
 
     #[test]
     fn serialized_scene_layout_is_consistent() {
         let words = build_scene_words();
-        let node_count = words[0] as usize;
+        let cell_count = words[0] as usize;
         let leaf_count = words[1] as usize;
         let material_box_count = words[2] as usize;
-        let nodes_base = words[3] as usize;
-        let leaves_base = words[4] as usize;
-        let material_boxes_base = words[5] as usize;
-        let root_ref = words[6] as i32;
+        let cells_base = words[3] as usize;
+        let bricks_base = words[4] as usize;
+        let leaves_base = words[5] as usize;
+        let material_boxes_base = words[6] as usize;
+        let dims = [words[10] as i32, words[11] as i32, words[12] as i32];
+        let brick_count = words[13] as usize;
 
-        assert_eq!(nodes_base, SCENE_HEADER_WORDS);
-        assert_eq!(leaves_base, nodes_base + node_count * SCENE_SVO_NODE_WORDS);
+        assert_eq!(cells_base, SCENE_HEADER_WORDS);
+        assert_eq!(bricks_base, cells_base + cell_count * SCENE_GRID_CELL_WORDS);
+        assert_eq!(
+            leaves_base,
+            bricks_base + brick_count * SCENE_GRID_BRICK_WORDS
+        );
         assert_eq!(
             material_boxes_base,
-            leaves_base + leaf_count * SCENE_SVO_LEAF_WORDS
+            leaves_base + leaf_count * SCENE_GRID_LEAF_WORDS
         );
         assert_eq!(
             words.len(),
             material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS
         );
-        assert_ne!(root_ref, 0);
+        assert_eq!(cell_count, (dims[0] * dims[1] * dims[2]) as usize);
+        assert!(brick_count > 0);
+        assert!(leaf_count > brick_count);
     }
 }
 
@@ -647,7 +711,12 @@ fn normalize3(mut v: [f32; 3]) -> [f32; 3] {
     v
 }
 
-fn camera_uniform(time: f32, sample_count: u32, seed_offset: u32) -> CameraUniform {
+fn camera_uniform(
+    time: f32,
+    sample_count: u32,
+    seed_offset: u32,
+    write_guides: bool,
+) -> CameraUniform {
     let a = CAMERA_ORBIT_ANGLE + time * CAMERA_ORBIT_SPEED;
     let target = [0.0, 2.25, 0.0];
     let ro = [
@@ -667,7 +736,12 @@ fn camera_uniform(time: f32, sample_count: u32, seed_offset: u32) -> CameraUnifo
         right: [right[0], right[1], right[2], 0.0],
         up: [up[0], up[1], up[2], 0.0],
         forward: [forward[0], forward[1], forward[2], CAMERA_FOCAL_LENGTH],
-        render: [sample_count, seed_offset, 0, 0],
+        render: [
+            sample_count,
+            seed_offset,
+            if write_guides { RENDER_FLAG_GUIDES } else { 0 },
+            0,
+        ],
     }
 }
 
@@ -1472,7 +1546,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (scene_buffer, use_svo) = create_scene_buffer(&device);
+        let (scene_buffer, use_grid) = create_scene_buffer(&device);
 
         let trace_bind_group_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
@@ -1481,7 +1555,7 @@ impl Renderer {
         let display_copy_layout = create_display_copy_layout(&device);
         let blit_bind_group_layout = create_blit_bind_group_layout(&device);
 
-        let trace_source = trace_shader_source(use_svo);
+        let trace_source = trace_shader_source(use_grid);
         let trace_shader =
             create_trusted_wgsl_shader_module(&device, "trace shader", &trace_source);
         let trace_pipeline = create_compute_pipeline(
@@ -1775,7 +1849,7 @@ impl Recorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (scene_buffer, use_svo) = create_scene_buffer(&device);
+        let (scene_buffer, use_grid) = create_scene_buffer(&device);
 
         let trace_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
@@ -1784,7 +1858,7 @@ impl Recorder {
         let display_copy_layout = create_display_copy_layout(&device);
         let denoiser_shader_kind = denoiser.unwrap_or(DenoiserKind::Filter);
 
-        let trace_source = trace_shader_source(use_svo);
+        let trace_source = trace_shader_source(use_grid);
         let trace_shader =
             create_trusted_wgsl_shader_module(&device, "record trace shader", &trace_source);
         let trace_pipeline = create_compute_pipeline(
@@ -2072,10 +2146,10 @@ impl DatasetRecorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let (scene_buffer, use_svo) = create_scene_buffer(&device);
+        let (scene_buffer, use_grid) = create_scene_buffer(&device);
         let trace_layout = create_trace_bind_group_layout(&device);
         let display_copy_layout = create_display_copy_layout(&device);
-        let trace_source = trace_shader_source(use_svo);
+        let trace_source = trace_shader_source(use_grid);
         let trace_shader =
             create_trusted_wgsl_shader_module(&device, "dataset trace shader", &trace_source);
         let denoise_shader =
@@ -2333,7 +2407,8 @@ impl ApplicationHandler for App {
                         .map(DenoiserKind::runtime_spp)
                         .unwrap_or(RUNTIME_SPP)
                 });
-                let camera = camera_uniform(time, sample_count, seed_offset);
+                let camera =
+                    camera_uniform(time, sample_count, seed_offset, renderer.denoiser.is_some());
                 renderer.render(&camera);
             }
             _ => {}
@@ -2510,7 +2585,12 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        let pixels = recorder.capture_frame(&camera_uniform(time, sample_count, frame_index))?;
+        let pixels = recorder.capture_frame(&camera_uniform(
+            time,
+            sample_count,
+            frame_index,
+            denoiser.is_some(),
+        ))?;
         let path = output_dir.join(format!("frame_{frame_index:06}.png"));
         write_png(&path, WIDTH, HEIGHT, &pixels)?;
 
@@ -2544,8 +2624,8 @@ fn run_dataset(args: &[String]) -> Result<(), Box<dyn Error>> {
     let recorder = DatasetRecorder::new(WIDTH, HEIGHT)?;
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        let input_camera = camera_uniform(time, DATASET_INPUT_SPP, frame_index);
-        let target_camera = camera_uniform(time, DATASET_TARGET_SPP, frame_index);
+        let input_camera = camera_uniform(time, DATASET_INPUT_SPP, frame_index, true);
+        let target_camera = camera_uniform(time, DATASET_TARGET_SPP, frame_index, true);
         let frame = recorder.capture_pair(&input_camera, &target_camera)?;
 
         write_bytes(
@@ -2628,10 +2708,12 @@ fn parse_sample_count_override(args: &[String]) -> Result<Option<u32>, Box<dyn E
 fn parse_denoiser_kind(args: &[String]) -> DenoiserKind {
     if args.iter().any(|arg| arg == "--atrous-denoise") {
         DenoiserKind::Atrous
+    } else if args.iter().any(|arg| arg == "--filter-denoise") {
+        DenoiserKind::Filter
     } else if args.iter().any(|arg| arg == "--cnn-denoise") {
         DenoiserKind::Cnn
     } else {
-        DenoiserKind::Filter
+        DenoiserKind::Cnn
     }
 }
 
@@ -2655,13 +2737,23 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     for frame_index in 0..warmup {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        recorder.submit_frame(&camera_uniform(time, sample_count, frame_index))?;
+        recorder.submit_frame(&camera_uniform(
+            time,
+            sample_count,
+            frame_index,
+            denoiser.is_some(),
+        ))?;
     }
 
     let start = Instant::now();
     for frame_index in 0..frames {
         let time = (warmup + frame_index) as f32 / RECORD_FPS as f32;
-        recorder.submit_frame(&camera_uniform(time, sample_count, warmup + frame_index))?;
+        recorder.submit_frame(&camera_uniform(
+            time,
+            sample_count,
+            warmup + frame_index,
+            denoiser.is_some(),
+        ))?;
     }
     let seconds = start.elapsed().as_secs_f64();
     let ms = seconds * 1000.0 / f64::from(frames);
@@ -2754,20 +2846,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("  realtimerays");
             println!("  realtimerays --no-denoise");
             println!("  realtimerays --cnn-denoise");
+            println!("  realtimerays --filter-denoise");
             println!("  realtimerays --atrous-denoise");
             println!("  realtimerays --spp N");
             println!(
-                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--cnn-denoise|--atrous-denoise]"
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
             );
             println!("  realtimerays dataset [output-dir] [--frames N]");
             println!(
-                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--cnn-denoise|--atrous-denoise]"
+                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
             );
             println!("  realtimerays remux [output-dir]");
             return Ok(());
         }
         Some("--no-denoise") => {}
         Some("--cnn-denoise") => {}
+        Some("--filter-denoise") => {}
         Some("--atrous-denoise") => {}
         Some("--spp") => {}
         Some(other) => {
@@ -2787,10 +2881,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     } else if args.iter().any(|arg| arg == "--atrous-denoise") {
         Some(DenoiserKind::Atrous)
+    } else if args.iter().any(|arg| arg == "--filter-denoise") {
+        Some(DenoiserKind::Filter)
     } else if args.iter().any(|arg| arg == "--cnn-denoise") {
         Some(DenoiserKind::Cnn)
     } else {
-        Some(DenoiserKind::Filter)
+        Some(DenoiserKind::Cnn)
     };
     let sample_count_override = parse_sample_count_override(&args)?;
     let mut app = App::new(denoiser, sample_count_override);
