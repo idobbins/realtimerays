@@ -680,7 +680,20 @@ fn create_atrous_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             texture_entry(1),
             texture_entry(2),
             texture_entry(3),
+            texture_entry(4),
             storage_texture_entry(21, wgpu::TextureFormat::Rgba16Float),
+        ],
+    })
+}
+
+fn create_atrous_display_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("atrous display bind group layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(2),
+            texture_entry(4),
+            storage_texture_entry(20, wgpu::TextureFormat::Rgba8Unorm),
         ],
     })
 }
@@ -867,6 +880,9 @@ fn create_atrous_bind_group(
     let depth_view = textures
         .depth
         .create_view(&wgpu::TextureViewDescriptor::default());
+    let raw_view = textures
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("atrous denoise bind group"),
@@ -889,8 +905,52 @@ fn create_atrous_bind_group(
                 resource: wgpu::BindingResource::TextureView(&depth_view),
             },
             wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&raw_view),
+            },
+            wgpu::BindGroupEntry {
                 binding: 21,
                 resource: wgpu::BindingResource::TextureView(&target_view),
+            },
+        ],
+    })
+}
+
+fn create_atrous_display_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source: &wgpu::Texture,
+    textures: &TraceTextures,
+) -> wgpu::BindGroup {
+    let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+    let albedo_view = textures
+        .albedo
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let raw_view = textures
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let display_view = textures
+        .display
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("atrous display bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&albedo_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&raw_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&display_view),
             },
         ],
     })
@@ -900,14 +960,13 @@ fn create_atrous_denoiser(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
     atrous_layout: &wgpu::BindGroupLayout,
-    display_copy_layout: &wgpu::BindGroupLayout,
+    atrous_display_layout: &wgpu::BindGroupLayout,
     textures: &FrameTextures,
 ) -> AtrousDenoiser {
     let steps = [
         ("atrous step 1 pipeline", "filter_step_1"),
         ("atrous step 2 pipeline", "filter_step_2"),
         ("atrous step 4 pipeline", "filter_step_4"),
-        ("atrous step 8 pipeline", "filter_step_8"),
     ];
     let pipelines = steps
         .iter()
@@ -935,19 +994,12 @@ fn create_atrous_denoiser(
             &textures.trace,
             &textures.atrous_a,
         ),
-        create_atrous_bind_group(
-            device,
-            atrous_layout,
-            &textures.atrous_a,
-            &textures.trace,
-            &textures.atrous_b,
-        ),
     ];
-    let display_bind_group = create_display_copy_from_texture_bind_group(
+    let display_bind_group = create_atrous_display_bind_group(
         device,
-        display_copy_layout,
-        &textures.atrous_b,
-        &textures.trace.display,
+        atrous_display_layout,
+        &textures.atrous_a,
+        &textures.trace,
     );
 
     AtrousDenoiser {
@@ -1077,6 +1129,7 @@ impl Renderer {
         let trace_bind_group_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
         let atrous_layout = create_atrous_layout(&device);
+        let atrous_display_layout = create_atrous_display_layout(&device);
         let display_copy_layout = create_display_copy_layout(&device);
         let blit_bind_group_layout = create_blit_bind_group_layout(&device);
 
@@ -1094,11 +1147,16 @@ impl Renderer {
             denoiser_kind.shader_label(),
             denoiser_kind.shader_source(),
         );
+        let display_pipeline_layout = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
+            &atrous_display_layout
+        } else {
+            &display_copy_layout
+        };
         let display_copy_pipeline = create_compute_pipeline(
             &device,
             "display copy pipeline",
             &denoise_shader,
-            &display_copy_layout,
+            display_pipeline_layout,
             "copy_main",
         );
 
@@ -1167,7 +1225,7 @@ impl Renderer {
                 &device,
                 &denoise_shader,
                 &atrous_layout,
-                &display_copy_layout,
+                &atrous_display_layout,
                 &frame_textures,
             ))
         } else {
@@ -1368,7 +1426,7 @@ impl Recorder {
         let trace_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
         let atrous_layout = create_atrous_layout(&device);
-        let display_copy_layout = create_display_copy_layout(&device);
+        let atrous_display_layout = create_atrous_display_layout(&device);
 
         let trace_shader =
             create_trusted_wgsl_shader_module(&device, "record trace shader", TRACE_SHADER);
@@ -1413,7 +1471,7 @@ impl Recorder {
                 &device,
                 "record atrous display copy pipeline",
                 &denoise_shader,
-                &display_copy_layout,
+                &atrous_display_layout,
                 "copy_main",
             ))
         } else {
@@ -1432,7 +1490,7 @@ impl Recorder {
                 &device,
                 &denoise_shader,
                 &atrous_layout,
-                &display_copy_layout,
+                &atrous_display_layout,
                 &frame_textures,
             ))
         } else {
@@ -1820,14 +1878,16 @@ struct App {
     renderer: Option<Renderer>,
     stats: FrameStats,
     denoiser: Option<DenoiserKind>,
+    sample_count_override: Option<u32>,
 }
 
 impl App {
-    fn new(denoiser: Option<DenoiserKind>) -> Self {
+    fn new(denoiser: Option<DenoiserKind>, sample_count_override: Option<u32>) -> Self {
         Self {
             renderer: None,
             stats: FrameStats::new(),
             denoiser,
+            sample_count_override,
         }
     }
 }
@@ -1870,10 +1930,12 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let time = self.stats.tick();
                 let seed_offset = renderer.frame_index;
-                let sample_count = renderer
-                    .denoiser
-                    .map(DenoiserKind::runtime_spp)
-                    .unwrap_or(RUNTIME_SPP);
+                let sample_count = self.sample_count_override.unwrap_or_else(|| {
+                    renderer
+                        .denoiser
+                        .map(DenoiserKind::runtime_spp)
+                        .unwrap_or(RUNTIME_SPP)
+                });
                 let camera = camera_uniform(time, sample_count, seed_offset);
                 renderer.render(&camera);
             }
@@ -2041,7 +2103,7 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| PathBuf::from("renders/shot01"));
     let frame_count = parse_frame_count(args)?;
     let denoiser_kind = parse_denoiser_kind(args);
-    let sample_count = denoiser_kind.runtime_spp();
+    let sample_count = parse_sample_count(args, denoiser_kind.runtime_spp())?;
 
     fs::create_dir_all(&output_dir)?;
     let recorder = Recorder::new(WIDTH, HEIGHT, denoiser_kind)?;
@@ -2151,6 +2213,18 @@ fn parse_arg_u32(args: &[String], name: &str, default: u32) -> Result<u32, Box<d
     Ok(parsed)
 }
 
+fn parse_sample_count(args: &[String], default: u32) -> Result<u32, Box<dyn Error>> {
+    parse_arg_u32(args, "--spp", default)
+}
+
+fn parse_sample_count_override(args: &[String]) -> Result<Option<u32>, Box<dyn Error>> {
+    if args.iter().any(|arg| arg == "--spp") {
+        Ok(Some(parse_arg_u32(args, "--spp", RUNTIME_SPP)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn parse_denoiser_kind(args: &[String]) -> DenoiserKind {
     if args.iter().any(|arg| arg == "--atrous-denoise") {
         DenoiserKind::Atrous
@@ -2165,7 +2239,7 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
     let frames = parse_arg_u32(args, "--frames", 120)?;
     let warmup = parse_arg_u32(args, "--warmup", 10)?;
     let denoiser_kind = parse_denoiser_kind(args);
-    let sample_count = denoiser_kind.runtime_spp();
+    let sample_count = parse_sample_count(args, denoiser_kind.runtime_spp())?;
     let recorder = Recorder::new(WIDTH, HEIGHT, denoiser_kind)?;
 
     for frame_index in 0..warmup {
@@ -2270,12 +2344,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("  realtimerays --no-denoise");
             println!("  realtimerays --cnn-denoise");
             println!("  realtimerays --atrous-denoise");
+            println!("  realtimerays --spp N");
             println!(
-                "  realtimerays bench [--frames N] [--warmup N] [--cnn-denoise|--atrous-denoise]"
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--cnn-denoise|--atrous-denoise]"
             );
             println!("  realtimerays dataset [output-dir] [--frames N]");
             println!(
-                "  realtimerays record-x [output-dir] [--frames N] [--cnn-denoise|--atrous-denoise]"
+                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--cnn-denoise|--atrous-denoise]"
             );
             println!("  realtimerays remux [output-dir]");
             return Ok(());
@@ -2283,6 +2358,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("--no-denoise") => {}
         Some("--cnn-denoise") => {}
         Some("--atrous-denoise") => {}
+        Some("--spp") => {}
         Some(other) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2305,7 +2381,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         Some(DenoiserKind::Filter)
     };
-    let mut app = App::new(denoiser);
+    let sample_count_override = parse_sample_count_override(&args)?;
+    let mut app = App::new(denoiser, sample_count_override);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

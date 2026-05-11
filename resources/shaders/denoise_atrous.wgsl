@@ -2,6 +2,7 @@
 @group(0) @binding(1) var normal_image: texture_2d<f32>;
 @group(0) @binding(2) var albedo_image: texture_2d<f32>;
 @group(0) @binding(3) var depth_image: texture_2d<f32>;
+@group(0) @binding(4) var raw_image: texture_2d<f32>;
 @group(0) @binding(21) var filtered_image: texture_storage_2d<rgba16float, write>;
 
 @group(0) @binding(20) var final_image: texture_storage_2d<rgba8unorm, write>;
@@ -9,7 +10,9 @@
 const NORMAL_PHI: f32 = 80.0;
 const ALBEDO_PHI: f32 = 8.0;
 const DEPTH_PHI: f32 = 180.0;
-const LUMA_PHI: f32 = 18.0;
+const LUMA_PHI: f32 = 45.0;
+const RAW_BLEND: f32 = 0.15;
+const VARIANCE_PHI: f32 = 80.0;
 
 fn clamp_px(px: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
     return clamp(px, vec2<i32>(0), size - vec2<i32>(1));
@@ -21,6 +24,33 @@ fn luminance(c: vec3<f32>) -> f32 {
 
 fn sqr_len3(v: vec3<f32>) -> f32 {
     return dot(v, v);
+}
+
+fn guide_chroma(px: vec2<i32>) -> vec3<f32> {
+    let raw_color = textureLoad(raw_image, px, 0).rgb;
+    let raw_luma = luminance(raw_color);
+    let raw_chroma = raw_color / max(raw_luma, 0.0001);
+    let albedo = textureLoad(albedo_image, px, 0).rgb;
+    let albedo_chroma = albedo / max(luminance(albedo), 0.0001);
+    let raw_confidence = smoothstep(0.02, 0.12, raw_luma);
+    return mix(albedo_chroma, raw_chroma, raw_confidence);
+}
+
+fn local_raw_luma_variance(px: vec2<i32>) -> f32 {
+    let size_u = textureDimensions(raw_image);
+    let size = vec2<i32>(i32(size_u.x), i32(size_u.y));
+    var sum_luma = 0.0;
+    var sum_luma2 = 0.0;
+    for (var oy = -1; oy <= 1; oy = oy + 1) {
+        for (var ox = -1; ox <= 1; ox = ox + 1) {
+            let q = clamp_px(px + vec2<i32>(ox, oy), size);
+            let l = luminance(textureLoad(raw_image, q, 0).rgb);
+            sum_luma += l;
+            sum_luma2 += l * l;
+        }
+    }
+    let mean = sum_luma / 9.0;
+    return max(sum_luma2 / 9.0 - mean * mean, 0.0);
 }
 
 fn kernel_weight(offset: i32) -> f32 {
@@ -57,23 +87,24 @@ fn edge_weight(
     return exp(-clamp(penalty, 0.0, 20.0));
 }
 
-fn filter_at_step(px: vec2<i32>, step_size: i32) -> vec3<f32> {
+fn filter_luma_at_step(px: vec2<i32>, step_size: i32) -> f32 {
     let size_u = textureDimensions(source_image);
     let size = vec2<i32>(i32(size_u.x), i32(size_u.y));
     let center = clamp_px(px, size);
 
-    let center_color = textureLoad(source_image, center, 0).rgb;
-    let center_luma = luminance(center_color);
+    let center_raw = textureLoad(raw_image, center, 0).rgb;
+    let center_luma = luminance(center_raw);
     let center_normal = textureLoad(normal_image, center, 0).rgb;
     let center_albedo = textureLoad(albedo_image, center, 0).rgb;
     let center_depth = textureLoad(depth_image, center, 0).x;
 
-    var sum_color = vec3<f32>(0.0);
+    var sum_luma = 0.0;
     var sum_weight = 0.0;
     for (var oy = -2; oy <= 2; oy = oy + 1) {
         for (var ox = -2; ox <= 2; ox = ox + 1) {
             let q = clamp_px(px + vec2<i32>(ox * step_size, oy * step_size), size);
             let q_color = textureLoad(source_image, q, 0).rgb;
+            let q_raw = textureLoad(raw_image, q, 0).rgb;
             let q_normal = textureLoad(normal_image, q, 0).rgb;
             let q_albedo = textureLoad(albedo_image, q, 0).rgb;
             let q_depth = textureLoad(depth_image, q, 0).x;
@@ -83,18 +114,18 @@ fn filter_at_step(px: vec2<i32>, step_size: i32) -> vec3<f32> {
                 center_normal,
                 center_albedo,
                 center_depth,
-                luminance(q_color),
+                luminance(q_raw),
                 q_normal,
                 q_albedo,
                 q_depth,
             );
             let w = spatial * guide;
-            sum_color += q_color * w;
+            sum_luma += luminance(q_color) * w;
             sum_weight += w;
         }
     }
 
-    return sum_color / max(sum_weight, 0.000001);
+    return sum_luma / max(sum_weight, 0.000001);
 }
 
 fn store_filtered(id: vec3<u32>, step_size: i32) {
@@ -105,7 +136,7 @@ fn store_filtered(id: vec3<u32>, step_size: i32) {
         return;
     }
 
-    textureStore(filtered_image, px, vec4<f32>(filter_at_step(px, step_size), 1.0));
+    textureStore(filtered_image, px, vec4<f32>(guide_chroma(px) * filter_luma_at_step(px, step_size), 1.0));
 }
 
 fn display_store(px: vec2<i32>, color: vec3<f32>) {
@@ -142,5 +173,10 @@ fn copy_main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    display_store(px, textureLoad(source_image, px, 0).rgb);
+    let raw_luma = luminance(textureLoad(raw_image, px, 0).rgb);
+    let filtered_luma = luminance(textureLoad(source_image, px, 0).rgb);
+    let variance = local_raw_luma_variance(px);
+    let raw_blend = RAW_BLEND * exp(-clamp(VARIANCE_PHI * variance, 0.0, 20.0));
+    let out_luma = mix(raw_luma, filtered_luma, 1.0 - raw_blend);
+    display_store(px, guide_chroma(px) * out_luma);
 }
