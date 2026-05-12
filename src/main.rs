@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -22,31 +22,95 @@ const TILE_SIZE: u32 = 8;
 const RECORD_FPS: u32 = 60;
 const RECORD_SECONDS: u32 = 10;
 const RECORD_FRAME_COUNT: u32 = RECORD_FPS * RECORD_SECONDS;
+const RUNTIME_SPP: u32 = 2;
+const DATASET_INPUT_SPP: u32 = 2;
+const DATASET_TARGET_SPP: u32 = 64;
+const RENDER_FLAG_GUIDES: u32 = 1;
+const FILTER_DENOISER_WEIGHT_COUNT: usize = 87;
+const CNN_DENOISER_WEIGHT_COUNT: usize = 4739;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
 const CAMERA_ORBIT_ANGLE: f32 = 0.45;
-const CAMERA_ORBIT_RADIUS: f32 = 16.0;
-const CAMERA_HEIGHT: f32 = 6.0;
-const CAMERA_FOCAL_LENGTH: f32 = 1.5;
+const CAMERA_ORBIT_RADIUS: f32 = 34.0;
+const CAMERA_HEIGHT: f32 = 13.0;
+const CAMERA_FOCAL_LENGTH: f32 = 1.35;
 
-const MAT_RED: u32 = 2;
-const MAT_GREEN: u32 = 3;
-const MAT_BLUE: u32 = 4;
-const MAT_LIGHT: u32 = 5;
+const MAT_GRASS: u32 = 2;
+const MAT_LEAF: u32 = 3;
+const MAT_WOOD: u32 = 4;
+const MAT_ROCK: u32 = 5;
+const MAT_SNOW: u32 = 6;
+const MAT_LIGHT: u32 = 7;
+const MAT_WATER: u32 = 8;
 
 const SCENE_HEADER_WORDS: usize = 16;
-const SCENE_CHUNK_WORDS: usize = 8;
-const SCENE_ACCEL_BOX_WORDS: usize = 8;
+const SCENE_BVH_NODE_WORDS: usize = 16;
 const SCENE_MATERIAL_BOX_WORDS: usize = 8;
-const CHUNK_SIZE: i32 = 4;
+const BVH_LEAF_BOXES: usize = 4;
+const MOUNTAIN_LAYERS: i32 = 11;
 
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
+const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
+const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.wgsl");
+const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
+
+#[derive(Clone, Copy)]
+enum DenoiserKind {
+    Filter,
+    Cnn,
+    Atrous,
+}
+
+impl DenoiserKind {
+    fn weight_count(self) -> Option<usize> {
+        match self {
+            Self::Filter => Some(FILTER_DENOISER_WEIGHT_COUNT),
+            Self::Cnn => Some(CNN_DENOISER_WEIGHT_COUNT),
+            Self::Atrous => None,
+        }
+    }
+
+    fn weight_path(self) -> Option<&'static str> {
+        match self {
+            Self::Filter => Some("resources/denoiser_weights.bin"),
+            Self::Cnn => Some("resources/denoiser_cnn_weights.bin"),
+            Self::Atrous => None,
+        }
+    }
+
+    fn shader_source(self) -> &'static str {
+        match self {
+            Self::Filter => DENOISE_SHADER,
+            Self::Cnn => DENOISE_CNN_SHADER,
+            Self::Atrous => DENOISE_ATROUS_SHADER,
+        }
+    }
+
+    fn shader_label(self) -> &'static str {
+        match self {
+            Self::Filter => "denoise shader",
+            Self::Cnn => "cnn denoise shader",
+            Self::Atrous => "atrous denoise shader",
+        }
+    }
+
+    fn is_single_pass(self) -> bool {
+        matches!(self, Self::Filter | Self::Cnn)
+    }
+
+    fn runtime_spp(self) -> u32 {
+        match self {
+            Self::Atrous => 1,
+            Self::Filter | Self::Cnn => RUNTIME_SPP,
+        }
+    }
+}
 
 fn create_trusted_wgsl_shader_module(
     device: &wgpu::Device,
-    label: &'static str,
-    source: &'static str,
+    label: &str,
+    source: &str,
 ) -> wgpu::ShaderModule {
     // SAFETY: These WGSL sources are static application assets, not user input.
     // The trace shader bounds-checks its storage texture writes against
@@ -64,6 +128,10 @@ fn create_trusted_wgsl_shader_module(
     }
 }
 
+fn trace_shader_source(_use_bvh: bool) -> Cow<'static, str> {
+    Cow::Borrowed(TRACE_SHADER)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -71,6 +139,7 @@ struct CameraUniform {
     right: [f32; 4],
     up: [f32; 4],
     forward: [f32; 4],
+    render: [u32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -80,115 +149,245 @@ struct SceneBox {
     mat: u32,
 }
 
-const SCENE_BOXES: [SceneBox; 6] = [
-    SceneBox {
-        lo: [-1, 0, -1],
-        hi: [2, 5, 2],
-        mat: MAT_GREEN,
-    },
-    SceneBox {
-        lo: [-5, 0, 2],
-        hi: [-2, 2, 5],
-        mat: MAT_RED,
-    },
-    SceneBox {
-        lo: [3, 0, -4],
-        hi: [5, 6, -2],
-        mat: MAT_BLUE,
-    },
-    SceneBox {
-        lo: [-4, 0, -3],
-        hi: [-2, 3, -1],
-        mat: MAT_RED,
-    },
-    SceneBox {
-        lo: [1, 6, -2],
-        hi: [3, 7, 0],
-        mat: MAT_BLUE,
-    },
-    SceneBox {
-        lo: [-3, 8, 1],
-        hi: [2, 9, 5],
-        mat: MAT_LIGHT,
-    },
-];
-
-fn floor_div_chunk(v: i32) -> i32 {
-    if v >= 0 {
-        v / CHUNK_SIZE
-    } else {
-        -((-v + CHUNK_SIZE - 1) / CHUNK_SIZE)
-    }
+#[derive(Clone, Debug)]
+struct BvhNode {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    left: i32,
+    right: i32,
+    first_box: u32,
+    box_count: u32,
 }
 
 fn push_i32_word(words: &mut Vec<u32>, value: i32) {
     words.push(value as u32);
 }
 
-fn build_scene_words() -> Vec<u32> {
-    let mut chunks = BTreeMap::<[i32; 3], [u32; 2]>::new();
+fn mountain_layer_bounds(y: i32) -> ([i32; 3], [i32; 3]) {
+    let x_radius = 15 - y;
+    let z_radius = 11 - y;
+    let x_shift = y / 3 - 1;
+    let z_shift = if y >= 5 { 1 } else { 0 };
 
-    for b in SCENE_BOXES {
-        for z in b.lo[2]..b.hi[2] {
-            for y in b.lo[1]..b.hi[1] {
-                for x in b.lo[0]..b.hi[0] {
-                    let chunk = [floor_div_chunk(x), floor_div_chunk(y), floor_div_chunk(z)];
-                    let local = [
-                        x - chunk[0] * CHUNK_SIZE,
-                        y - chunk[1] * CHUNK_SIZE,
-                        z - chunk[2] * CHUNK_SIZE,
-                    ];
-                    let bit = (local[0]
-                        + local[1] * CHUNK_SIZE
-                        + local[2] * CHUNK_SIZE * CHUNK_SIZE) as u32;
-                    let mask = chunks.entry(chunk).or_insert([0; 2]);
-                    if bit < 32 {
-                        mask[0] |= 1 << bit;
-                    } else {
-                        mask[1] |= 1 << (bit - 32);
-                    }
-                }
-            }
+    (
+        [x_shift - x_radius, y, z_shift - z_radius],
+        [x_shift + x_radius + 1, y + 1, z_shift + z_radius + 1],
+    )
+}
+
+fn mountain_height_at(x: i32, z: i32) -> i32 {
+    let mut height = 0;
+    for y in 0..MOUNTAIN_LAYERS {
+        let (lo, hi) = mountain_layer_bounds(y);
+        if x >= lo[0] && x < hi[0] && z >= lo[2] && z < hi[2] {
+            height = y + 1;
         }
     }
+    height
+}
 
-    let chunk_count = chunks.len();
-    let accel_box_count = SCENE_BOXES.len();
-    let material_box_count = SCENE_BOXES.len();
-    let chunks_base = SCENE_HEADER_WORDS;
-    let accel_boxes_base = chunks_base + chunk_count * SCENE_CHUNK_WORDS;
-    let material_boxes_base = accel_boxes_base + accel_box_count * SCENE_ACCEL_BOX_WORDS;
+fn push_tree(boxes: &mut Vec<SceneBox>, x: i32, z: i32, height: i32) {
+    let y = mountain_height_at(x, z);
+    boxes.push(SceneBox {
+        lo: [x, y, z],
+        hi: [x + 1, y + height, z + 1],
+        mat: MAT_WOOD,
+    });
+    boxes.push(SceneBox {
+        lo: [x - 2, y + height - 2, z - 2],
+        hi: [x + 3, y + height, z + 3],
+        mat: MAT_LEAF,
+    });
+    boxes.push(SceneBox {
+        lo: [x - 1, y + height, z - 1],
+        hi: [x + 2, y + height + 2, z + 2],
+        mat: MAT_LEAF,
+    });
+    boxes.push(SceneBox {
+        lo: [x, y + height + 2, z],
+        hi: [x + 1, y + height + 3, z + 1],
+        mat: MAT_LEAF,
+    });
+}
+
+fn scene_boxes() -> Vec<SceneBox> {
+    let mut boxes = Vec::new();
+
+    for y in 0..MOUNTAIN_LAYERS {
+        let (lo, hi) = mountain_layer_bounds(y);
+        let mat = if y >= 8 {
+            MAT_SNOW
+        } else if y >= 3 {
+            MAT_ROCK
+        } else {
+            MAT_GRASS
+        };
+        boxes.push(SceneBox { lo, hi, mat });
+    }
+
+    boxes.extend([
+        SceneBox {
+            lo: [-22, 0, -16],
+            hi: [-9, 1, -10],
+            mat: MAT_WATER,
+        },
+        SceneBox {
+            lo: [-20, 0, -10],
+            hi: [-16, 1, 4],
+            mat: MAT_WATER,
+        },
+        SceneBox {
+            lo: [13, 0, -15],
+            hi: [22, 1, -11],
+            mat: MAT_WATER,
+        },
+        SceneBox {
+            lo: [-15, 1, 8],
+            hi: [-12, 4, 11],
+            mat: MAT_ROCK,
+        },
+        SceneBox {
+            lo: [14, 1, 5],
+            hi: [17, 3, 8],
+            mat: MAT_ROCK,
+        },
+        SceneBox {
+            lo: [3, 11, 0],
+            hi: [8, 12, 3],
+            mat: MAT_SNOW,
+        },
+    ]);
+
+    for (x, z, height) in [
+        (-20, -7, 6),
+        (-18, 7, 5),
+        (-12, -4, 6),
+        (-9, 9, 5),
+        (-2, -12, 5),
+        (8, -7, 6),
+        (10, 6, 5),
+        (17, 9, 6),
+        (20, -4, 5),
+    ] {
+        push_tree(&mut boxes, x, z, height);
+    }
+
+    boxes.push(SceneBox {
+        lo: [-7, 16, -7],
+        hi: [8, 17, 8],
+        mat: MAT_LIGHT,
+    });
+
+    boxes
+}
+
+fn box_bounds(boxes: &[SceneBox], indices: &[usize]) -> ([i32; 3], [i32; 3]) {
+    let mut lo = [i32::MAX; 3];
+    let mut hi = [i32::MIN; 3];
+    for &index in indices {
+        let b = boxes[index];
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(b.lo[axis]);
+            hi[axis] = hi[axis].max(b.hi[axis]);
+        }
+    }
+    (lo, hi)
+}
+
+fn centroid_axis(b: SceneBox, axis: usize) -> i32 {
+    b.lo[axis] + b.hi[axis]
+}
+
+fn build_bvh_node(
+    boxes: &[SceneBox],
+    indices: &mut [usize],
+    nodes: &mut Vec<BvhNode>,
+    ordered_boxes: &mut Vec<SceneBox>,
+) -> i32 {
+    let (lo, hi) = box_bounds(boxes, indices);
+    let node_id = nodes.len();
+    nodes.push(BvhNode {
+        lo,
+        hi,
+        left: 0,
+        right: 0,
+        first_box: 0,
+        box_count: 0,
+    });
+
+    if indices.len() <= BVH_LEAF_BOXES {
+        let first_box = ordered_boxes.len() as u32;
+        for &index in indices.iter() {
+            ordered_boxes.push(boxes[index]);
+        }
+        nodes[node_id].first_box = first_box;
+        nodes[node_id].box_count = indices.len() as u32;
+        return node_id as i32 + 1;
+    }
+
+    let extent = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let axis = if extent[0] >= extent[1] && extent[0] >= extent[2] {
+        0
+    } else if extent[1] >= extent[2] {
+        1
+    } else {
+        2
+    };
+    indices.sort_by_key(|&index| centroid_axis(boxes[index], axis));
+    let mid = indices.len() / 2;
+    let (left_indices, right_indices) = indices.split_at_mut(mid);
+    let left = build_bvh_node(boxes, left_indices, nodes, ordered_boxes);
+    let right = build_bvh_node(boxes, right_indices, nodes, ordered_boxes);
+    nodes[node_id].left = left;
+    nodes[node_id].right = right;
+    node_id as i32 + 1
+}
+
+fn build_box_bvh(boxes: &[SceneBox]) -> (Vec<BvhNode>, Vec<SceneBox>, i32) {
+    if boxes.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
+    }
+
+    let mut indices = (0..boxes.len()).collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    let mut ordered_boxes = Vec::with_capacity(boxes.len());
+    let root = build_bvh_node(boxes, &mut indices, &mut nodes, &mut ordered_boxes);
+    (nodes, ordered_boxes, root)
+}
+
+fn build_scene_words() -> Vec<u32> {
+    let scene_boxes = scene_boxes();
+    let (bvh_nodes, ordered_boxes, bvh_root) = build_box_bvh(&scene_boxes);
+
+    let bvh_node_count = bvh_nodes.len();
+    let material_box_count = ordered_boxes.len();
+    let bvh_nodes_base = SCENE_HEADER_WORDS;
+    let material_boxes_base = bvh_nodes_base + bvh_node_count * SCENE_BVH_NODE_WORDS;
     let total_words = material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS;
 
     let mut words = vec![0; SCENE_HEADER_WORDS];
-    words[0] = chunk_count as u32;
-    words[1] = accel_box_count as u32;
+    words[0] = bvh_node_count as u32;
+    words[1] = bvh_root as u32;
     words[2] = material_box_count as u32;
-    words[3] = chunks_base as u32;
-    words[4] = accel_boxes_base as u32;
-    words[5] = material_boxes_base as u32;
+    words[3] = bvh_nodes_base as u32;
+    words[4] = material_boxes_base as u32;
     words.reserve(total_words - words.len());
 
-    for (chunk, mask) in chunks {
-        push_i32_word(&mut words, chunk[0]);
-        push_i32_word(&mut words, chunk[1]);
-        push_i32_word(&mut words, chunk[2]);
-        words.push(mask[0]);
-        words.push(mask[1]);
-        words.extend([0, 0, 0]);
+    for node in bvh_nodes {
+        push_i32_word(&mut words, node.lo[0]);
+        push_i32_word(&mut words, node.lo[1]);
+        push_i32_word(&mut words, node.lo[2]);
+        push_i32_word(&mut words, node.hi[0]);
+        push_i32_word(&mut words, node.hi[1]);
+        push_i32_word(&mut words, node.hi[2]);
+        push_i32_word(&mut words, node.left);
+        push_i32_word(&mut words, node.right);
+        words.push(node.first_box);
+        words.push(node.box_count);
+        words.extend([0, 0, 0, 0, 0, 0]);
     }
 
-    for b in SCENE_BOXES {
-        push_i32_word(&mut words, b.lo[0]);
-        push_i32_word(&mut words, b.lo[1]);
-        push_i32_word(&mut words, b.lo[2]);
-        push_i32_word(&mut words, b.hi[0]);
-        push_i32_word(&mut words, b.hi[1]);
-        push_i32_word(&mut words, b.hi[2]);
-        words.extend([0, 0]);
-    }
-
-    for b in SCENE_BOXES {
+    for b in ordered_boxes {
         push_i32_word(&mut words, b.lo[0]);
         push_i32_word(&mut words, b.lo[1]);
         push_i32_word(&mut words, b.lo[2]);
@@ -203,7 +402,7 @@ fn build_scene_words() -> Vec<u32> {
     words
 }
 
-fn create_scene_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+fn create_scene_buffer(device: &wgpu::Device) -> (wgpu::Buffer, bool) {
     let scene_words = build_scene_words();
     let scene_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scene buffer"),
@@ -216,7 +415,58 @@ fn create_scene_buffer(device: &wgpu::Device) -> wgpu::Buffer {
         .get_mapped_range_mut()
         .copy_from_slice(bytemuck::cast_slice(&scene_words));
     scene_buffer.unmap();
-    scene_buffer
+    (scene_buffer, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_bvh_covers_all_scene_boxes() {
+        let scene_boxes = scene_boxes();
+        let (nodes, ordered_boxes, root_ref) = build_box_bvh(&scene_boxes);
+
+        assert_eq!(ordered_boxes.len(), scene_boxes.len());
+        assert_eq!(root_ref, 1);
+        assert!(!nodes.is_empty());
+        assert!(nodes.iter().any(|node| node.box_count > 0));
+
+        for node in &nodes {
+            if node.box_count > 0 {
+                assert_eq!(node.left, 0);
+                assert_eq!(node.right, 0);
+                assert!(node.box_count as usize <= BVH_LEAF_BOXES);
+                assert!((node.first_box + node.box_count) as usize <= ordered_boxes.len());
+            } else {
+                assert!(node.left > 0);
+                assert!(node.right > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn serialized_bvh_scene_layout_is_consistent() {
+        let words = build_scene_words();
+        let bvh_node_count = words[0] as usize;
+        let bvh_root_ref = words[1] as i32;
+        let material_box_count = words[2] as usize;
+        let bvh_nodes_base = words[3] as usize;
+        let material_boxes_base = words[4] as usize;
+
+        assert_eq!(bvh_root_ref, 1);
+        assert_eq!(bvh_nodes_base, SCENE_HEADER_WORDS);
+        assert_eq!(
+            material_boxes_base,
+            bvh_nodes_base + bvh_node_count * SCENE_BVH_NODE_WORDS
+        );
+        assert_eq!(
+            words.len(),
+            material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS
+        );
+        assert!(bvh_node_count > 1);
+        assert_eq!(material_box_count, scene_boxes().len());
+    }
 }
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -239,7 +489,12 @@ fn normalize3(mut v: [f32; 3]) -> [f32; 3] {
     v
 }
 
-fn camera_uniform(time: f32) -> CameraUniform {
+fn camera_uniform(
+    time: f32,
+    sample_count: u32,
+    seed_offset: u32,
+    write_guides: bool,
+) -> CameraUniform {
     let a = CAMERA_ORBIT_ANGLE + time * CAMERA_ORBIT_SPEED;
     let target = [0.0, 2.25, 0.0];
     let ro = [
@@ -259,6 +514,12 @@ fn camera_uniform(time: f32) -> CameraUniform {
         right: [right[0], right[1], right[2], 0.0],
         up: [up[0], up[1], up[2], 0.0],
         forward: [forward[0], forward[1], forward[2], CAMERA_FOCAL_LENGTH],
+        render: [
+            sample_count,
+            seed_offset,
+            if write_guides { RENDER_FLAG_GUIDES } else { 0 },
+            0,
+        ],
     }
 }
 
@@ -308,10 +569,19 @@ struct Renderer {
     config: wgpu::SurfaceConfiguration,
     camera_buffer: wgpu::Buffer,
     _scene_buffer: wgpu::Buffer,
-    compute_bind_group: wgpu::BindGroup,
+    _denoiser_weight_buffer: Option<wgpu::Buffer>,
+    _frame_textures: FrameTextures,
+    trace_bind_group: wgpu::BindGroup,
+    denoise_bind_group: Option<wgpu::BindGroup>,
+    atrous_denoiser: Option<AtrousDenoiser>,
+    display_copy_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
-    compute_pipeline: wgpu::ComputePipeline,
+    trace_pipeline: wgpu::ComputePipeline,
+    denoise_pipeline: Option<wgpu::ComputePipeline>,
+    display_copy_pipeline: wgpu::ComputePipeline,
     blit_pipeline: wgpu::RenderPipeline,
+    denoiser: Option<DenoiserKind>,
+    frame_index: u32,
 }
 
 struct Recorder {
@@ -321,13 +591,678 @@ struct Recorder {
     height: u32,
     camera_buffer: wgpu::Buffer,
     _scene_buffer: wgpu::Buffer,
-    offscreen: wgpu::Texture,
-    compute_bind_group: wgpu::BindGroup,
-    compute_pipeline: wgpu::ComputePipeline,
+    _denoiser_weight_buffer: Option<wgpu::Buffer>,
+    frame_textures: FrameTextures,
+    trace_bind_group: wgpu::BindGroup,
+    denoise_bind_group: Option<wgpu::BindGroup>,
+    atrous_denoiser: Option<AtrousDenoiser>,
+    trace_pipeline: wgpu::ComputePipeline,
+    denoise_pipeline: Option<wgpu::ComputePipeline>,
+    display_copy_bind_group: Option<wgpu::BindGroup>,
+    display_copy_pipeline: Option<wgpu::ComputePipeline>,
+    denoiser: Option<DenoiserKind>,
+}
+
+struct DatasetRecorder {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    width: u32,
+    height: u32,
+    input_camera_buffer: wgpu::Buffer,
+    target_camera_buffer: wgpu::Buffer,
+    _scene_buffer: wgpu::Buffer,
+    input_textures: TraceTextures,
+    target_textures: TraceTextures,
+    input_trace_bind_group: wgpu::BindGroup,
+    target_trace_bind_group: wgpu::BindGroup,
+    input_display_bind_group: wgpu::BindGroup,
+    target_display_bind_group: wgpu::BindGroup,
+    trace_pipeline: wgpu::ComputePipeline,
+    display_copy_pipeline: wgpu::ComputePipeline,
+}
+
+struct TraceTextures {
+    color: wgpu::Texture,
+    normal: wgpu::Texture,
+    albedo: wgpu::Texture,
+    depth: wgpu::Texture,
+    display: wgpu::Texture,
+}
+
+struct FrameTextures {
+    trace: TraceTextures,
+    atrous_a: wgpu::Texture,
+    atrous_b: wgpu::Texture,
+}
+
+struct AtrousDenoiser {
+    pipelines: Vec<wgpu::ComputePipeline>,
+    bind_groups: Vec<wgpu::BindGroup>,
+    display_bind_group: wgpu::BindGroup,
+}
+
+fn create_texture(
+    device: &wgpu::Device,
+    label: &'static str,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
+}
+
+fn create_trace_textures(device: &wgpu::Device, width: u32, height: u32) -> TraceTextures {
+    let float_usage = wgpu::TextureUsages::STORAGE_BINDING
+        | wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC;
+    TraceTextures {
+        color: create_texture(
+            device,
+            "trace color",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            float_usage,
+        ),
+        normal: create_texture(
+            device,
+            "trace normal",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            float_usage,
+        ),
+        albedo: create_texture(
+            device,
+            "trace albedo",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            float_usage,
+        ),
+        depth: create_texture(
+            device,
+            "trace depth",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            float_usage,
+        ),
+        display: create_texture(
+            device,
+            "trace display",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        ),
+    }
+}
+
+fn create_frame_textures(device: &wgpu::Device, width: u32, height: u32) -> FrameTextures {
+    let denoise_usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+    FrameTextures {
+        trace: create_trace_textures(device, width, height),
+        atrous_a: create_texture(
+            device,
+            "atrous denoise a",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            denoise_usage,
+        ),
+        atrous_b: create_texture(
+            device,
+            "atrous denoise b",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            denoise_usage,
+        ),
+    }
+}
+
+fn load_denoiser_weights(kind: DenoiserKind) -> Vec<f32> {
+    let weight_count = kind.weight_count().expect("denoiser kind has weights");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(kind.weight_path().expect("denoiser kind has weights"));
+    let Ok(bytes) = fs::read(&path) else {
+        return vec![0.0; weight_count];
+    };
+    if bytes.len() != weight_count * std::mem::size_of::<f32>() {
+        eprintln!(
+            "ignoring {}, expected {} bytes but found {}",
+            path.display(),
+            weight_count * std::mem::size_of::<f32>(),
+            bytes.len()
+        );
+        return vec![0.0; weight_count];
+    }
+
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn create_denoiser_weight_buffer(device: &wgpu::Device, kind: DenoiserKind) -> wgpu::Buffer {
+    let weights = load_denoiser_weights(kind);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("denoiser weights"),
+        size: (weights.len() * std::mem::size_of::<f32>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: true,
+    });
+    buffer
+        .slice(..)
+        .get_mapped_range_mut()
+        .copy_from_slice(bytemuck::cast_slice(&weights));
+    buffer.unmap();
+    buffer
+}
+
+fn create_trace_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("trace bind group layout"),
+        entries: &[
+            storage_texture_entry(0, wgpu::TextureFormat::Rgba16Float),
+            storage_texture_entry(1, wgpu::TextureFormat::Rgba16Float),
+            storage_texture_entry(2, wgpu::TextureFormat::Rgba16Float),
+            storage_texture_entry(3, wgpu::TextureFormat::Rgba16Float),
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn storage_texture_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn weights_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: 6,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn create_display_copy_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("display copy bind group layout"),
+        entries: &[
+            texture_entry(0),
+            storage_texture_entry(20, wgpu::TextureFormat::Rgba8Unorm),
+        ],
+    })
+}
+
+fn create_denoise_filter_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("denoise filter bind group layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            texture_entry(2),
+            texture_entry(3),
+            weights_entry(),
+            storage_texture_entry(20, wgpu::TextureFormat::Rgba8Unorm),
+        ],
+    })
+}
+
+fn create_atrous_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("atrous denoise bind group layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            texture_entry(2),
+            texture_entry(3),
+            texture_entry(4),
+            storage_texture_entry(21, wgpu::TextureFormat::Rgba16Float),
+        ],
+    })
+}
+
+fn create_atrous_display_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("atrous display bind group layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(2),
+            texture_entry(4),
+            storage_texture_entry(20, wgpu::TextureFormat::Rgba8Unorm),
+        ],
+    })
+}
+
+fn create_blit_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_trace_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    textures: &TraceTextures,
+    camera_buffer: &wgpu::Buffer,
+    scene_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let color_view = textures
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let normal_view = textures
+        .normal
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let albedo_view = textures
+        .albedo
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_view = textures
+        .depth
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("trace bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&normal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&albedo_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: camera_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: scene_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn create_display_copy_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    textures: &TraceTextures,
+) -> wgpu::BindGroup {
+    create_display_copy_from_texture_bind_group(device, layout, &textures.color, &textures.display)
+}
+
+fn create_display_copy_from_texture_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source: &wgpu::Texture,
+    display: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let color_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+    let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("display copy bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&display_view),
+            },
+        ],
+    })
+}
+
+fn create_denoise_filter_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    textures: &FrameTextures,
+    weights: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let color_view = textures
+        .trace
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let normal_view = textures
+        .trace
+        .normal
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let albedo_view = textures
+        .trace
+        .albedo
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_view = textures
+        .trace
+        .depth
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let display_view = textures
+        .trace
+        .display
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("denoise filter bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&normal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&albedo_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: weights.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&display_view),
+            },
+        ],
+    })
+}
+
+fn create_atrous_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source: &wgpu::Texture,
+    textures: &TraceTextures,
+    target: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+    let normal_view = textures
+        .normal
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let albedo_view = textures
+        .albedo
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let depth_view = textures
+        .depth
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let raw_view = textures
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("atrous denoise bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&normal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&albedo_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&raw_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::TextureView(&target_view),
+            },
+        ],
+    })
+}
+
+fn create_atrous_display_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source: &wgpu::Texture,
+    textures: &TraceTextures,
+) -> wgpu::BindGroup {
+    let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+    let albedo_view = textures
+        .albedo
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let raw_view = textures
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let display_view = textures
+        .display
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("atrous display bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&albedo_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&raw_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&display_view),
+            },
+        ],
+    })
+}
+
+fn create_atrous_denoiser(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    atrous_layout: &wgpu::BindGroupLayout,
+    atrous_display_layout: &wgpu::BindGroupLayout,
+    textures: &FrameTextures,
+) -> AtrousDenoiser {
+    let steps = [
+        ("atrous step 1 pipeline", "filter_step_1"),
+        ("atrous step 2 pipeline", "filter_step_2"),
+        ("atrous step 4 pipeline", "filter_step_4"),
+    ];
+    let pipelines = steps
+        .iter()
+        .map(|(label, entry)| create_compute_pipeline(device, label, shader, atrous_layout, entry))
+        .collect::<Vec<_>>();
+    let bind_groups = vec![
+        create_atrous_bind_group(
+            device,
+            atrous_layout,
+            &textures.trace.color,
+            &textures.trace,
+            &textures.atrous_a,
+        ),
+        create_atrous_bind_group(
+            device,
+            atrous_layout,
+            &textures.atrous_a,
+            &textures.trace,
+            &textures.atrous_b,
+        ),
+        create_atrous_bind_group(
+            device,
+            atrous_layout,
+            &textures.atrous_b,
+            &textures.trace,
+            &textures.atrous_a,
+        ),
+    ];
+    let display_bind_group = create_atrous_display_bind_group(
+        device,
+        atrous_display_layout,
+        &textures.atrous_a,
+        &textures.trace,
+    );
+
+    AtrousDenoiser {
+        pipelines,
+        bind_groups,
+        display_bind_group,
+    }
+}
+
+fn create_blit_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    display: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let display_view = display.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("blit sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blit bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&display_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    })
+}
+
+fn create_compute_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    entry_point: &'static str,
+) -> wgpu::ComputePipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pipeline_layout),
+        module: shader,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    })
 }
 
 impl Renderer {
-    fn new(window: Arc<Window>) -> Self {
+    fn new(window: Arc<Window>, denoiser: Option<DenoiserKind>) -> Self {
         let size = window.inner_size();
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = wgpu::Backends::METAL;
@@ -389,82 +1324,43 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let scene_buffer = create_scene_buffer(&device);
+        let (scene_buffer, use_grid) = create_scene_buffer(&device);
 
-        let compute_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("compute bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let blit_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("blit bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        let trace_bind_group_layout = create_trace_bind_group_layout(&device);
+        let denoise_filter_layout = create_denoise_filter_layout(&device);
+        let atrous_layout = create_atrous_layout(&device);
+        let atrous_display_layout = create_atrous_display_layout(&device);
+        let display_copy_layout = create_display_copy_layout(&device);
+        let blit_bind_group_layout = create_blit_bind_group_layout(&device);
 
-        let trace_shader = create_trusted_wgsl_shader_module(&device, "trace shader", TRACE_SHADER);
-        let compute_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("compute pipeline layout"),
-                bind_group_layouts: &[Some(&compute_bind_group_layout)],
-                immediate_size: 0,
-            });
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("trace pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &trace_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let trace_source = trace_shader_source(use_grid);
+        let trace_shader =
+            create_trusted_wgsl_shader_module(&device, "trace shader", &trace_source);
+        let trace_pipeline = create_compute_pipeline(
+            &device,
+            "trace pipeline",
+            &trace_shader,
+            &trace_bind_group_layout,
+            "main",
+        );
+        let denoiser_kind = denoiser.unwrap_or(DenoiserKind::Filter);
+        let denoise_shader = create_trusted_wgsl_shader_module(
+            &device,
+            denoiser_kind.shader_label(),
+            denoiser_kind.shader_source(),
+        );
+        let display_pipeline_layout = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
+            &atrous_display_layout
+        } else {
+            &display_copy_layout
+        };
+        let display_copy_pipeline = create_compute_pipeline(
+            &device,
+            "display copy pipeline",
+            &denoise_shader,
+            display_pipeline_layout,
+            "copy_main",
+        );
 
         let blit_shader = create_trusted_wgsl_shader_module(&device, "blit shader", BLIT_SHADER);
         let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -498,14 +1394,51 @@ impl Renderer {
             cache: None,
         });
 
-        let (compute_bind_group, blit_bind_group) = Self::create_frame_bind_groups(
+        let frame_textures = create_frame_textures(&device, config.width, config.height);
+        let denoiser_weight_buffer = denoiser
+            .filter(|kind| kind.is_single_pass())
+            .map(|kind| create_denoiser_weight_buffer(&device, kind));
+        let trace_bind_group = create_trace_bind_group(
             &device,
+            &trace_bind_group_layout,
+            &frame_textures.trace,
             &camera_buffer,
             &scene_buffer,
-            &compute_bind_group_layout,
+        );
+        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|_| {
+            create_compute_pipeline(
+                &device,
+                "denoise filter pipeline",
+                &denoise_shader,
+                &denoise_filter_layout,
+                "filter_main",
+            )
+        });
+        let denoise_bind_group = denoiser_weight_buffer.as_ref().map(|weights| {
+            create_denoise_filter_bind_group(
+                &device,
+                &denoise_filter_layout,
+                &frame_textures,
+                weights,
+            )
+        });
+        let atrous_denoiser = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
+            Some(create_atrous_denoiser(
+                &device,
+                &denoise_shader,
+                &atrous_layout,
+                &atrous_display_layout,
+                &frame_textures,
+            ))
+        } else {
+            None
+        };
+        let display_copy_bind_group =
+            create_display_copy_bind_group(&device, &display_copy_layout, &frame_textures.trace);
+        let blit_bind_group = create_blit_bind_group(
+            &device,
             &blit_bind_group_layout,
-            config.width,
-            config.height,
+            &frame_textures.trace.display,
         );
 
         Self {
@@ -516,80 +1449,20 @@ impl Renderer {
             config,
             camera_buffer,
             _scene_buffer: scene_buffer,
-            compute_bind_group,
+            _denoiser_weight_buffer: denoiser_weight_buffer,
+            _frame_textures: frame_textures,
+            trace_bind_group,
+            denoise_bind_group,
+            atrous_denoiser,
+            display_copy_bind_group,
             blit_bind_group,
-            compute_pipeline,
+            trace_pipeline,
+            denoise_pipeline,
+            display_copy_pipeline,
             blit_pipeline,
+            denoiser,
+            frame_index: 0,
         }
-    }
-
-    fn create_frame_bind_groups(
-        device: &wgpu::Device,
-        camera_buffer: &wgpu::Buffer,
-        scene_buffer: &wgpu::Buffer,
-        compute_layout: &wgpu::BindGroupLayout,
-        blit_layout: &wgpu::BindGroupLayout,
-        width: u32,
-        height: u32,
-    ) -> (wgpu::BindGroup, wgpu::BindGroup) {
-        let offscreen = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("offscreen image"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("blit sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("compute bind group"),
-            layout: compute_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scene_buffer.as_entire_binding(),
-                },
-            ],
-        });
-        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit bind group"),
-            layout: blit_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        (compute_bind_group, blit_bind_group)
     }
 
     fn render(&mut self, camera: &CameraUniform) {
@@ -618,13 +1491,19 @@ impl Renderer {
                 label: Some("trace pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            pass.set_pipeline(&self.trace_pipeline);
+            pass.set_bind_group(0, &self.trace_bind_group, &[]);
             pass.dispatch_workgroups(
                 self.config.width.div_ceil(TILE_SIZE),
                 self.config.height.div_ceil(TILE_SIZE),
                 1,
             );
+        }
+
+        match self.denoiser {
+            Some(DenoiserKind::Filter | DenoiserKind::Cnn) => self.dispatch_denoiser(&mut encoder),
+            Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(&mut encoder),
+            None => self.dispatch_display_copy(&mut encoder),
         }
 
         {
@@ -651,11 +1530,78 @@ impl Renderer {
 
         self.queue.submit([encoder.finish()]);
         frame.present();
+        self.frame_index = self.frame_index.wrapping_add(1);
+    }
+
+    fn dispatch_denoiser(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("denoise pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(self.denoise_pipeline.as_ref().expect("denoise pipeline"));
+        pass.set_bind_group(
+            0,
+            self.denoise_bind_group
+                .as_ref()
+                .expect("denoise bind group"),
+            &[],
+        );
+        pass.dispatch_workgroups(
+            self.config.width.div_ceil(TILE_SIZE),
+            self.config.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+
+    fn dispatch_atrous_denoiser(&self, encoder: &mut wgpu::CommandEncoder) {
+        let atrous = self.atrous_denoiser.as_ref().expect("atrous denoiser");
+        for (pipeline, bind_group) in atrous.pipelines.iter().zip(atrous.bind_groups.iter()) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("atrous denoise pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.config.width.div_ceil(TILE_SIZE),
+                self.config.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("atrous display copy pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.display_copy_pipeline);
+        pass.set_bind_group(0, &atrous.display_bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.config.width.div_ceil(TILE_SIZE),
+            self.config.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+
+    fn dispatch_display_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("display copy pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.display_copy_pipeline);
+        pass.set_bind_group(0, &self.display_copy_bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.config.width.div_ceil(TILE_SIZE),
+            self.config.height.div_ceil(TILE_SIZE),
+            1,
+        );
     }
 }
 
 impl Recorder {
-    fn new(width: u32, height: u32) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        width: u32,
+        height: u32,
+        denoiser: Option<DenoiserKind>,
+    ) -> Result<Self, Box<dyn Error>> {
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = wgpu::Backends::METAL;
         let instance = wgpu::Instance::new(instance_descriptor);
@@ -681,95 +1627,97 @@ impl Recorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let scene_buffer = create_scene_buffer(&device);
+        let (scene_buffer, use_grid) = create_scene_buffer(&device);
 
-        let compute_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("record compute bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+        let trace_layout = create_trace_bind_group_layout(&device);
+        let denoise_filter_layout = create_denoise_filter_layout(&device);
+        let atrous_layout = create_atrous_layout(&device);
+        let atrous_display_layout = create_atrous_display_layout(&device);
+        let display_copy_layout = create_display_copy_layout(&device);
+        let denoiser_shader_kind = denoiser.unwrap_or(DenoiserKind::Filter);
 
+        let trace_source = trace_shader_source(use_grid);
         let trace_shader =
-            create_trusted_wgsl_shader_module(&device, "record trace shader", TRACE_SHADER);
-        let compute_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("record compute pipeline layout"),
-                bind_group_layouts: &[Some(&compute_bind_group_layout)],
-                immediate_size: 0,
-            });
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("record trace pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &trace_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+            create_trusted_wgsl_shader_module(&device, "record trace shader", &trace_source);
+        let trace_pipeline = create_compute_pipeline(
+            &device,
+            "record trace pipeline",
+            &trace_shader,
+            &trace_layout,
+            "main",
+        );
+        let denoise_shader = create_trusted_wgsl_shader_module(
+            &device,
+            "record denoise shader",
+            denoiser_shader_kind.shader_source(),
+        );
+        let frame_textures = create_frame_textures(&device, width, height);
+        let denoiser_weight_buffer = denoiser
+            .filter(|kind| kind.is_single_pass())
+            .map(|kind| create_denoiser_weight_buffer(&device, kind));
+        let trace_bind_group = create_trace_bind_group(
+            &device,
+            &trace_layout,
+            &frame_textures.trace,
+            &camera_buffer,
+            &scene_buffer,
+        );
+        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|_| {
+            create_compute_pipeline(
+                &device,
+                "record denoise filter pipeline",
+                &denoise_shader,
+                &denoise_filter_layout,
+                "filter_main",
+            )
         });
-
-        let offscreen = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("record offscreen image"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+        let display_copy_pipeline = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
+            Some(create_compute_pipeline(
+                &device,
+                "record atrous display copy pipeline",
+                &denoise_shader,
+                &atrous_display_layout,
+                "copy_main",
+            ))
+        } else if denoiser.is_none() {
+            Some(create_compute_pipeline(
+                &device,
+                "record display copy pipeline",
+                &denoise_shader,
+                &display_copy_layout,
+                "copy_main",
+            ))
+        } else {
+            None
+        };
+        let denoise_bind_group = denoiser_weight_buffer.as_ref().map(|weights| {
+            create_denoise_filter_bind_group(
+                &device,
+                &denoise_filter_layout,
+                &frame_textures,
+                weights,
+            )
         });
-        let offscreen_view = offscreen.create_view(&wgpu::TextureViewDescriptor::default());
-        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("record compute bind group"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&offscreen_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scene_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let display_copy_bind_group = if denoiser.is_none() {
+            Some(create_display_copy_bind_group(
+                &device,
+                &display_copy_layout,
+                &frame_textures.trace,
+            ))
+        } else {
+            None
+        };
+        let atrous_denoiser = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
+            Some(create_atrous_denoiser(
+                &device,
+                &denoise_shader,
+                &atrous_layout,
+                &atrous_display_layout,
+                &frame_textures,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             device,
@@ -778,25 +1726,20 @@ impl Recorder {
             height,
             camera_buffer,
             _scene_buffer: scene_buffer,
-            offscreen,
-            compute_bind_group,
-            compute_pipeline,
+            _denoiser_weight_buffer: denoiser_weight_buffer,
+            frame_textures,
+            trace_bind_group,
+            denoise_bind_group,
+            atrous_denoiser,
+            trace_pipeline,
+            denoise_pipeline,
+            display_copy_bind_group,
+            display_copy_pipeline,
+            denoiser,
         })
     }
 
     fn capture_frame(&self, camera: &CameraUniform) -> Result<Vec<u8>, Box<dyn Error>> {
-        let bytes_per_pixel = 4;
-        let unpadded_bytes_per_row = self.width * bytes_per_pixel;
-        let padded_bytes_per_row =
-            align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let output_buffer_size = u64::from(padded_bytes_per_row) * u64::from(self.height);
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("record readback"),
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
 
@@ -805,79 +1748,395 @@ impl Recorder {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("record frame encoder"),
             });
+        self.encode_frame(&mut encoder);
+        let pixels = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.frame_textures.trace.display,
+            self.width,
+            self.height,
+            4,
+            "record readback",
+        )?;
+        self.queue.submit([encoder.finish()]);
+        map_readback(&self.device, pixels)
+    }
+
+    fn submit_frame(&self, camera: &CameraUniform) -> Result<(), Box<dyn Error>> {
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bench frame encoder"),
+            });
+        self.encode_frame(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        Ok(())
+    }
+
+    fn encode_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("record trace pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            pass.set_pipeline(&self.trace_pipeline);
+            pass.set_bind_group(0, &self.trace_bind_group, &[]);
             pass.dispatch_workgroups(
                 self.width.div_ceil(TILE_SIZE),
                 self.height.div_ceil(TILE_SIZE),
                 1,
             );
         }
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.offscreen,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
+        match self.denoiser {
+            Some(DenoiserKind::Filter | DenoiserKind::Cnn) => self.dispatch_denoiser(encoder),
+            Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
+            None => self.dispatch_display_copy(encoder),
+        }
+    }
+
+    fn dispatch_denoiser(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("record denoise pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(
+            self.denoise_pipeline
+                .as_ref()
+                .expect("record denoise pipeline"),
         );
+        pass.set_bind_group(
+            0,
+            self.denoise_bind_group
+                .as_ref()
+                .expect("record denoise bind group"),
+            &[],
+        );
+        pass.dispatch_workgroups(
+            self.width.div_ceil(TILE_SIZE),
+            self.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+
+    fn dispatch_atrous_denoiser(&self, encoder: &mut wgpu::CommandEncoder) {
+        let atrous = self
+            .atrous_denoiser
+            .as_ref()
+            .expect("record atrous denoiser");
+        for (pipeline, bind_group) in atrous.pipelines.iter().zip(atrous.bind_groups.iter()) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("record atrous denoise pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("record atrous display copy pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(
+            self.display_copy_pipeline
+                .as_ref()
+                .expect("record atrous display copy pipeline"),
+        );
+        pass.set_bind_group(0, &atrous.display_bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.width.div_ceil(TILE_SIZE),
+            self.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+
+    fn dispatch_display_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("record display copy pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(
+            self.display_copy_pipeline
+                .as_ref()
+                .expect("record display copy pipeline"),
+        );
+        pass.set_bind_group(
+            0,
+            self.display_copy_bind_group
+                .as_ref()
+                .expect("record display copy bind group"),
+            &[],
+        );
+        pass.dispatch_workgroups(
+            self.width.div_ceil(TILE_SIZE),
+            self.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+}
+
+struct DatasetFrame {
+    input_color: Vec<u8>,
+    input_normal: Vec<u8>,
+    input_albedo: Vec<u8>,
+    input_depth: Vec<u8>,
+    target_color: Vec<u8>,
+    debug_input: Vec<u8>,
+    debug_target: Vec<u8>,
+}
+
+impl DatasetRecorder {
+    fn new(width: u32, height: u32) -> Result<Self, Box<dyn Error>> {
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = wgpu::Backends::METAL;
+        let instance = wgpu::Instance::new(instance_descriptor);
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "request Metal adapter"))?;
+
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("dataset device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            }))?;
+
+        let input_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dataset input camera uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let target_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dataset target camera uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (scene_buffer, use_grid) = create_scene_buffer(&device);
+        let trace_layout = create_trace_bind_group_layout(&device);
+        let display_copy_layout = create_display_copy_layout(&device);
+        let trace_source = trace_shader_source(use_grid);
+        let trace_shader =
+            create_trusted_wgsl_shader_module(&device, "dataset trace shader", &trace_source);
+        let denoise_shader =
+            create_trusted_wgsl_shader_module(&device, "dataset display shader", DENOISE_SHADER);
+        let trace_pipeline = create_compute_pipeline(
+            &device,
+            "dataset trace pipeline",
+            &trace_shader,
+            &trace_layout,
+            "main",
+        );
+        let display_copy_pipeline = create_compute_pipeline(
+            &device,
+            "dataset display copy pipeline",
+            &denoise_shader,
+            &display_copy_layout,
+            "copy_main",
+        );
+        let input_textures = create_trace_textures(&device, width, height);
+        let target_textures = create_trace_textures(&device, width, height);
+        let input_trace_bind_group = create_trace_bind_group(
+            &device,
+            &trace_layout,
+            &input_textures,
+            &input_camera_buffer,
+            &scene_buffer,
+        );
+        let target_trace_bind_group = create_trace_bind_group(
+            &device,
+            &trace_layout,
+            &target_textures,
+            &target_camera_buffer,
+            &scene_buffer,
+        );
+        let input_display_bind_group =
+            create_display_copy_bind_group(&device, &display_copy_layout, &input_textures);
+        let target_display_bind_group =
+            create_display_copy_bind_group(&device, &display_copy_layout, &target_textures);
+
+        Ok(Self {
+            device,
+            queue,
+            width,
+            height,
+            input_camera_buffer,
+            target_camera_buffer,
+            _scene_buffer: scene_buffer,
+            input_textures,
+            target_textures,
+            input_trace_bind_group,
+            target_trace_bind_group,
+            input_display_bind_group,
+            target_display_bind_group,
+            trace_pipeline,
+            display_copy_pipeline,
+        })
+    }
+
+    fn capture_pair(
+        &self,
+        input_camera: &CameraUniform,
+        target_camera: &CameraUniform,
+    ) -> Result<DatasetFrame, Box<dyn Error>> {
+        self.queue.write_buffer(
+            &self.input_camera_buffer,
+            0,
+            bytemuck::bytes_of(input_camera),
+        );
+        self.queue.write_buffer(
+            &self.target_camera_buffer,
+            0,
+            bytemuck::bytes_of(target_camera),
+        );
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dataset encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dataset trace pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.trace_pipeline);
+            pass.set_bind_group(0, &self.input_trace_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+            pass.set_bind_group(0, &self.target_trace_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dataset display copy pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.display_copy_pipeline);
+            pass.set_bind_group(0, &self.input_display_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+            pass.set_bind_group(0, &self.target_display_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.width.div_ceil(TILE_SIZE),
+                self.height.div_ceil(TILE_SIZE),
+                1,
+            );
+        }
+
+        let input_color = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.input_textures.color,
+            self.width,
+            self.height,
+            8,
+            "dataset input color readback",
+        )?;
+        let input_normal = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.input_textures.normal,
+            self.width,
+            self.height,
+            8,
+            "dataset input normal readback",
+        )?;
+        let input_albedo = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.input_textures.albedo,
+            self.width,
+            self.height,
+            8,
+            "dataset input albedo readback",
+        )?;
+        let input_depth = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.input_textures.depth,
+            self.width,
+            self.height,
+            8,
+            "dataset input depth readback",
+        )?;
+        let target_color = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.target_textures.color,
+            self.width,
+            self.height,
+            8,
+            "dataset target color readback",
+        )?;
+        let debug_input = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.input_textures.display,
+            self.width,
+            self.height,
+            4,
+            "dataset input debug readback",
+        )?;
+        let debug_target = copy_texture_to_vec(
+            &self.device,
+            &mut encoder,
+            &self.target_textures.display,
+            self.width,
+            self.height,
+            4,
+            "dataset target debug readback",
+        )?;
         self.queue.submit([encoder.finish()]);
 
-        let slice = readback.slice(..);
-        let (sender, receiver) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        receiver
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "readback callback dropped"))?
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-
-        let mapped = slice.get_mapped_range();
-        let mut pixels = vec![0u8; (self.width * self.height * bytes_per_pixel) as usize];
-        for y in 0..self.height as usize {
-            let src_offset = y * padded_bytes_per_row as usize;
-            let dst_offset = y * unpadded_bytes_per_row as usize;
-            let src = &mapped[src_offset..src_offset + unpadded_bytes_per_row as usize];
-            let dst = &mut pixels[dst_offset..dst_offset + unpadded_bytes_per_row as usize];
-            dst.copy_from_slice(src);
-        }
-        drop(mapped);
-        readback.unmap();
-
-        Ok(pixels)
+        Ok(DatasetFrame {
+            input_color: map_readback(&self.device, input_color)?,
+            input_normal: map_readback(&self.device, input_normal)?,
+            input_albedo: map_readback(&self.device, input_albedo)?,
+            input_depth: map_readback(&self.device, input_depth)?,
+            target_color: map_readback(&self.device, target_color)?,
+            debug_input: map_readback(&self.device, debug_input)?,
+            debug_target: map_readback(&self.device, debug_target)?,
+        })
     }
 }
 
 struct App {
     renderer: Option<Renderer>,
     stats: FrameStats,
+    denoiser: Option<DenoiserKind>,
+    sample_count_override: Option<u32>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(denoiser: Option<DenoiserKind>, sample_count_override: Option<u32>) -> Self {
         Self {
             renderer: None,
             stats: FrameStats::new(),
+            denoiser,
+            sample_count_override,
         }
     }
 }
@@ -895,7 +2154,7 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         center_window(&window);
-        let renderer = Renderer::new(Arc::clone(&window));
+        let renderer = Renderer::new(Arc::clone(&window), self.denoiser);
         window.request_redraw();
 
         self.renderer = Some(renderer);
@@ -919,7 +2178,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let time = self.stats.tick();
-                let camera = camera_uniform(time);
+                let seed_offset = renderer.frame_index;
+                let sample_count = self.sample_count_override.unwrap_or_else(|| {
+                    renderer
+                        .denoiser
+                        .map(DenoiserKind::runtime_spp)
+                        .unwrap_or(RUNTIME_SPP)
+                });
+                let camera =
+                    camera_uniform(time, sample_count, seed_offset, renderer.denoiser.is_some());
                 renderer.render(&camera);
             }
             _ => {}
@@ -977,6 +2244,92 @@ fn align_to(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
 
+struct PendingReadback {
+    buffer: wgpu::Buffer,
+    padded_bytes_per_row: u32,
+    unpadded_bytes_per_row: u32,
+    height: u32,
+}
+
+fn copy_texture_to_vec(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u32,
+    label: &'static str,
+) -> Result<PendingReadback, Box<dyn Error>> {
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let padded_bytes_per_row = align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let output_buffer_size = u64::from(padded_bytes_per_row) * u64::from(height);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: output_buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    Ok(PendingReadback {
+        buffer,
+        padded_bytes_per_row,
+        unpadded_bytes_per_row,
+        height,
+    })
+}
+
+fn map_readback(
+    device: &wgpu::Device,
+    pending: PendingReadback,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let slice = pending.buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    receiver
+        .recv()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "readback callback dropped"))?
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+    let mapped = slice.get_mapped_range();
+    let mut pixels = vec![0u8; (pending.unpadded_bytes_per_row * pending.height) as usize];
+    for y in 0..pending.height as usize {
+        let src_offset = y * pending.padded_bytes_per_row as usize;
+        let dst_offset = y * pending.unpadded_bytes_per_row as usize;
+        let src = &mapped[src_offset..src_offset + pending.unpadded_bytes_per_row as usize];
+        let dst = &mut pixels[dst_offset..dst_offset + pending.unpadded_bytes_per_row as usize];
+        dst.copy_from_slice(src);
+    }
+    drop(mapped);
+    pending.buffer.unmap();
+
+    Ok(pixels)
+}
+
 fn write_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), Box<dyn Error>> {
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
@@ -987,19 +2340,35 @@ fn write_png(path: &Path, width: u32, height: u32, pixels: &[u8]) -> Result<(), 
     Ok(())
 }
 
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
 fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
     let output_dir = args
         .first()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("renders/shot01"));
     let frame_count = parse_frame_count(args)?;
+    let denoiser = parse_optional_denoiser_kind(args);
+    let default_spp = denoiser
+        .map(DenoiserKind::runtime_spp)
+        .unwrap_or(RUNTIME_SPP);
+    let sample_count = parse_sample_count(args, default_spp)?;
 
     fs::create_dir_all(&output_dir)?;
-    let recorder = Recorder::new(WIDTH, HEIGHT)?;
+    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        let pixels = recorder.capture_frame(&camera_uniform(time))?;
+        let pixels = recorder.capture_frame(&camera_uniform(
+            time,
+            sample_count,
+            frame_index,
+            denoiser.is_some(),
+        ))?;
         let path = output_dir.join(format!("frame_{frame_index:06}.png"));
         write_png(&path, WIDTH, HEIGHT, &pixels)?;
 
@@ -1014,6 +2383,165 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     run_remux(&output_dir)?;
+    Ok(())
+}
+
+fn run_dataset(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let output_dir = args
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("renders/denoiser_dataset"));
+    let frame_count = parse_frame_count(args)?;
+
+    fs::create_dir_all(&output_dir)?;
+    let meta = format!(
+        "{{\n  \"width\": {WIDTH},\n  \"height\": {HEIGHT},\n  \"input_spp\": {DATASET_INPUT_SPP},\n  \"target_spp\": {DATASET_TARGET_SPP},\n  \"frames\": {frame_count},\n  \"format\": \"rgba16float little-endian raw files plus rgba8 debug pngs\",\n  \"channels\": [\"input_color\", \"input_normal\", \"input_albedo\", \"input_depth\", \"target_color\"]\n}}\n"
+    );
+    write_bytes(&output_dir.join("dataset_meta.json"), meta.as_bytes())?;
+
+    let recorder = DatasetRecorder::new(WIDTH, HEIGHT)?;
+    for frame_index in 0..frame_count {
+        let time = frame_index as f32 / RECORD_FPS as f32;
+        let input_camera = camera_uniform(time, DATASET_INPUT_SPP, frame_index, true);
+        let target_camera = camera_uniform(time, DATASET_TARGET_SPP, frame_index, true);
+        let frame = recorder.capture_pair(&input_camera, &target_camera)?;
+
+        write_bytes(
+            &output_dir.join(format!("input_color_{frame_index:06}.rgba16f")),
+            &frame.input_color,
+        )?;
+        write_bytes(
+            &output_dir.join(format!("input_normal_{frame_index:06}.rgba16f")),
+            &frame.input_normal,
+        )?;
+        write_bytes(
+            &output_dir.join(format!("input_albedo_{frame_index:06}.rgba16f")),
+            &frame.input_albedo,
+        )?;
+        write_bytes(
+            &output_dir.join(format!("input_depth_{frame_index:06}.rgba16f")),
+            &frame.input_depth,
+        )?;
+        write_bytes(
+            &output_dir.join(format!("target_color_{frame_index:06}.rgba16f")),
+            &frame.target_color,
+        )?;
+        write_png(
+            &output_dir.join(format!("debug_input_{frame_index:06}.png")),
+            WIDTH,
+            HEIGHT,
+            &frame.debug_input,
+        )?;
+        write_png(
+            &output_dir.join(format!("debug_target_{frame_index:06}.png")),
+            WIDTH,
+            HEIGHT,
+            &frame.debug_target,
+        )?;
+
+        if frame_index % RECORD_FPS == 0 || frame_index + 1 == frame_count {
+            println!(
+                "captured {}/{} training pairs to {}",
+                frame_index + 1,
+                frame_count,
+                output_dir.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_arg_u32(args: &[String], name: &str, default: u32) -> Result<u32, Box<dyn Error>> {
+    let Some(index) = args.iter().position(|arg| arg == name) else {
+        return Ok(default);
+    };
+    let value = args.get(index + 1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} requires a value"),
+        )
+    })?;
+    let parsed = value.parse::<u32>()?;
+    if parsed == 0 {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be > 0")).into(),
+        );
+    }
+    Ok(parsed)
+}
+
+fn parse_sample_count(args: &[String], default: u32) -> Result<u32, Box<dyn Error>> {
+    parse_arg_u32(args, "--spp", default)
+}
+
+fn parse_sample_count_override(args: &[String]) -> Result<Option<u32>, Box<dyn Error>> {
+    if args.iter().any(|arg| arg == "--spp") {
+        Ok(Some(parse_arg_u32(args, "--spp", RUNTIME_SPP)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn parse_denoiser_kind(args: &[String]) -> DenoiserKind {
+    if args.iter().any(|arg| arg == "--atrous-denoise") {
+        DenoiserKind::Atrous
+    } else if args.iter().any(|arg| arg == "--filter-denoise") {
+        DenoiserKind::Filter
+    } else if args.iter().any(|arg| arg == "--cnn-denoise") {
+        DenoiserKind::Cnn
+    } else {
+        DenoiserKind::Cnn
+    }
+}
+
+fn parse_optional_denoiser_kind(args: &[String]) -> Option<DenoiserKind> {
+    if args.iter().any(|arg| arg == "--no-denoise") {
+        None
+    } else {
+        Some(parse_denoiser_kind(args))
+    }
+}
+
+fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let frames = parse_arg_u32(args, "--frames", 120)?;
+    let warmup = parse_arg_u32(args, "--warmup", 10)?;
+    let denoiser = parse_optional_denoiser_kind(args);
+    let default_spp = denoiser
+        .map(DenoiserKind::runtime_spp)
+        .unwrap_or(RUNTIME_SPP);
+    let sample_count = parse_sample_count(args, default_spp)?;
+    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
+
+    for frame_index in 0..warmup {
+        let time = frame_index as f32 / RECORD_FPS as f32;
+        recorder.submit_frame(&camera_uniform(
+            time,
+            sample_count,
+            frame_index,
+            denoiser.is_some(),
+        ))?;
+    }
+
+    let start = Instant::now();
+    for frame_index in 0..frames {
+        let time = (warmup + frame_index) as f32 / RECORD_FPS as f32;
+        recorder.submit_frame(&camera_uniform(
+            time,
+            sample_count,
+            warmup + frame_index,
+            denoiser.is_some(),
+        ))?;
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    let ms = seconds * 1000.0 / f64::from(frames);
+    println!(
+        "bench frames={} warmup={} avg_ms={:.3} fps={:.1}",
+        frames,
+        warmup,
+        ms,
+        1000.0 / ms
+    );
     Ok(())
 }
 
@@ -1082,6 +2610,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("record-x") | Some("--record-x") => return run_record_x(&args[1..]),
+        Some("dataset") => return run_dataset(&args[1..]),
+        Some("bench") => return run_bench(&args[1..]),
         Some("remux") => {
             let output_dir = args
                 .get(1)
@@ -1092,10 +2622,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("--help") | Some("-h") => {
             println!("usage:");
             println!("  realtimerays");
-            println!("  realtimerays record-x [output-dir] [--frames N]");
+            println!("  realtimerays --no-denoise");
+            println!("  realtimerays --cnn-denoise");
+            println!("  realtimerays --filter-denoise");
+            println!("  realtimerays --atrous-denoise");
+            println!("  realtimerays --spp N");
+            println!(
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+            );
+            println!("  realtimerays dataset [output-dir] [--frames N]");
+            println!(
+                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+            );
             println!("  realtimerays remux [output-dir]");
             return Ok(());
         }
+        Some("--no-denoise") => {}
+        Some("--cnn-denoise") => {}
+        Some("--filter-denoise") => {}
+        Some("--atrous-denoise") => {}
+        Some("--spp") => {}
         Some(other) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1109,7 +2655,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new();
+    let denoiser = if args.iter().any(|arg| arg == "--no-denoise") {
+        None
+    } else if args.iter().any(|arg| arg == "--atrous-denoise") {
+        Some(DenoiserKind::Atrous)
+    } else if args.iter().any(|arg| arg == "--filter-denoise") {
+        Some(DenoiserKind::Filter)
+    } else if args.iter().any(|arg| arg == "--cnn-denoise") {
+        Some(DenoiserKind::Cnn)
+    } else {
+        Some(DenoiserKind::Cnn)
+    };
+    let sample_count_override = parse_sample_count_override(&args)?;
+    let mut app = App::new(denoiser, sample_count_override);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

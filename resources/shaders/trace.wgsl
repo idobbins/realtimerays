@@ -3,18 +3,21 @@ struct CameraUniform {
     camera_right: vec4<f32>,
     camera_up: vec4<f32>,
     camera_forward: vec4<f32>,
+    render: vec4<u32>,
 }
 
 struct SceneBuffer {
     words: array<u32>,
 }
 
-@group(0) @binding(0) var out_image: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(1) var<uniform> pc: CameraUniform;
-@group(0) @binding(2) var<storage, read> scene: SceneBuffer;
+@group(0) @binding(0) var color_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(1) var normal_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var albedo_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var depth_image: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var<uniform> pc: CameraUniform;
+@group(0) @binding(5) var<storage, read> scene: SceneBuffer;
 
-const MAX_BOUNCES: i32 = 3;
-const SAMPLES_PER_PIXEL: i32 = 2;
+const MAX_BOUNCES: i32 = 2;
 const SURFACE_EPSILON: f32 = 0.001;
 const MAX_RAY_DISTANCE: f32 = 80.0;
 const AXIS_NEVER: f32 = 1.0e20;
@@ -22,19 +25,22 @@ const PI: f32 = 3.14159265359;
 
 const MAT_EMPTY: u32 = 0u;
 const MAT_FLOOR: u32 = 1u;
-const MAT_RED: u32 = 2u;
-const MAT_GREEN: u32 = 3u;
-const MAT_BLUE: u32 = 4u;
-const MAT_LIGHT: u32 = 5u;
+const MAT_GRASS: u32 = 2u;
+const MAT_LEAF: u32 = 3u;
+const MAT_WOOD: u32 = 4u;
+const MAT_ROCK: u32 = 5u;
+const MAT_SNOW: u32 = 6u;
+const MAT_LIGHT: u32 = 7u;
+const MAT_WATER: u32 = 8u;
 
-const LIGHT_LO: vec3<i32> = vec3<i32>(-3, 8, 1);
-const LIGHT_HI: vec3<i32> = vec3<i32>(2, 9, 5);
-const LIGHT_AREA: f32 = 20.0;
+const LIGHT_LO: vec3<i32> = vec3<i32>(-7, 16, -7);
+const LIGHT_HI: vec3<i32> = vec3<i32>(8, 17, 8);
+const LIGHT_AREA: f32 = 225.0;
 
-const CHUNK_SIZE: i32 = 4;
-const SCENE_CHUNK_WORDS: u32 = 8u;
-const SCENE_ACCEL_BOX_WORDS: u32 = 8u;
+const SCENE_BVH_NODE_WORDS: u32 = 16u;
 const SCENE_MATERIAL_BOX_WORDS: u32 = 8u;
+const BVH_STACK_SIZE: i32 = 64;
+const RENDER_FLAG_GUIDES: u32 = 1u;
 
 struct Hit {
     t: f32,
@@ -42,10 +48,10 @@ struct Hit {
     mat: u32,
 }
 
-struct VoxelHit {
-    t: f32,
-    n: vec3<f32>,
-    voxel: vec3<i32>,
+struct AabbHit {
+    t0: f32,
+    t1: f32,
+    n0: vec3<f32>,
 }
 
 struct Camera {
@@ -55,40 +61,38 @@ struct Camera {
     forward: vec3<f32>,
 }
 
+struct Guides {
+    normal: vec3<f32>,
+    albedo: vec3<f32>,
+    depth: f32,
+}
+
 fn scene_i32(index: u32) -> i32 {
     return bitcast<i32>(scene.words[index]);
 }
 
-fn chunk_count() -> u32 {
+fn bvh_node_count() -> u32 {
     return scene.words[0u];
 }
 
-fn accel_box_count() -> u32 {
-    return scene.words[1u];
+fn bvh_root_ref() -> i32 {
+    return scene_i32(1u);
 }
 
 fn material_box_count() -> u32 {
     return scene.words[2u];
 }
 
-fn chunks_base() -> u32 {
+fn bvh_nodes_base() -> u32 {
     return scene.words[3u];
 }
 
-fn accel_boxes_base() -> u32 {
+fn material_boxes_base() -> u32 {
     return scene.words[4u];
 }
 
-fn material_boxes_base() -> u32 {
-    return scene.words[5u];
-}
-
-fn chunk_entry_base(id: u32) -> u32 {
-    return chunks_base() + id * SCENE_CHUNK_WORDS;
-}
-
-fn accel_box_base(id: u32) -> u32 {
-    return accel_boxes_base() + id * SCENE_ACCEL_BOX_WORDS;
+fn bvh_node_base(id: u32) -> u32 {
+    return bvh_nodes_base() + id * SCENE_BVH_NODE_WORDS;
 }
 
 fn material_box_base(id: u32) -> u32 {
@@ -115,29 +119,39 @@ fn seed(px: vec2<i32>, sample_index: i32) -> u32 {
         (u32(px.x) * 1973u) ^
         (u32(px.y) * 9277u) ^
         (u32(sample_index) * 26699u) ^
+        (pc.render.y * 374761393u) ^
         (bitcast<u32>(pc.camera_ro_time.w) * 747796405u)
     );
 }
 
 fn albedo(m: u32) -> vec3<f32> {
-    if m == MAT_RED {
-        return vec3<f32>(0.8, 0.2, 0.2);
+    if m == MAT_GRASS {
+        return vec3<f32>(0.32, 0.55, 0.22);
     }
-    if m == MAT_GREEN {
-        return vec3<f32>(0.2, 0.8, 0.2);
+    if m == MAT_LEAF {
+        return vec3<f32>(0.10, 0.42, 0.16);
     }
-    if m == MAT_BLUE {
-        return vec3<f32>(0.2, 0.4, 0.9);
+    if m == MAT_WOOD {
+        return vec3<f32>(0.42, 0.24, 0.10);
+    }
+    if m == MAT_ROCK {
+        return vec3<f32>(0.42, 0.43, 0.40);
+    }
+    if m == MAT_SNOW {
+        return vec3<f32>(0.86, 0.90, 0.92);
+    }
+    if m == MAT_WATER {
+        return vec3<f32>(0.12, 0.35, 0.70);
     }
     if m == MAT_FLOOR {
-        return vec3<f32>(0.8);
+        return vec3<f32>(0.58, 0.62, 0.52);
     }
     return vec3<f32>(0.0);
 }
 
 fn emission(m: u32) -> vec3<f32> {
     if m == MAT_LIGHT {
-        return vec3<f32>(8.0, 7.0, 6.0);
+        return vec3<f32>(5.0, 4.7, 4.1);
     }
     return vec3<f32>(0.0);
 }
@@ -149,86 +163,14 @@ fn safe_inv(x: f32) -> f32 {
     return 1.0 / x;
 }
 
-fn floor_div_4(v: i32) -> i32 {
-    if v >= 0 {
-        return v / CHUNK_SIZE;
-    }
-    return -((-v + CHUNK_SIZE - 1) / CHUNK_SIZE);
-}
-
-fn in_box(v: vec3<i32>, lo: vec3<i32>, hi: vec3<i32>) -> bool {
-    return all(v >= lo) && all(v < hi);
-}
-
-fn mask_test(mask: vec2<u32>, local_voxel: vec3<i32>) -> bool {
-    let bit = u32(local_voxel.x + local_voxel.y * CHUNK_SIZE + local_voxel.z * CHUNK_SIZE * CHUNK_SIZE);
-    if bit < 32u {
-        return (mask.x & (1u << bit)) != 0u;
-    }
-    return (mask.y & (1u << (bit - 32u))) != 0u;
-}
-
-fn voxel_occupied(v: vec3<i32>) -> bool {
-    let chunk = vec3<i32>(floor_div_4(v.x), floor_div_4(v.y), floor_div_4(v.z));
-    let local_voxel = v - chunk * CHUNK_SIZE;
-    let count = chunk_count();
-
-    for (var i = 0u; i < count; i = i + 1u) {
-        let base = chunk_entry_base(i);
-        let chunk_coord = vec3<i32>(
-            scene_i32(base + 0u),
-            scene_i32(base + 1u),
-            scene_i32(base + 2u),
-        );
-        if all(chunk == chunk_coord) {
-            return mask_test(vec2<u32>(scene.words[base + 3u], scene.words[base + 4u]), local_voxel);
-        }
-    }
-
-    return false;
-}
-
-fn material_at_voxel(v: vec3<i32>) -> u32 {
-    let count = material_box_count();
-    for (var i = 0u; i < count; i = i + 1u) {
-        let base = material_box_base(i);
-        let lo = vec3<i32>(
-            scene_i32(base + 0u),
-            scene_i32(base + 1u),
-            scene_i32(base + 2u),
-        );
-        let hi = vec3<i32>(
-            scene_i32(base + 3u),
-            scene_i32(base + 4u),
-            scene_i32(base + 5u),
-        );
-        if in_box(v, lo, hi) {
-            return scene.words[base + 6u];
-        }
-    }
-    return MAT_EMPTY;
-}
-
-fn trace_accel_box(
+fn trace_aabb(
     ro: vec3<f32>,
     rd: vec3<f32>,
-    id: u32,
+    lo: vec3<f32>,
+    hi: vec3<f32>,
     max_distance: f32,
-    out_hit: ptr<function, VoxelHit>,
+    out_hit: ptr<function, AabbHit>,
 ) -> bool {
-    let base = accel_box_base(id);
-    let lo_i = vec3<i32>(
-        scene_i32(base + 0u),
-        scene_i32(base + 1u),
-        scene_i32(base + 2u),
-    );
-    let hi_i = vec3<i32>(
-        scene_i32(base + 3u),
-        scene_i32(base + 4u),
-        scene_i32(base + 5u),
-    );
-    let lo = vec3<f32>(lo_i);
-    let hi = vec3<f32>(hi_i);
     let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
     let a = (lo - ro) * inv;
@@ -250,66 +192,152 @@ fn trace_accel_box(
         near_normal = vec3<f32>(0.0, 0.0, select(1.0, -1.0, rd.z > 0.0));
     }
 
-    var far_normal: vec3<f32>;
-    if t1 == far_t.x {
-        far_normal = vec3<f32>(select(-1.0, 1.0, rd.x > 0.0), 0.0, 0.0);
-    } else if t1 == far_t.y {
-        far_normal = vec3<f32>(0.0, select(-1.0, 1.0, rd.y > 0.0), 0.0);
-    } else {
-        far_normal = vec3<f32>(0.0, 0.0, select(-1.0, 1.0, rd.z > 0.0));
+    *out_hit = AabbHit(t0, t1, near_normal);
+    return true;
+}
+
+fn trace_material_box(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    id: u32,
+    max_distance: f32,
+    out_hit: ptr<function, Hit>,
+) -> bool {
+    let base = material_box_base(id);
+    let lo_i = vec3<i32>(
+        scene_i32(base + 0u),
+        scene_i32(base + 1u),
+        scene_i32(base + 2u),
+    );
+    let hi_i = vec3<i32>(
+        scene_i32(base + 3u),
+        scene_i32(base + 4u),
+        scene_i32(base + 5u),
+    );
+
+    var box_hit = AabbHit(0.0, 0.0, vec3<f32>(0.0));
+    if !trace_aabb(ro, rd, vec3<f32>(lo_i), vec3<f32>(hi_i), max_distance, &box_hit) {
+        return false;
     }
 
-    var t = t0;
-    var n = near_normal;
+    var t = box_hit.t0;
+    var n = box_hit.n0;
     if t < SURFACE_EPSILON {
-        t = t1;
-        n = far_normal;
+        t = box_hit.t1;
+        let p = ro + rd * t;
+        let eps = 0.0001;
+        if abs(p.x - f32(lo_i.x)) < eps {
+            n = vec3<f32>(-1.0, 0.0, 0.0);
+        } else if abs(p.x - f32(hi_i.x)) < eps {
+            n = vec3<f32>(1.0, 0.0, 0.0);
+        } else if abs(p.y - f32(lo_i.y)) < eps {
+            n = vec3<f32>(0.0, -1.0, 0.0);
+        } else if abs(p.y - f32(hi_i.y)) < eps {
+            n = vec3<f32>(0.0, 1.0, 0.0);
+        } else if abs(p.z - f32(lo_i.z)) < eps {
+            n = vec3<f32>(0.0, 0.0, -1.0);
+        } else {
+            n = vec3<f32>(0.0, 0.0, 1.0);
+        }
     }
 
     if t < SURFACE_EPSILON || t > max_distance {
         return false;
     }
 
-    let voxel = vec3<i32>(floor(ro + rd * t - n * 0.0001));
-    if !voxel_occupied(voxel) {
-        return false;
-    }
-
-    *out_hit = VoxelHit(t, n, voxel);
+    *out_hit = Hit(t, n, scene.words[base + 6u]);
     return true;
 }
 
-fn trace_voxels(
+fn trace_bvh_boxes(
     ro: vec3<f32>,
     rd: vec3<f32>,
     max_distance: f32,
-    out_hit: ptr<function, VoxelHit>,
+    out_hit: ptr<function, Hit>,
 ) -> bool {
+    let root = bvh_root_ref();
+    if root <= 0 || bvh_node_count() == 0u {
+        return false;
+    }
+
     var closest = max_distance;
     var found = false;
-    let count = accel_box_count();
+    var stack: array<i32, 64>;
+    var stack_size = 0;
+    stack[stack_size] = root;
+    stack_size += 1;
 
-    for (var i = 0u; i < count; i = i + 1u) {
-        var hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0));
-        if trace_accel_box(ro, rd, i, closest, &hit) {
-            *out_hit = hit;
-            closest = hit.t;
-            found = true;
+    for (var iter = 0; iter < BVH_STACK_SIZE; iter = iter + 1) {
+        if stack_size <= 0 {
+            break;
+        }
+
+        stack_size -= 1;
+        let node_ref = stack[stack_size];
+        if node_ref <= 0 {
+            continue;
+        }
+
+        let node_id = u32(node_ref - 1);
+        if node_id >= bvh_node_count() {
+            continue;
+        }
+
+        let base = bvh_node_base(node_id);
+        let lo = vec3<f32>(
+            f32(scene_i32(base + 0u)),
+            f32(scene_i32(base + 1u)),
+            f32(scene_i32(base + 2u)),
+        );
+        let hi = vec3<f32>(
+            f32(scene_i32(base + 3u)),
+            f32(scene_i32(base + 4u)),
+            f32(scene_i32(base + 5u)),
+        );
+
+        var node_hit = AabbHit(0.0, 0.0, vec3<f32>(0.0));
+        if !trace_aabb(ro, rd, lo, hi, closest, &node_hit) {
+            continue;
+        }
+
+        let left = scene_i32(base + 6u);
+        let right = scene_i32(base + 7u);
+        let first_box = scene.words[base + 8u];
+        let box_count = scene.words[base + 9u];
+        if box_count > 0u {
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                if i >= box_count {
+                    break;
+                }
+                var box_hit = Hit(closest, vec3<f32>(0.0), MAT_EMPTY);
+                if trace_material_box(ro, rd, first_box + i, closest, &box_hit) {
+                    *out_hit = box_hit;
+                    closest = box_hit.t;
+                    found = true;
+                }
+            }
+        } else {
+            if left > 0 && stack_size < BVH_STACK_SIZE {
+                stack[stack_size] = left;
+                stack_size += 1;
+            }
+            if right > 0 && stack_size < BVH_STACK_SIZE {
+                stack[stack_size] = right;
+                stack_size += 1;
+            }
         }
     }
 
     return found;
 }
 
+fn trace_bvh_any_box(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
+    var hit = Hit(max_distance, vec3<f32>(0.0), MAT_EMPTY);
+    return trace_bvh_boxes(ro, rd, max_distance, &hit);
+}
+
 fn trace_any_voxel(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
-    let count = accel_box_count();
-    for (var i = 0u; i < count; i = i + 1u) {
-        var hit = VoxelHit(max_distance, vec3<f32>(0.0), vec3<i32>(0));
-        if trace_accel_box(ro, rd, i, max_distance, &hit) {
-            return true;
-        }
-    }
-    return false;
+    return trace_bvh_any_box(ro, rd, max_distance);
 }
 
 fn trace(
@@ -334,13 +362,10 @@ fn trace(
         found = true;
     }
 
-    var voxel_hit = VoxelHit(closest, vec3<f32>(0.0), vec3<i32>(0));
-    if trace_voxels(ro, rd, closest, &voxel_hit) {
-        let mat = material_at_voxel(voxel_hit.voxel);
-        if mat != MAT_EMPTY {
-            *out_hit = Hit(voxel_hit.t, voxel_hit.n, mat);
-            found = true;
-        }
+    var bvh_hit = Hit(closest, vec3<f32>(0.0), MAT_EMPTY);
+    if trace_bvh_boxes(ro, rd, closest, &bvh_hit) {
+        *out_hit = bvh_hit;
+        found = true;
     }
 
     return found;
@@ -465,10 +490,20 @@ fn tonemap(x: vec3<f32>) -> vec3<f32> {
     return x / (x + vec3<f32>(1.0));
 }
 
+fn first_hit_guides(ro: vec3<f32>, rd: vec3<f32>) -> Guides {
+    var hit = Hit(MAX_RAY_DISTANCE, vec3<f32>(0.0), MAT_EMPTY);
+    if !trace(ro, rd, MAX_RAY_DISTANCE, &hit) {
+        return Guides(vec3<f32>(0.5), vec3<f32>(0.0), 1.0);
+    }
+
+    let encoded_normal = hit.n * 0.5 + vec3<f32>(0.5);
+    return Guides(encoded_normal, albedo(hit.mat), clamp(hit.t / MAX_RAY_DISTANCE, 0.0, 1.0));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let px = vec2<i32>(i32(id.x), i32(id.y));
-    let size_u = textureDimensions(out_image);
+    let size_u = textureDimensions(color_image);
     let size = vec2<i32>(i32(size_u.x), i32(size_u.y));
 
     if any(px >= size) {
@@ -476,15 +511,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let cam = camera();
+    let sample_count = max(i32(pc.render.x), 1);
     var color = vec3<f32>(0.0);
-    for (var i = 0; i < SAMPLES_PER_PIXEL; i = i + 1) {
+    let write_guides = (pc.render.z & RENDER_FLAG_GUIDES) != 0u;
+    var guides = Guides(vec3<f32>(0.5), vec3<f32>(0.0), 1.0);
+    if write_guides {
+        let center_ray = camera_ray(cam, pixel_uv(px, size, vec2<f32>(0.0)));
+        guides = first_hit_guides(cam.ro, center_ray);
+    }
+
+    for (var i = 0; i < sample_count; i = i + 1) {
         var rng = seed(px, i);
         let jitter = vec2<f32>(rand(&rng), rand(&rng)) - vec2<f32>(0.5);
         color += path_trace(cam.ro, camera_ray(cam, pixel_uv(px, size, jitter)), &rng);
     }
 
-    color /= f32(SAMPLES_PER_PIXEL);
-    color = pow(tonemap(color), vec3<f32>(1.0 / 2.2));
-
-    textureStore(out_image, px, vec4<f32>(color, 1.0));
+    color /= f32(sample_count);
+    color = tonemap(color);
+    textureStore(color_image, px, vec4<f32>(color, 1.0));
+    if write_guides {
+        textureStore(normal_image, px, vec4<f32>(guides.normal, 1.0));
+        textureStore(albedo_image, px, vec4<f32>(guides.albedo, 1.0));
+        textureStore(depth_image, px, vec4<f32>(guides.depth, 0.0, 0.0, 1.0));
+    }
 }
