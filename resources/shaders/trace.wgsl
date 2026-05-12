@@ -196,6 +196,24 @@ fn trace_aabb(
     return true;
 }
 
+fn intersects_aabb(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    lo: vec3<f32>,
+    hi: vec3<f32>,
+    max_distance: f32,
+) -> bool {
+    let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+    let a = (lo - ro) * inv;
+    let b = (hi - ro) * inv;
+    let near_t = min(a, b);
+    let far_t = max(a, b);
+    let t0 = max(max(near_t.x, near_t.y), near_t.z);
+    let t1 = min(min(far_t.x, far_t.y), far_t.z);
+    return t1 >= max(t0, SURFACE_EPSILON) && t0 <= max_distance;
+}
+
 fn trace_material_box(
     ro: vec3<f32>,
     rd: vec3<f32>,
@@ -247,6 +265,21 @@ fn trace_material_box(
 
     *out_hit = Hit(t, n, scene.words[base + 6u]);
     return true;
+}
+
+fn intersects_material_box(ro: vec3<f32>, rd: vec3<f32>, id: u32, max_distance: f32) -> bool {
+    let base = material_box_base(id);
+    let lo_i = vec3<i32>(
+        scene_i32(base + 0u),
+        scene_i32(base + 1u),
+        scene_i32(base + 2u),
+    );
+    let hi_i = vec3<i32>(
+        scene_i32(base + 3u),
+        scene_i32(base + 4u),
+        scene_i32(base + 5u),
+    );
+    return intersects_aabb(ro, rd, vec3<f32>(lo_i), vec3<f32>(hi_i), max_distance);
 }
 
 fn trace_bvh_boxes(
@@ -332,8 +365,74 @@ fn trace_bvh_boxes(
 }
 
 fn trace_bvh_any_box(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
-    var hit = Hit(max_distance, vec3<f32>(0.0), MAT_EMPTY);
-    return trace_bvh_boxes(ro, rd, max_distance, &hit);
+    let root = bvh_root_ref();
+    if root <= 0 || bvh_node_count() == 0u {
+        return false;
+    }
+
+    var stack: array<i32, 64>;
+    var stack_size = 0;
+    stack[stack_size] = root;
+    stack_size += 1;
+
+    for (var iter = 0; iter < BVH_STACK_SIZE; iter = iter + 1) {
+        if stack_size <= 0 {
+            break;
+        }
+
+        stack_size -= 1;
+        let node_ref = stack[stack_size];
+        if node_ref <= 0 {
+            continue;
+        }
+
+        let node_id = u32(node_ref - 1);
+        if node_id >= bvh_node_count() {
+            continue;
+        }
+
+        let base = bvh_node_base(node_id);
+        let lo = vec3<f32>(
+            f32(scene_i32(base + 0u)),
+            f32(scene_i32(base + 1u)),
+            f32(scene_i32(base + 2u)),
+        );
+        let hi = vec3<f32>(
+            f32(scene_i32(base + 3u)),
+            f32(scene_i32(base + 4u)),
+            f32(scene_i32(base + 5u)),
+        );
+
+        if !intersects_aabb(ro, rd, lo, hi, max_distance) {
+            continue;
+        }
+
+        let left = scene_i32(base + 6u);
+        let right = scene_i32(base + 7u);
+        let first_box = scene.words[base + 8u];
+        let box_count = scene.words[base + 9u];
+        if box_count > 0u {
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                if i >= box_count {
+                    break;
+                }
+                if intersects_material_box(ro, rd, first_box + i, max_distance) {
+                    return true;
+                }
+            }
+        } else {
+            if left > 0 && stack_size < BVH_STACK_SIZE {
+                stack[stack_size] = left;
+                stack_size += 1;
+            }
+            if right > 0 && stack_size < BVH_STACK_SIZE {
+                stack[stack_size] = right;
+                stack_size += 1;
+            }
+        }
+    }
+
+    return false;
 }
 
 fn trace_any_voxel(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
