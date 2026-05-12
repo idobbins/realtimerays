@@ -9,13 +9,13 @@ struct Weights {
 @group(0) @binding(6) var<storage, read> weights: Weights;
 @group(0) @binding(20) var final_image: texture_storage_2d<rgba8unorm, write>;
 
-const HIDDEN_CHANNELS: u32 = 16u;
+const HIDDEN_CHANNELS: u32 = 32u;
 const INPUT_CHANNELS: u32 = 16u;
 const KERNEL_SIZE: u32 = 3u;
 const CONV0_WEIGHT_OFFSET: u32 = 0u;
-const CONV0_BIAS_OFFSET: u32 = 2304u;
-const CONV1_WEIGHT_OFFSET: u32 = 2320u;
-const CONV1_BIAS_OFFSET: u32 = 2368u;
+const CONV0_BIAS_OFFSET: u32 = 4608u;
+const CONV1_WEIGHT_OFFSET: u32 = 4640u;
+const CONV1_BIAS_OFFSET: u32 = 4736u;
 const MAX_RGB_DELTA: f32 = 0.22;
 
 fn clamp_px(px: vec2<i32>, size: vec2<i32>) -> vec2<i32> {
@@ -68,7 +68,7 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let center_albedo = textureLoad(albedo_image, center, 0).rgb;
     let center_depth = textureLoad(depth_image, center, 0).x;
 
-    var hidden: array<f32, 16>;
+    var hidden: array<f32, 32>;
     for (var h = 0u; h < HIDDEN_CHANNELS; h = h + 1u) {
         hidden[h] = weights.values[CONV0_BIAS_OFFSET + h];
     }

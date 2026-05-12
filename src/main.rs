@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -25,10 +24,10 @@ const RECORD_SECONDS: u32 = 10;
 const RECORD_FRAME_COUNT: u32 = RECORD_FPS * RECORD_SECONDS;
 const RUNTIME_SPP: u32 = 2;
 const DATASET_INPUT_SPP: u32 = 2;
-const DATASET_TARGET_SPP: u32 = 12;
+const DATASET_TARGET_SPP: u32 = 64;
 const RENDER_FLAG_GUIDES: u32 = 1;
 const FILTER_DENOISER_WEIGHT_COUNT: usize = 87;
-const CNN_DENOISER_WEIGHT_COUNT: usize = 2371;
+const CNN_DENOISER_WEIGHT_COUNT: usize = 4739;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
 const CAMERA_ORBIT_ANGLE: f32 = 0.45;
@@ -45,20 +44,12 @@ const MAT_LIGHT: u32 = 7;
 const MAT_WATER: u32 = 8;
 
 const SCENE_HEADER_WORDS: usize = 16;
-const SCENE_GRID_CELL_WORDS: usize = 1;
-const SCENE_GRID_BRICK_WORDS: usize = GRID_BRICK_SLOT_COUNT;
-const SCENE_GRID_LEAF_MATERIAL_WORDS: usize = 16;
-const SCENE_GRID_LEAF_WORDS: usize = 8 + SCENE_GRID_LEAF_MATERIAL_WORDS;
+const SCENE_BVH_NODE_WORDS: usize = 16;
 const SCENE_MATERIAL_BOX_WORDS: usize = 8;
-const TRACE_GRID_LEAF_THRESHOLD: usize = 64;
-const CHUNK_SIZE: i32 = 4;
-const GRID_BRICK_SIZE: i32 = 4;
-const GRID_BRICK_SLOT_COUNT: usize = 64;
+const BVH_LEAF_BOXES: usize = 4;
 const MOUNTAIN_LAYERS: i32 = 11;
 
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
-const TRACE_USE_GRID_DECL: &str = "const USE_TWO_LEVEL_GRID: bool = true;";
-const TRACE_USE_GRID_BRANCH: &str = "if !USE_TWO_LEVEL_GRID {";
 const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
 const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.wgsl");
 const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
@@ -137,19 +128,8 @@ fn create_trusted_wgsl_shader_module(
     }
 }
 
-fn trace_shader_source(use_grid: bool) -> Cow<'static, str> {
-    if use_grid {
-        Cow::Borrowed(TRACE_SHADER)
-    } else {
-        Cow::Owned(
-            TRACE_SHADER
-                .replace(
-                    TRACE_USE_GRID_DECL,
-                    "const USE_TWO_LEVEL_GRID: bool = false;",
-                )
-                .replace(TRACE_USE_GRID_BRANCH, "if true {"),
-        )
-    }
+fn trace_shader_source(_use_bvh: bool) -> Cow<'static, str> {
+    Cow::Borrowed(TRACE_SHADER)
 }
 
 #[repr(C)]
@@ -169,20 +149,14 @@ struct SceneBox {
     mat: u32,
 }
 
-fn floor_div(v: i32, divisor: i32) -> i32 {
-    if v >= 0 {
-        v / divisor
-    } else {
-        -((-v + divisor - 1) / divisor)
-    }
-}
-
-fn floor_div_chunk(v: i32) -> i32 {
-    floor_div(v, CHUNK_SIZE)
-}
-
-fn floor_div_grid(v: i32) -> i32 {
-    floor_div(v, GRID_BRICK_SIZE)
+#[derive(Clone, Debug)]
+struct BvhNode {
+    lo: [i32; 3],
+    hi: [i32; 3],
+    left: i32,
+    right: i32,
+    first_box: u32,
+    box_count: u32,
 }
 
 fn push_i32_word(words: &mut Vec<u32>, value: i32) {
@@ -307,239 +281,113 @@ fn scene_boxes() -> Vec<SceneBox> {
     boxes
 }
 
-#[derive(Clone, Copy, Debug)]
-struct OccupancyChunk {
-    coord: [i32; 3],
-    mask: [u32; 2],
-    materials: [u32; SCENE_GRID_LEAF_MATERIAL_WORDS],
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GridBrick {
-    chunk_refs: [i32; GRID_BRICK_SLOT_COUNT],
-}
-
-#[derive(Clone, Debug)]
-struct VoxelGrid {
-    origin: [i32; 3],
-    dims: [i32; 3],
-    cells: Vec<i32>,
-    bricks: Vec<GridBrick>,
-    leaves: Vec<OccupancyChunk>,
-}
-
-fn build_occupancy_chunks(scene_boxes: &[SceneBox]) -> Vec<OccupancyChunk> {
-    let mut chunks = BTreeMap::<[i32; 3], ([u32; 2], [u32; SCENE_GRID_LEAF_MATERIAL_WORDS])>::new();
-
-    for b in scene_boxes {
-        for z in b.lo[2]..b.hi[2] {
-            for y in b.lo[1]..b.hi[1] {
-                for x in b.lo[0]..b.hi[0] {
-                    let chunk = [floor_div_chunk(x), floor_div_chunk(y), floor_div_chunk(z)];
-                    let local = [
-                        x - chunk[0] * CHUNK_SIZE,
-                        y - chunk[1] * CHUNK_SIZE,
-                        z - chunk[2] * CHUNK_SIZE,
-                    ];
-                    let bit = (local[0]
-                        + local[1] * CHUNK_SIZE
-                        + local[2] * CHUNK_SIZE * CHUNK_SIZE) as u32;
-                    let (mask, materials) = chunks
-                        .entry(chunk)
-                        .or_insert(([0; 2], [0; SCENE_GRID_LEAF_MATERIAL_WORDS]));
-                    if bit < 32 {
-                        mask[0] |= 1 << bit;
-                    } else {
-                        mask[1] |= 1 << (bit - 32);
-                    }
-
-                    let material_word = (bit / 8) as usize;
-                    let material_shift = (bit % 8) * 4;
-                    let material_mask = 0xfu32 << material_shift;
-                    if materials[material_word] & material_mask == 0 {
-                        materials[material_word] |= (b.mat & 0xf) << material_shift;
-                    }
-                }
-            }
+fn box_bounds(boxes: &[SceneBox], indices: &[usize]) -> ([i32; 3], [i32; 3]) {
+    let mut lo = [i32::MAX; 3];
+    let mut hi = [i32::MIN; 3];
+    for &index in indices {
+        let b = boxes[index];
+        for axis in 0..3 {
+            lo[axis] = lo[axis].min(b.lo[axis]);
+            hi[axis] = hi[axis].max(b.hi[axis]);
         }
     }
-
-    chunks
-        .into_iter()
-        .map(|(coord, (mask, materials))| OccupancyChunk {
-            coord,
-            mask,
-            materials,
-        })
-        .collect()
+    (lo, hi)
 }
 
-fn grid_cell_index(dims: [i32; 3], cell: [i32; 3]) -> usize {
-    (cell[0] + cell[1] * dims[0] + cell[2] * dims[0] * dims[1]) as usize
+fn centroid_axis(b: SceneBox, axis: usize) -> i32 {
+    b.lo[axis] + b.hi[axis]
 }
 
-fn grid_brick_slot(local_chunk: [i32; 3]) -> usize {
-    (local_chunk[0]
-        + local_chunk[1] * GRID_BRICK_SIZE
-        + local_chunk[2] * GRID_BRICK_SIZE * GRID_BRICK_SIZE) as usize
+fn build_bvh_node(
+    boxes: &[SceneBox],
+    indices: &mut [usize],
+    nodes: &mut Vec<BvhNode>,
+    ordered_boxes: &mut Vec<SceneBox>,
+) -> i32 {
+    let (lo, hi) = box_bounds(boxes, indices);
+    let node_id = nodes.len();
+    nodes.push(BvhNode {
+        lo,
+        hi,
+        left: 0,
+        right: 0,
+        first_box: 0,
+        box_count: 0,
+    });
+
+    if indices.len() <= BVH_LEAF_BOXES {
+        let first_box = ordered_boxes.len() as u32;
+        for &index in indices.iter() {
+            ordered_boxes.push(boxes[index]);
+        }
+        nodes[node_id].first_box = first_box;
+        nodes[node_id].box_count = indices.len() as u32;
+        return node_id as i32 + 1;
+    }
+
+    let extent = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    let axis = if extent[0] >= extent[1] && extent[0] >= extent[2] {
+        0
+    } else if extent[1] >= extent[2] {
+        1
+    } else {
+        2
+    };
+    indices.sort_by_key(|&index| centroid_axis(boxes[index], axis));
+    let mid = indices.len() / 2;
+    let (left_indices, right_indices) = indices.split_at_mut(mid);
+    let left = build_bvh_node(boxes, left_indices, nodes, ordered_boxes);
+    let right = build_bvh_node(boxes, right_indices, nodes, ordered_boxes);
+    nodes[node_id].left = left;
+    nodes[node_id].right = right;
+    node_id as i32 + 1
 }
 
-fn build_voxel_grid(chunks: &[OccupancyChunk]) -> VoxelGrid {
-    if chunks.is_empty() {
-        return VoxelGrid {
-            origin: [0; 3],
-            dims: [0; 3],
-            cells: Vec::new(),
-            bricks: Vec::new(),
-            leaves: Vec::new(),
-        };
+fn build_box_bvh(boxes: &[SceneBox]) -> (Vec<BvhNode>, Vec<SceneBox>, i32) {
+    if boxes.is_empty() {
+        return (Vec::new(), Vec::new(), 0);
     }
 
-    let min_brick = [
-        chunks
-            .iter()
-            .map(|chunk| floor_div_grid(chunk.coord[0]))
-            .min()
-            .unwrap(),
-        chunks
-            .iter()
-            .map(|chunk| floor_div_grid(chunk.coord[1]))
-            .min()
-            .unwrap(),
-        chunks
-            .iter()
-            .map(|chunk| floor_div_grid(chunk.coord[2]))
-            .min()
-            .unwrap(),
-    ];
-    let max_brick = [
-        chunks
-            .iter()
-            .map(|chunk| floor_div_grid(chunk.coord[0]))
-            .max()
-            .unwrap(),
-        chunks
-            .iter()
-            .map(|chunk| floor_div_grid(chunk.coord[1]))
-            .max()
-            .unwrap(),
-        chunks
-            .iter()
-            .map(|chunk| floor_div_grid(chunk.coord[2]))
-            .max()
-            .unwrap(),
-    ];
-    let dims = [
-        max_brick[0] - min_brick[0] + 1,
-        max_brick[1] - min_brick[1] + 1,
-        max_brick[2] - min_brick[2] + 1,
-    ];
-    let cell_count = (dims[0] * dims[1] * dims[2]) as usize;
-
-    let mut cells = vec![0; cell_count];
-    let mut bricks = Vec::new();
-    let mut leaves = Vec::with_capacity(chunks.len());
-
-    for chunk in chunks {
-        let brick_coord = [
-            floor_div_grid(chunk.coord[0]),
-            floor_div_grid(chunk.coord[1]),
-            floor_div_grid(chunk.coord[2]),
-        ];
-        let cell = [
-            brick_coord[0] - min_brick[0],
-            brick_coord[1] - min_brick[1],
-            brick_coord[2] - min_brick[2],
-        ];
-        let cell_index = grid_cell_index(dims, cell);
-        let brick_id = if cells[cell_index] == 0 {
-            bricks.push(GridBrick {
-                chunk_refs: [0; GRID_BRICK_SLOT_COUNT],
-            });
-            cells[cell_index] = bricks.len() as i32;
-            bricks.len() - 1
-        } else {
-            (cells[cell_index] - 1) as usize
-        };
-
-        let local_chunk = [
-            chunk.coord[0] - brick_coord[0] * GRID_BRICK_SIZE,
-            chunk.coord[1] - brick_coord[1] * GRID_BRICK_SIZE,
-            chunk.coord[2] - brick_coord[2] * GRID_BRICK_SIZE,
-        ];
-        debug_assert!(local_chunk
-            .iter()
-            .all(|&v| (0..GRID_BRICK_SIZE).contains(&v)));
-        let slot = grid_brick_slot(local_chunk);
-        debug_assert_eq!(bricks[brick_id].chunk_refs[slot], 0);
-
-        let leaf_ref = leaves.len() as i32 + 1;
-        leaves.push(*chunk);
-        bricks[brick_id].chunk_refs[slot] = leaf_ref;
-    }
-
-    VoxelGrid {
-        origin: min_brick,
-        dims,
-        cells,
-        bricks,
-        leaves,
-    }
+    let mut indices = (0..boxes.len()).collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+    let mut ordered_boxes = Vec::with_capacity(boxes.len());
+    let root = build_bvh_node(boxes, &mut indices, &mut nodes, &mut ordered_boxes);
+    (nodes, ordered_boxes, root)
 }
 
 fn build_scene_words() -> Vec<u32> {
     let scene_boxes = scene_boxes();
-    let chunks = build_occupancy_chunks(&scene_boxes);
-    let grid = build_voxel_grid(&chunks);
+    let (bvh_nodes, ordered_boxes, bvh_root) = build_box_bvh(&scene_boxes);
 
-    let cell_count = grid.cells.len();
-    let brick_count = grid.bricks.len();
-    let leaf_count = grid.leaves.len();
-    let material_box_count = scene_boxes.len();
-    let cells_base = SCENE_HEADER_WORDS;
-    let bricks_base = cells_base + cell_count * SCENE_GRID_CELL_WORDS;
-    let leaves_base = bricks_base + brick_count * SCENE_GRID_BRICK_WORDS;
-    let material_boxes_base = leaves_base + leaf_count * SCENE_GRID_LEAF_WORDS;
+    let bvh_node_count = bvh_nodes.len();
+    let material_box_count = ordered_boxes.len();
+    let bvh_nodes_base = SCENE_HEADER_WORDS;
+    let material_boxes_base = bvh_nodes_base + bvh_node_count * SCENE_BVH_NODE_WORDS;
     let total_words = material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS;
 
     let mut words = vec![0; SCENE_HEADER_WORDS];
-    words[0] = cell_count as u32;
-    words[1] = leaf_count as u32;
+    words[0] = bvh_node_count as u32;
+    words[1] = bvh_root as u32;
     words[2] = material_box_count as u32;
-    words[3] = cells_base as u32;
-    words[4] = bricks_base as u32;
-    words[5] = leaves_base as u32;
-    words[6] = material_boxes_base as u32;
-    words[7] = grid.origin[0] as u32;
-    words[8] = grid.origin[1] as u32;
-    words[9] = grid.origin[2] as u32;
-    words[10] = grid.dims[0] as u32;
-    words[11] = grid.dims[1] as u32;
-    words[12] = grid.dims[2] as u32;
-    words[13] = brick_count as u32;
+    words[3] = bvh_nodes_base as u32;
+    words[4] = material_boxes_base as u32;
     words.reserve(total_words - words.len());
 
-    for cell_ref in grid.cells {
-        push_i32_word(&mut words, cell_ref);
+    for node in bvh_nodes {
+        push_i32_word(&mut words, node.lo[0]);
+        push_i32_word(&mut words, node.lo[1]);
+        push_i32_word(&mut words, node.lo[2]);
+        push_i32_word(&mut words, node.hi[0]);
+        push_i32_word(&mut words, node.hi[1]);
+        push_i32_word(&mut words, node.hi[2]);
+        push_i32_word(&mut words, node.left);
+        push_i32_word(&mut words, node.right);
+        words.push(node.first_box);
+        words.push(node.box_count);
+        words.extend([0, 0, 0, 0, 0, 0]);
     }
 
-    for brick in grid.bricks {
-        for chunk_ref in brick.chunk_refs {
-            push_i32_word(&mut words, chunk_ref);
-        }
-    }
-
-    for leaf in grid.leaves {
-        push_i32_word(&mut words, leaf.coord[0]);
-        push_i32_word(&mut words, leaf.coord[1]);
-        push_i32_word(&mut words, leaf.coord[2]);
-        words.push(leaf.mask[0]);
-        words.push(leaf.mask[1]);
-        words.extend(leaf.materials);
-        words.extend([0, 0, 0]);
-    }
-
-    for b in scene_boxes {
+    for b in ordered_boxes {
         push_i32_word(&mut words, b.lo[0]);
         push_i32_word(&mut words, b.lo[1]);
         push_i32_word(&mut words, b.lo[2]);
@@ -556,7 +404,6 @@ fn build_scene_words() -> Vec<u32> {
 
 fn create_scene_buffer(device: &wgpu::Device) -> (wgpu::Buffer, bool) {
     let scene_words = build_scene_words();
-    let use_grid = scene_words[1] as usize > TRACE_GRID_LEAF_THRESHOLD;
     let scene_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("scene buffer"),
         size: (scene_words.len() * std::mem::size_of::<u32>()) as u64,
@@ -568,7 +415,7 @@ fn create_scene_buffer(device: &wgpu::Device) -> (wgpu::Buffer, bool) {
         .get_mapped_range_mut()
         .copy_from_slice(bytemuck::cast_slice(&scene_words));
     scene_buffer.unmap();
-    (scene_buffer, use_grid)
+    (scene_buffer, true)
 }
 
 #[cfg(test)]
@@ -576,118 +423,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scene_occupancy_matches_current_boxes() {
+    fn box_bvh_covers_all_scene_boxes() {
         let scene_boxes = scene_boxes();
-        let chunks = build_occupancy_chunks(&scene_boxes);
-        let occupied_voxels: u32 = chunks
-            .iter()
-            .map(|chunk| chunk.mask[0].count_ones() + chunk.mask[1].count_ones())
-            .sum();
+        let (nodes, ordered_boxes, root_ref) = build_box_bvh(&scene_boxes);
 
-        assert!(scene_boxes.len() > 40);
-        assert!(chunks.len() > TRACE_GRID_LEAF_THRESHOLD);
-        assert!(occupied_voxels > 3_500);
-    }
+        assert_eq!(ordered_boxes.len(), scene_boxes.len());
+        assert_eq!(root_ref, 1);
+        assert!(!nodes.is_empty());
+        assert!(nodes.iter().any(|node| node.box_count > 0));
 
-    #[test]
-    fn grid_bounds_contain_all_chunks() {
-        let scene_boxes = scene_boxes();
-        let chunks = build_occupancy_chunks(&scene_boxes);
-        let grid = build_voxel_grid(&chunks);
-
-        for chunk in chunks {
-            let brick_coord = [
-                floor_div_grid(chunk.coord[0]),
-                floor_div_grid(chunk.coord[1]),
-                floor_div_grid(chunk.coord[2]),
-            ];
-            let cell = [
-                brick_coord[0] - grid.origin[0],
-                brick_coord[1] - grid.origin[1],
-                brick_coord[2] - grid.origin[2],
-            ];
-            assert!(cell[0] >= 0 && cell[0] < grid.dims[0]);
-            assert!(cell[1] >= 0 && cell[1] < grid.dims[1]);
-            assert!(cell[2] >= 0 && cell[2] < grid.dims[2]);
-
-            let cell_ref = grid.cells[grid_cell_index(grid.dims, cell)];
-            assert!(cell_ref > 0);
-
-            let local_chunk = [
-                chunk.coord[0] - brick_coord[0] * GRID_BRICK_SIZE,
-                chunk.coord[1] - brick_coord[1] * GRID_BRICK_SIZE,
-                chunk.coord[2] - brick_coord[2] * GRID_BRICK_SIZE,
-            ];
-            let chunk_ref =
-                grid.bricks[(cell_ref - 1) as usize].chunk_refs[grid_brick_slot(local_chunk)];
-            assert!(chunk_ref > 0);
-            assert_eq!(grid.leaves[(chunk_ref - 1) as usize].coord, chunk.coord);
-        }
-    }
-
-    #[test]
-    fn grid_reaches_every_occupied_chunk_once() {
-        let scene_boxes = scene_boxes();
-        let chunks = build_occupancy_chunks(&scene_boxes);
-        let grid = build_voxel_grid(&chunks);
-        let mut reachable = Vec::new();
-
-        for brick in &grid.bricks {
-            for chunk_ref in brick.chunk_refs {
-                if chunk_ref > 0 {
-                    reachable.push((chunk_ref - 1) as usize);
-                }
+        for node in &nodes {
+            if node.box_count > 0 {
+                assert_eq!(node.left, 0);
+                assert_eq!(node.right, 0);
+                assert!(node.box_count as usize <= BVH_LEAF_BOXES);
+                assert!((node.first_box + node.box_count) as usize <= ordered_boxes.len());
+            } else {
+                assert!(node.left > 0);
+                assert!(node.right > 0);
             }
         }
-        reachable.sort_unstable();
-
-        let expected = (0..grid.leaves.len()).collect::<Vec<_>>();
-        assert_eq!(reachable, expected);
-        assert_eq!(grid.leaves.len(), chunks.len());
     }
 
     #[test]
-    fn grid_has_one_brick_per_populated_cell() {
-        let scene_boxes = scene_boxes();
-        let chunks = build_occupancy_chunks(&scene_boxes);
-        let grid = build_voxel_grid(&chunks);
-        let populated_cells = grid.cells.iter().filter(|&&cell_ref| cell_ref > 0).count();
-
-        assert_eq!(populated_cells, grid.bricks.len());
-        assert!(grid.bricks.len() <= grid.cells.len());
-        assert!(grid.bricks.len() < grid.leaves.len());
-    }
-
-    #[test]
-    fn serialized_scene_layout_is_consistent() {
+    fn serialized_bvh_scene_layout_is_consistent() {
         let words = build_scene_words();
-        let cell_count = words[0] as usize;
-        let leaf_count = words[1] as usize;
+        let bvh_node_count = words[0] as usize;
+        let bvh_root_ref = words[1] as i32;
         let material_box_count = words[2] as usize;
-        let cells_base = words[3] as usize;
-        let bricks_base = words[4] as usize;
-        let leaves_base = words[5] as usize;
-        let material_boxes_base = words[6] as usize;
-        let dims = [words[10] as i32, words[11] as i32, words[12] as i32];
-        let brick_count = words[13] as usize;
+        let bvh_nodes_base = words[3] as usize;
+        let material_boxes_base = words[4] as usize;
 
-        assert_eq!(cells_base, SCENE_HEADER_WORDS);
-        assert_eq!(bricks_base, cells_base + cell_count * SCENE_GRID_CELL_WORDS);
-        assert_eq!(
-            leaves_base,
-            bricks_base + brick_count * SCENE_GRID_BRICK_WORDS
-        );
+        assert_eq!(bvh_root_ref, 1);
+        assert_eq!(bvh_nodes_base, SCENE_HEADER_WORDS);
         assert_eq!(
             material_boxes_base,
-            leaves_base + leaf_count * SCENE_GRID_LEAF_WORDS
+            bvh_nodes_base + bvh_node_count * SCENE_BVH_NODE_WORDS
         );
         assert_eq!(
             words.len(),
             material_boxes_base + material_box_count * SCENE_MATERIAL_BOX_WORDS
         );
-        assert_eq!(cell_count, (dims[0] * dims[1] * dims[2]) as usize);
-        assert!(brick_count > 0);
-        assert!(leaf_count > brick_count);
+        assert!(bvh_node_count > 1);
+        assert_eq!(material_box_count, scene_boxes().len());
     }
 }
 
