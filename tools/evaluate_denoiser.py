@@ -18,11 +18,12 @@ DISABLED_PENALTY = -10.0
 MAX_LUMA_BLEND = 0.45
 RGB_CNN_HIDDEN_CHANNELS = 8
 RGB_CNN_INPUT_CHANNELS = 3
+RECON_CNN_INPUT_CHANNELS = 4
 RGB_CNN_OUTPUT_CHANNELS = 3
 RGB_CNN_DEFAULT_KERNEL_SIZE = 3
 MAX_CNN_RGB_DELTA = 0.22
 RGB_CNN_LAYOUTS = ("dense", "sparse-wide", "dilated3", "dilated5", "axis17")
-RGB_CNN_MODES = ("rgb", "luma")
+RGB_CNN_MODES = ("rgb", "luma", "recon")
 RGB_CNN_CHROMA_EPSILON = 0.0001
 RGB_CNN_CHROMA_FALLBACK_LUMA = 0.01
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
@@ -98,6 +99,8 @@ def rgb_cnn_channels(mode: str) -> tuple[int, int]:
         return RGB_CNN_INPUT_CHANNELS, RGB_CNN_OUTPUT_CHANNELS
     if mode == "luma":
         return 1, 1
+    if mode == "recon":
+        return RECON_CNN_INPUT_CHANNELS, RGB_CNN_OUTPUT_CHANNELS
     raise ValueError(f"unknown rgb-cnn mode: {mode}")
 
 
@@ -189,15 +192,35 @@ def load_crop(
     width: int,
     height: int,
     load_guides: bool = True,
+    load_coverage: bool = False,
+    sparse_coverage: float = 1.0,
 ):
     crop = np.s_[y0 : y0 + crop_size, x0 : x0 + crop_size]
-    color = load_rgba16f(root, "input_color", frame, height, width)[crop][..., 0:3].astype(np.float32)
+    input_rgba = load_rgba16f(root, "input_color", frame, height, width)[crop].astype(np.float32)
+    color = input_rgba[..., 0:3]
     target = load_rgba16f(root, "target_color", frame, height, width)[crop][..., 0:3].astype(np.float32)
+    if load_coverage:
+        coverage = (input_rgba[..., 3:4] > 0.0).astype(np.float32)
+        if sparse_coverage < 1.0:
+            seed = (
+                (frame + 1) * 73856093
+                ^ (x0 + 1) * 19349663
+                ^ (y0 + 1) * 83492791
+                ^ crop_size * 2654435761
+            ) & 0xFFFFFFFF
+            rng = np.random.default_rng(seed)
+            coverage *= (rng.random((crop_size, crop_size, 1)) < sparse_coverage).astype(np.float32)
+        color = color * coverage
     if load_guides:
         normal = load_rgba16f(root, "input_normal", frame, height, width)[crop][..., 0:3].astype(np.float32)
         albedo = load_rgba16f(root, "input_albedo", frame, height, width)[crop][..., 0:3].astype(np.float32)
         depth = load_rgba16f(root, "input_depth", frame, height, width)[crop][..., 0:1].astype(np.float32)
-        inputs = np.concatenate([color, normal, albedo, depth], axis=2)
+        parts = [color, normal, albedo, depth]
+        if load_coverage:
+            parts.append(coverage)
+        inputs = np.concatenate(parts, axis=2)
+    elif load_coverage:
+        inputs = np.concatenate([color, coverage], axis=2)
     else:
         inputs = color
     return (
@@ -295,7 +318,13 @@ def rgb_cnn(
     conv1_weight = weights[conv1_weight_offset:conv1_bias_offset].view(output_channels, RGB_CNN_HIDDEN_CHANNELS, 1, 1)
     conv1_bias = weights[conv1_bias_offset:expected_count]
 
-    conv_input = luminance(color) if mode == "luma" else color
+    if mode == "luma":
+        conv_input = luminance(color)
+    elif mode == "recon":
+        coverage = inputs[:, 10:11] if inputs.shape[1] > 10 else inputs[:, 3:4]
+        conv_input = torch.cat([color, coverage], dim=1)
+    else:
+        conv_input = color
     if layout == "dense":
         radius = kernel_size // 2
         padded = torch.nn.functional.pad(conv_input, (radius, radius, radius, radius), mode="replicate")
@@ -315,6 +344,8 @@ def rgb_cnn(
         delta_luma = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
         out_luma = torch.clamp(luminance(color) + delta_luma, 0.0, 1.0)
         return chroma_preserving_luma(color, out_luma, tap_offsets)
+    if mode == "recon":
+        return torch.sigmoid(raw_delta)
     delta_rgb = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
     return torch.clamp(color + delta_rgb, 0.0, 1.0)
 
@@ -338,8 +369,11 @@ def main() -> None:
     parser.add_argument("--rgb-cnn-mode", choices=RGB_CNN_MODES, default="rgb")
     parser.add_argument("--rgb-cnn-kernel-size", type=int)
     parser.add_argument("--rgb-cnn-dilation", type=int, default=4)
+    parser.add_argument("--sparse-coverage", type=float, default=1.0)
     parser.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     args = parser.parse_args()
+    if not (0.0 < args.sparse_coverage <= 1.0):
+        raise ValueError("--sparse-coverage must be > 0 and <= 1")
 
     with (args.dataset / "dataset_meta.json").open("r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -373,6 +407,7 @@ def main() -> None:
                 "or rgb-cnn weights with an odd-square kernel footprint"
             )
     needs_guides = any(kind == "filter" for _, kind, _, _ in candidates)
+    needs_coverage = args.rgb_cnn_mode == "recon" or args.sparse_coverage < 1.0
     has_guides = {"input_normal", "input_albedo", "input_depth"}.issubset(channels)
     if needs_guides and not has_guides:
         raise ValueError(f"{args.dataset} does not contain guide channels for learned-filter weights")
@@ -394,6 +429,8 @@ def main() -> None:
                         width,
                         height,
                         load_guides=needs_guides,
+                        load_coverage=needs_coverage,
+                        sparse_coverage=args.sparse_coverage,
                     )
                     inputs = inputs.to(args.device)
                     targets = targets.to(args.device)

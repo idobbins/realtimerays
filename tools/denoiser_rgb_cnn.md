@@ -90,6 +90,44 @@ Run the renderer with the RGB-only CNN:
 cargo run --release -- --rgb-cnn-denoise --rgb-cnn-layout dense --rgb-cnn-mode luma
 ```
 
+For sparse reconstruction experiments, train with `--rgb-cnn-mode recon`. This
+adds one input channel: `input_color.a`, interpreted as a coverage mask. Missing
+pixels are zero RGB with alpha/coverage 0, and the model predicts direct RGB
+rather than a residual from the center pixel. Existing dense datasets can be
+masked synthetically during training:
+
+```bash
+.venv/bin/python tools/train_denoiser.py renders/denoiser_dataset_cnn64 \
+  --model rgb-cnn \
+  --rgb-cnn-mode recon \
+  --rgb-cnn-layout dense \
+  --rgb-cnn-kernel-size 17 \
+  --sparse-coverage 0.5 \
+  --epochs 8 \
+  --steps-per-epoch 200 \
+  --batch-size 4 \
+  --crop-size 96 \
+  --val-steps 40 \
+  --output resources/denoiser_recon_cnn_weights.bin
+```
+
+You can also capture sparse input directly. `--coverage 0.5 --input-spp 1`
+means roughly half a ray per pixel on average:
+
+```bash
+cargo run --release -- dataset renders/denoiser_dataset_sparse \
+  --frames 24 \
+  --rgb-only \
+  --input-spp 1 \
+  --coverage 0.5
+```
+
+Run the reconstruction mode with the same sparse coverage:
+
+```bash
+cargo run --release -- --rgb-cnn-denoise --rgb-cnn-mode recon --spp 1 --coverage 0.5
+```
+
 Benchmark the isolated postpass:
 
 ```bash

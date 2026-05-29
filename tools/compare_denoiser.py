@@ -39,8 +39,11 @@ def main() -> None:
     parser.add_argument("--rgb-cnn-mode", choices=RGB_CNN_MODES, default="rgb")
     parser.add_argument("--rgb-cnn-kernel-size", type=int)
     parser.add_argument("--rgb-cnn-dilation", type=int, default=4)
+    parser.add_argument("--sparse-coverage", type=float, default=1.0)
     parser.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     args = parser.parse_args()
+    if not (0.0 < args.sparse_coverage <= 1.0):
+        raise ValueError("--sparse-coverage must be > 0 and <= 1")
 
     with (args.dataset / "dataset_meta.json").open("r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -75,7 +78,18 @@ def main() -> None:
     if needs_guides and not has_guides:
         raise ValueError(f"{args.dataset} does not contain guide channels for learned-filter weights")
 
-    inputs, target = load_crop(args.dataset, frame, x, y, args.crop_size, width, height, load_guides=needs_guides)
+    inputs, target = load_crop(
+        args.dataset,
+        frame,
+        x,
+        y,
+        args.crop_size,
+        width,
+        height,
+        load_guides=needs_guides,
+        load_coverage=args.rgb_cnn_mode == "recon" or args.sparse_coverage < 1.0,
+        sparse_coverage=args.sparse_coverage,
+    )
     inputs = inputs.to(args.device)
     target = target.to(args.device)
 

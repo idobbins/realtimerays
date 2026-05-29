@@ -23,10 +23,11 @@ CNN_HIDDEN_CHANNELS = 32
 CNN_INPUT_CHANNELS = 16
 RGB_CNN_HIDDEN_CHANNELS = 8
 RGB_CNN_INPUT_CHANNELS = 3
+RECON_CNN_INPUT_CHANNELS = 4
 RGB_CNN_OUTPUT_CHANNELS = 3
 MAX_CNN_RGB_DELTA = 0.22
 RGB_CNN_LAYOUTS = ("dense", "sparse-wide", "dilated3", "dilated5", "axis17")
-RGB_CNN_MODES = ("rgb", "luma")
+RGB_CNN_MODES = ("rgb", "luma", "recon")
 RGB_CNN_CHROMA_EPSILON = 0.0001
 RGB_CNN_CHROMA_FALLBACK_LUMA = 0.01
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
@@ -108,6 +109,8 @@ def rgb_cnn_channels(mode: str) -> tuple[int, int]:
         return RGB_CNN_INPUT_CHANNELS, RGB_CNN_OUTPUT_CHANNELS
     if mode == "luma":
         return 1, 1
+    if mode == "recon":
+        return RECON_CNN_INPUT_CHANNELS, RGB_CNN_OUTPUT_CHANNELS
     raise ValueError(f"unknown rgb-cnn mode: {mode}")
 
 
@@ -306,7 +309,13 @@ class RgbTinyCnnDenoiser(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         color = x[:, 0:3]
-        conv_input = luminance(color) if self.mode == "luma" else color
+        if self.mode == "luma":
+            conv_input = luminance(color)
+        elif self.mode == "recon":
+            coverage = x[:, 10:11] if x.shape[1] > 10 else x[:, 3:4]
+            conv_input = torch.cat([color, coverage], dim=1)
+        else:
+            conv_input = color
         if self.layout == "dense":
             padded = F.pad(
                 conv_input,
@@ -333,6 +342,8 @@ class RgbTinyCnnDenoiser(torch.nn.Module):
             delta_luma = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
             out_luma = torch.clamp(luminance(color) + delta_luma, 0.0, 1.0)
             return chroma_preserving_luma(color, out_luma, self.tap_offsets)
+        if self.mode == "recon":
+            return torch.sigmoid(raw_delta)
         delta_rgb = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
         return torch.clamp(color + delta_rgb, 0.0, 1.0)
 
@@ -402,6 +413,8 @@ class DenoiserDataset:
         importance_gradient_weight: float,
         importance_guide_weight: float,
         load_guides: bool,
+        load_coverage: bool,
+        sparse_coverage: float,
     ) -> None:
         self.root = root
         self.crop_size = crop_size
@@ -411,6 +424,8 @@ class DenoiserDataset:
         self.importance_error_weight = importance_error_weight
         self.importance_gradient_weight = importance_gradient_weight
         self.importance_guide_weight = importance_guide_weight
+        self.load_coverage = load_coverage
+        self.sparse_coverage = sparse_coverage
         self.cache: dict[tuple[str, int], np.memmap] = {}
         self.importance_cdf: np.ndarray | None = None
         self.importance_tiles: list[tuple[int, int, int]] = []
@@ -503,14 +518,27 @@ class DenoiserDataset:
         frame, x0, y0 = self._sample_location()
         crop = np.s_[y0 : y0 + self.crop_size, x0 : x0 + self.crop_size]
 
-        color = self._rgba16f("input_color", frame)[crop][..., 0:3].astype(np.float32)
+        input_rgba = self._rgba16f("input_color", frame)[crop].astype(np.float32)
+        color = input_rgba[..., 0:3]
         target = self._rgba16f("target_color", frame)[crop][..., 0:3].astype(np.float32)
+
+        if self.load_coverage:
+            coverage = (input_rgba[..., 3:4] > 0.0).astype(np.float32)
+            if self.sparse_coverage < 1.0:
+                mask = (
+                    np.random.random_sample((self.crop_size, self.crop_size, 1))
+                    < self.sparse_coverage
+                ).astype(np.float32)
+                coverage *= mask
+            color = color * coverage
 
         if self.load_guides:
             normal = self._rgba16f("input_normal", frame)[crop][..., 0:3].astype(np.float32)
             albedo = self._rgba16f("input_albedo", frame)[crop][..., 0:3].astype(np.float32)
             depth = self._rgba16f("input_depth", frame)[crop][..., 0:1].astype(np.float32)
             inp = np.concatenate([color, normal, albedo, depth], axis=2)
+        elif self.load_coverage:
+            inp = np.concatenate([color, coverage], axis=2)
         else:
             inp = color
         inp_t = torch.from_numpy(inp).permute(2, 0, 1)
@@ -732,7 +760,13 @@ def main() -> None:
         "--rgb-cnn-mode",
         choices=RGB_CNN_MODES,
         default="rgb",
-        help="rgb predicts color residuals; luma predicts brightness only and preserves chroma",
+        help="rgb predicts color residuals; luma predicts brightness only; recon predicts direct RGB from color+coverage",
+    )
+    parser.add_argument(
+        "--sparse-coverage",
+        type=float,
+        default=1.0,
+        help="synthetically keep this fraction of input pixels for rgb-cnn recon training",
     )
     parser.add_argument("--tap-pattern", choices=sorted(FILTER_TAP_PATTERNS), default="dense3")
     parser.add_argument(
@@ -748,6 +782,8 @@ def main() -> None:
     unknown_guides = guides - valid_guides
     if unknown_guides:
         raise ValueError(f"unknown guide(s): {', '.join(sorted(unknown_guides))}")
+    if not (0.0 < args.sparse_coverage <= 1.0):
+        raise ValueError("--sparse-coverage must be > 0 and <= 1")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -761,6 +797,7 @@ def main() -> None:
     val_frames = list(range(max(0, frame_count - val_count), frame_count))
 
     load_guides = args.model != "rgb-cnn"
+    load_coverage = args.model == "rgb-cnn" and args.rgb_cnn_mode == "recon"
     train_dataset = DenoiserDataset(
         args.dataset,
         args.crop_size,
@@ -771,6 +808,8 @@ def main() -> None:
         args.importance_gradient_weight,
         args.importance_guide_weight,
         load_guides,
+        load_coverage,
+        args.sparse_coverage,
     )
     val_dataset = DenoiserDataset(
         args.dataset,
@@ -782,11 +821,16 @@ def main() -> None:
         args.importance_gradient_weight,
         args.importance_guide_weight,
         load_guides,
+        load_coverage,
+        args.sparse_coverage,
     )
     output = args.output
     if output is None:
         if args.model == "rgb-cnn":
-            output = Path("resources/denoiser_rgb_cnn_weights.bin")
+            if args.rgb_cnn_mode == "recon":
+                output = Path("resources/denoiser_recon_cnn_weights.bin")
+            else:
+                output = Path("resources/denoiser_rgb_cnn_weights.bin")
         elif args.model in {"tiny-cnn", "cnn"}:
             output = Path("resources/denoiser_cnn_weights.bin")
         else:

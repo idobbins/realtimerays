@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 RGB_CNN_LAYOUTS = ("dense", "sparse-wide", "dilated3", "dilated5", "axis17")
-RGB_CNN_MODES = ("rgb", "luma")
+RGB_CNN_MODES = ("rgb", "luma", "recon")
 VARIANTS = [
     {
         "name": "sparse13_spatial",
@@ -128,6 +128,7 @@ def main() -> None:
     parser.add_argument("--importance-prob", type=float, default=0.7)
     parser.add_argument("--importance-stride", type=int, default=16)
     parser.add_argument("--high-weight", type=float, default=3.0)
+    parser.add_argument("--sparse-coverage", type=float, default=1.0)
     parser.add_argument(
         "--rgb-cnn-kernels",
         type=parse_kernel_sizes,
@@ -144,7 +145,7 @@ def main() -> None:
         "--rgb-cnn-modes",
         type=parse_rgb_cnn_modes,
         default=["rgb"],
-        help="comma-separated RGB CNN modes: rgb,luma",
+        help="comma-separated RGB CNN modes: rgb,luma,recon",
     )
     args = parser.parse_args()
 
@@ -165,6 +166,8 @@ def main() -> None:
                     rgb_variant["rgb_cnn_mode"] = mode
                     rgb_variant["rgb_cnn_layout"] = layout
                     rgb_variant["rgb_cnn_kernel_size"] = kernel_size
+                    if mode == "recon":
+                        rgb_variant["resource"] = "resources/denoiser_recon_cnn_weights.bin"
                     suffix = "" if mode == "rgb" and layout == "dense" and kernel_size == 3 else f"_{mode}_{layout}"
                     if layout == "dense" and kernel_size != 3:
                         suffix = f"_{mode}_k{kernel_size}"
@@ -209,6 +212,7 @@ def main() -> None:
             train_cmd.extend(["--rgb-cnn-kernel-size", str(variant["rgb_cnn_kernel_size"])])
             train_cmd.extend(["--rgb-cnn-layout", variant["rgb_cnn_layout"]])
             train_cmd.extend(["--rgb-cnn-mode", variant["rgb_cnn_mode"]])
+            train_cmd.extend(["--sparse-coverage", str(args.sparse_coverage)])
         train_output = run(train_cmd, repo)
 
         resource_path = repo / variant["resource"]
@@ -228,6 +232,8 @@ def main() -> None:
         if variant["model"] == "rgb-cnn":
             bench_cmd.extend(["--rgb-cnn-layout", variant["rgb_cnn_layout"]])
             bench_cmd.extend(["--rgb-cnn-mode", variant["rgb_cnn_mode"]])
+            if variant["rgb_cnn_mode"] == "recon":
+                bench_cmd.extend(["--coverage", str(args.sparse_coverage)])
         bench_output = run(bench_cmd, repo)
         avg_ms, fps = parse_bench(bench_output)
         rows.append(

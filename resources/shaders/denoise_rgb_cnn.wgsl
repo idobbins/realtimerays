@@ -29,6 +29,11 @@ fn tanh_approx(x: f32) -> f32 {
     return 2.0 / (1.0 + exp(-2.0 * y)) - 1.0;
 }
 
+fn sigmoid_approx(x: f32) -> f32 {
+    let y = clamp(x, -10.0, 10.0);
+    return 1.0 / (1.0 + exp(-y));
+}
+
 fn display_store(px: vec2<i32>, color: vec3<f32>) {
     let display = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));
     textureStore(final_image, px, vec4<f32>(display, 1.0));
@@ -164,12 +169,20 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var tap = 0u; tap < RGB_CNN_TAP_COUNT; tap = tap + 1u) {
         let offset = rgb_cnn_tap_offset(tap);
         let q = clamp_px(px + offset, size);
-        let q_color = textureLoad(noisy_image, q, 0).rgb;
+        let q_sample = textureLoad(noisy_image, q, 0);
+        let q_color = q_sample.rgb;
         let q_luma = luminance(q_color);
+        let q_coverage = q_sample.a;
 
         for (var h = 0u; h < HIDDEN_CHANNELS; h = h + 1u) {
             if RGB_CNN_MODE == 1u {
                 hidden[h] = hidden[h] + q_luma * weights.values[conv0_weight_index(h, 0u, tap)];
+            } else if RGB_CNN_MODE == 2u {
+                hidden[h] = hidden[h]
+                    + q_color.x * weights.values[conv0_weight_index(h, 0u, tap)]
+                    + q_color.y * weights.values[conv0_weight_index(h, 1u, tap)]
+                    + q_color.z * weights.values[conv0_weight_index(h, 2u, tap)]
+                    + q_coverage * weights.values[conv0_weight_index(h, 3u, tap)];
             } else {
                 hidden[h] = hidden[h]
                     + q_color.x * weights.values[conv0_weight_index(h, 0u, tap)]
@@ -182,7 +195,7 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let conv1_weight_base = rgb_cnn_conv1_weight_offset();
     let conv1_bias_base = rgb_cnn_conv1_bias_offset();
     var raw_delta = vec3<f32>(weights.values[conv1_bias_base], 0.0, 0.0);
-    if RGB_CNN_MODE == 0u {
+    if RGB_CNN_MODE != 1u {
         raw_delta.y = weights.values[conv1_bias_base + 1u];
         raw_delta.z = weights.values[conv1_bias_base + 2u];
     }
@@ -212,6 +225,16 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let local_chroma = local_color / max(luminance(local_color), CHROMA_EPSILON);
         let chroma = select(center_chroma, local_chroma, center_luma < CHROMA_FALLBACK_LUMA);
         display_store(px, chroma * out_luma);
+        return;
+    }
+
+    if RGB_CNN_MODE == 2u {
+        let reconstructed = vec3<f32>(
+            sigmoid_approx(raw_delta.x),
+            sigmoid_approx(raw_delta.y),
+            sigmoid_approx(raw_delta.z),
+        );
+        display_store(px, reconstructed);
         return;
     }
 
