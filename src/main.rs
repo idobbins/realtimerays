@@ -26,7 +26,8 @@ const RUNTIME_SPP: u32 = 2;
 const DATASET_INPUT_SPP: u32 = 2;
 const DATASET_TARGET_SPP: u32 = 64;
 const RENDER_FLAG_GUIDES: u32 = 1;
-const FILTER_DENOISER_WEIGHT_COUNT: usize = 87;
+const FILTER_DENOISER_WEIGHT_COUNT: usize = 19;
+const RGB_CNN_DENOISER_WEIGHT_COUNT: usize = 251;
 const CNN_DENOISER_WEIGHT_COUNT: usize = 4739;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
@@ -51,6 +52,7 @@ const MOUNTAIN_LAYERS: i32 = 11;
 
 const TRACE_SHADER: &str = include_str!("../resources/shaders/trace.wgsl");
 const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
+const DENOISE_RGB_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_rgb_cnn.wgsl");
 const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.wgsl");
 const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
@@ -58,6 +60,7 @@ const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
 #[derive(Clone, Copy)]
 enum DenoiserKind {
     Filter,
+    RgbCnn,
     Cnn,
     Atrous,
 }
@@ -66,6 +69,7 @@ impl DenoiserKind {
     fn weight_count(self) -> Option<usize> {
         match self {
             Self::Filter => Some(FILTER_DENOISER_WEIGHT_COUNT),
+            Self::RgbCnn => Some(RGB_CNN_DENOISER_WEIGHT_COUNT),
             Self::Cnn => Some(CNN_DENOISER_WEIGHT_COUNT),
             Self::Atrous => None,
         }
@@ -74,6 +78,7 @@ impl DenoiserKind {
     fn weight_path(self) -> Option<&'static str> {
         match self {
             Self::Filter => Some("resources/denoiser_weights.bin"),
+            Self::RgbCnn => Some("resources/denoiser_rgb_cnn_weights.bin"),
             Self::Cnn => Some("resources/denoiser_cnn_weights.bin"),
             Self::Atrous => None,
         }
@@ -82,6 +87,7 @@ impl DenoiserKind {
     fn shader_source(self) -> &'static str {
         match self {
             Self::Filter => DENOISE_SHADER,
+            Self::RgbCnn => DENOISE_RGB_CNN_SHADER,
             Self::Cnn => DENOISE_CNN_SHADER,
             Self::Atrous => DENOISE_ATROUS_SHADER,
         }
@@ -90,19 +96,24 @@ impl DenoiserKind {
     fn shader_label(self) -> &'static str {
         match self {
             Self::Filter => "denoise shader",
+            Self::RgbCnn => "rgb cnn denoise shader",
             Self::Cnn => "cnn denoise shader",
             Self::Atrous => "atrous denoise shader",
         }
     }
 
     fn is_single_pass(self) -> bool {
-        matches!(self, Self::Filter | Self::Cnn)
+        matches!(self, Self::Filter | Self::RgbCnn | Self::Cnn)
+    }
+
+    fn needs_guides(self) -> bool {
+        !matches!(self, Self::RgbCnn)
     }
 
     fn runtime_spp(self) -> u32 {
         match self {
             Self::Atrous => 1,
-            Self::Filter | Self::Cnn => RUNTIME_SPP,
+            Self::Filter | Self::RgbCnn | Self::Cnn => RUNTIME_SPP,
         }
     }
 }
@@ -1501,7 +1512,9 @@ impl Renderer {
         }
 
         match self.denoiser {
-            Some(DenoiserKind::Filter | DenoiserKind::Cnn) => self.dispatch_denoiser(&mut encoder),
+            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn | DenoiserKind::Cnn) => {
+                self.dispatch_denoiser(&mut encoder)
+            }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(&mut encoder),
             None => self.dispatch_display_copy(&mut encoder),
         }
@@ -1776,6 +1789,18 @@ impl Recorder {
         Ok(())
     }
 
+    fn submit_denoiser_only(&self) -> Result<(), Box<dyn Error>> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bench denoiser-only encoder"),
+            });
+        self.encode_denoiser_only(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        Ok(())
+    }
+
     fn encode_frame(&self, encoder: &mut wgpu::CommandEncoder) {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1791,7 +1816,19 @@ impl Recorder {
             );
         }
         match self.denoiser {
-            Some(DenoiserKind::Filter | DenoiserKind::Cnn) => self.dispatch_denoiser(encoder),
+            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn | DenoiserKind::Cnn) => {
+                self.dispatch_denoiser(encoder)
+            }
+            Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
+            None => self.dispatch_display_copy(encoder),
+        }
+    }
+
+    fn encode_denoiser_only(&self, encoder: &mut wgpu::CommandEncoder) {
+        match self.denoiser {
+            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn | DenoiserKind::Cnn) => {
+                self.dispatch_denoiser(encoder)
+            }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
             None => self.dispatch_display_copy(encoder),
         }
@@ -1883,9 +1920,9 @@ impl Recorder {
 
 struct DatasetFrame {
     input_color: Vec<u8>,
-    input_normal: Vec<u8>,
-    input_albedo: Vec<u8>,
-    input_depth: Vec<u8>,
+    input_normal: Option<Vec<u8>>,
+    input_albedo: Option<Vec<u8>>,
+    input_depth: Option<Vec<u8>>,
     target_color: Vec<u8>,
     debug_input: Vec<u8>,
     debug_target: Vec<u8>,
@@ -1990,6 +2027,7 @@ impl DatasetRecorder {
         &self,
         input_camera: &CameraUniform,
         target_camera: &CameraUniform,
+        capture_guides: bool,
     ) -> Result<DatasetFrame, Box<dyn Error>> {
         self.queue.write_buffer(
             &self.input_camera_buffer,
@@ -2055,33 +2093,45 @@ impl DatasetRecorder {
             8,
             "dataset input color readback",
         )?;
-        let input_normal = copy_texture_to_vec(
-            &self.device,
-            &mut encoder,
-            &self.input_textures.normal,
-            self.width,
-            self.height,
-            8,
-            "dataset input normal readback",
-        )?;
-        let input_albedo = copy_texture_to_vec(
-            &self.device,
-            &mut encoder,
-            &self.input_textures.albedo,
-            self.width,
-            self.height,
-            8,
-            "dataset input albedo readback",
-        )?;
-        let input_depth = copy_texture_to_vec(
-            &self.device,
-            &mut encoder,
-            &self.input_textures.depth,
-            self.width,
-            self.height,
-            8,
-            "dataset input depth readback",
-        )?;
+        let input_normal = if capture_guides {
+            Some(copy_texture_to_vec(
+                &self.device,
+                &mut encoder,
+                &self.input_textures.normal,
+                self.width,
+                self.height,
+                8,
+                "dataset input normal readback",
+            )?)
+        } else {
+            None
+        };
+        let input_albedo = if capture_guides {
+            Some(copy_texture_to_vec(
+                &self.device,
+                &mut encoder,
+                &self.input_textures.albedo,
+                self.width,
+                self.height,
+                8,
+                "dataset input albedo readback",
+            )?)
+        } else {
+            None
+        };
+        let input_depth = if capture_guides {
+            Some(copy_texture_to_vec(
+                &self.device,
+                &mut encoder,
+                &self.input_textures.depth,
+                self.width,
+                self.height,
+                8,
+                "dataset input depth readback",
+            )?)
+        } else {
+            None
+        };
         let target_color = copy_texture_to_vec(
             &self.device,
             &mut encoder,
@@ -2113,9 +2163,15 @@ impl DatasetRecorder {
 
         Ok(DatasetFrame {
             input_color: map_readback(&self.device, input_color)?,
-            input_normal: map_readback(&self.device, input_normal)?,
-            input_albedo: map_readback(&self.device, input_albedo)?,
-            input_depth: map_readback(&self.device, input_depth)?,
+            input_normal: input_normal
+                .map(|pending| map_readback(&self.device, pending))
+                .transpose()?,
+            input_albedo: input_albedo
+                .map(|pending| map_readback(&self.device, pending))
+                .transpose()?,
+            input_depth: input_depth
+                .map(|pending| map_readback(&self.device, pending))
+                .transpose()?,
             target_color: map_readback(&self.device, target_color)?,
             debug_input: map_readback(&self.device, debug_input)?,
             debug_target: map_readback(&self.device, debug_target)?,
@@ -2185,8 +2241,8 @@ impl ApplicationHandler for App {
                         .map(DenoiserKind::runtime_spp)
                         .unwrap_or(RUNTIME_SPP)
                 });
-                let camera =
-                    camera_uniform(time, sample_count, seed_offset, renderer.denoiser.is_some());
+                let write_guides = renderer.denoiser.is_some_and(DenoiserKind::needs_guides);
+                let camera = camera_uniform(time, sample_count, seed_offset, write_guides);
                 renderer.render(&camera);
             }
             _ => {}
@@ -2367,7 +2423,7 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
             time,
             sample_count,
             frame_index,
-            denoiser.is_some(),
+            denoiser.is_some_and(DenoiserKind::needs_guides),
         ))?;
         let path = output_dir.join(format!("frame_{frame_index:06}.png"));
         write_png(&path, WIDTH, HEIGHT, &pixels)?;
@@ -2392,36 +2448,48 @@ fn run_dataset(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("renders/denoiser_dataset"));
     let frame_count = parse_frame_count(args)?;
+    let rgb_only = args.iter().any(|arg| arg == "--rgb-only");
+    let channels = if rgb_only {
+        "[\"input_color\", \"target_color\"]"
+    } else {
+        "[\"input_color\", \"input_normal\", \"input_albedo\", \"input_depth\", \"target_color\"]"
+    };
 
     fs::create_dir_all(&output_dir)?;
     let meta = format!(
-        "{{\n  \"width\": {WIDTH},\n  \"height\": {HEIGHT},\n  \"input_spp\": {DATASET_INPUT_SPP},\n  \"target_spp\": {DATASET_TARGET_SPP},\n  \"frames\": {frame_count},\n  \"format\": \"rgba16float little-endian raw files plus rgba8 debug pngs\",\n  \"channels\": [\"input_color\", \"input_normal\", \"input_albedo\", \"input_depth\", \"target_color\"]\n}}\n"
+        "{{\n  \"width\": {WIDTH},\n  \"height\": {HEIGHT},\n  \"input_spp\": {DATASET_INPUT_SPP},\n  \"target_spp\": {DATASET_TARGET_SPP},\n  \"frames\": {frame_count},\n  \"rgb_only\": {rgb_only},\n  \"format\": \"rgba16float little-endian raw files plus rgba8 debug pngs\",\n  \"channels\": {channels}\n}}\n"
     );
     write_bytes(&output_dir.join("dataset_meta.json"), meta.as_bytes())?;
 
     let recorder = DatasetRecorder::new(WIDTH, HEIGHT)?;
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        let input_camera = camera_uniform(time, DATASET_INPUT_SPP, frame_index, true);
-        let target_camera = camera_uniform(time, DATASET_TARGET_SPP, frame_index, true);
-        let frame = recorder.capture_pair(&input_camera, &target_camera)?;
+        let input_camera = camera_uniform(time, DATASET_INPUT_SPP, frame_index, !rgb_only);
+        let target_camera = camera_uniform(time, DATASET_TARGET_SPP, frame_index, false);
+        let frame = recorder.capture_pair(&input_camera, &target_camera, !rgb_only)?;
 
         write_bytes(
             &output_dir.join(format!("input_color_{frame_index:06}.rgba16f")),
             &frame.input_color,
         )?;
-        write_bytes(
-            &output_dir.join(format!("input_normal_{frame_index:06}.rgba16f")),
-            &frame.input_normal,
-        )?;
-        write_bytes(
-            &output_dir.join(format!("input_albedo_{frame_index:06}.rgba16f")),
-            &frame.input_albedo,
-        )?;
-        write_bytes(
-            &output_dir.join(format!("input_depth_{frame_index:06}.rgba16f")),
-            &frame.input_depth,
-        )?;
+        if let Some(input_normal) = frame.input_normal.as_deref() {
+            write_bytes(
+                &output_dir.join(format!("input_normal_{frame_index:06}.rgba16f")),
+                input_normal,
+            )?;
+        }
+        if let Some(input_albedo) = frame.input_albedo.as_deref() {
+            write_bytes(
+                &output_dir.join(format!("input_albedo_{frame_index:06}.rgba16f")),
+                input_albedo,
+            )?;
+        }
+        if let Some(input_depth) = frame.input_depth.as_deref() {
+            write_bytes(
+                &output_dir.join(format!("input_depth_{frame_index:06}.rgba16f")),
+                input_depth,
+            )?;
+        }
         write_bytes(
             &output_dir.join(format!("target_color_{frame_index:06}.rgba16f")),
             &frame.target_color,
@@ -2488,6 +2556,8 @@ fn parse_denoiser_kind(args: &[String]) -> DenoiserKind {
         DenoiserKind::Atrous
     } else if args.iter().any(|arg| arg == "--filter-denoise") {
         DenoiserKind::Filter
+    } else if args.iter().any(|arg| arg == "--rgb-cnn-denoise") {
+        DenoiserKind::RgbCnn
     } else if args.iter().any(|arg| arg == "--cnn-denoise") {
         DenoiserKind::Cnn
     } else {
@@ -2501,6 +2571,44 @@ fn parse_optional_denoiser_kind(args: &[String]) -> Option<DenoiserKind> {
     } else {
         Some(parse_denoiser_kind(args))
     }
+}
+
+fn run_denoiser_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let frames = parse_arg_u32(args, "--frames", 240)?;
+    let warmup = parse_arg_u32(args, "--warmup", 20)?;
+    let denoiser = parse_optional_denoiser_kind(args);
+    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
+
+    let sample_count = denoiser
+        .map(DenoiserKind::runtime_spp)
+        .unwrap_or(RUNTIME_SPP);
+    recorder.submit_frame(&camera_uniform(
+        0.0,
+        sample_count,
+        0,
+        denoiser.is_some_and(DenoiserKind::needs_guides),
+    ))?;
+    for _ in 0..warmup {
+        recorder.submit_denoiser_only()?;
+    }
+
+    let start = Instant::now();
+    let mut encoder = recorder
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("denoiser batched benchmark encoder"),
+        });
+    for _ in 0..frames {
+        recorder.encode_denoiser_only(&mut encoder);
+    }
+    recorder.queue.submit([encoder.finish()]);
+    recorder.device.poll(wgpu::PollType::wait_indefinitely())?;
+    let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
+    println!(
+        "denoiser-bench mode=batched-submit frames={} warmup={} avg_ms={:.3}",
+        frames, warmup, ms
+    );
+    Ok(())
 }
 
 fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -2519,7 +2627,7 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
             time,
             sample_count,
             frame_index,
-            denoiser.is_some(),
+            denoiser.is_some_and(DenoiserKind::needs_guides),
         ))?;
     }
 
@@ -2530,7 +2638,7 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
             time,
             sample_count,
             warmup + frame_index,
-            denoiser.is_some(),
+            denoiser.is_some_and(DenoiserKind::needs_guides),
         ))?;
     }
     let seconds = start.elapsed().as_secs_f64();
@@ -2612,6 +2720,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("record-x") | Some("--record-x") => return run_record_x(&args[1..]),
         Some("dataset") => return run_dataset(&args[1..]),
         Some("bench") => return run_bench(&args[1..]),
+        Some("bench-denoiser") => return run_denoiser_bench(&args[1..]),
         Some("remux") => {
             let output_dir = args
                 .get(1)
@@ -2623,21 +2732,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("usage:");
             println!("  realtimerays");
             println!("  realtimerays --no-denoise");
+            println!("  realtimerays --rgb-cnn-denoise");
             println!("  realtimerays --cnn-denoise");
             println!("  realtimerays --filter-denoise");
             println!("  realtimerays --atrous-denoise");
             println!("  realtimerays --spp N");
             println!(
-                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
             );
-            println!("  realtimerays dataset [output-dir] [--frames N]");
             println!(
-                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays bench-denoiser [--frames N] [--warmup N] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+            );
+            println!("  realtimerays dataset [output-dir] [--frames N] [--rgb-only]");
+            println!(
+                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
             );
             println!("  realtimerays remux [output-dir]");
             return Ok(());
         }
         Some("--no-denoise") => {}
+        Some("--rgb-cnn-denoise") => {}
         Some("--cnn-denoise") => {}
         Some("--filter-denoise") => {}
         Some("--atrous-denoise") => {}
@@ -2661,6 +2775,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(DenoiserKind::Atrous)
     } else if args.iter().any(|arg| arg == "--filter-denoise") {
         Some(DenoiserKind::Filter)
+    } else if args.iter().any(|arg| arg == "--rgb-cnn-denoise") {
+        Some(DenoiserKind::RgbCnn)
     } else if args.iter().any(|arg| arg == "--cnn-denoise") {
         Some(DenoiserKind::Cnn)
     } else {

@@ -9,9 +9,7 @@ struct Weights {
 @group(0) @binding(6) var<storage, read> weights: Weights;
 @group(0) @binding(20) var final_image: texture_storage_2d<rgba8unorm, write>;
 
-const MAX_FILTER_RADIUS: i32 = 4;
-const MAX_FILTER_SIZE: u32 = 9u;
-const MAX_FILTER_TAPS: u32 = MAX_FILTER_SIZE * MAX_FILTER_SIZE;
+const FILTER_TAPS: u32 = 13u;
 
 const RADIUS_OFFSET: u32 = 0u;
 const BLEND_OFFSET: u32 = 1u;
@@ -43,10 +41,48 @@ fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-fn tap_index(ox: i32, oy: i32) -> u32 {
-    let x = u32(ox + MAX_FILTER_RADIUS);
-    let y = u32(oy + MAX_FILTER_RADIUS);
-    return y * MAX_FILTER_SIZE + x;
+fn tap_offset(index: u32) -> vec2<i32> {
+    switch index {
+        case 0u: {
+            return vec2<i32>(-1, -1);
+        }
+        case 1u: {
+            return vec2<i32>(0, -1);
+        }
+        case 2u: {
+            return vec2<i32>(1, -1);
+        }
+        case 3u: {
+            return vec2<i32>(-1, 0);
+        }
+        case 4u: {
+            return vec2<i32>(0, 0);
+        }
+        case 5u: {
+            return vec2<i32>(1, 0);
+        }
+        case 6u: {
+            return vec2<i32>(-1, 1);
+        }
+        case 7u: {
+            return vec2<i32>(0, 1);
+        }
+        case 8u: {
+            return vec2<i32>(1, 1);
+        }
+        case 9u: {
+            return vec2<i32>(-4, 0);
+        }
+        case 10u: {
+            return vec2<i32>(4, 0);
+        }
+        case 11u: {
+            return vec2<i32>(0, -4);
+        }
+        default: {
+            return vec2<i32>(0, 4);
+        }
+    }
 }
 
 fn display_store(px: vec2<i32>, color: vec3<f32>) {
@@ -77,7 +113,6 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let center = clamp_px(px, size);
     let center_color = textureLoad(noisy_image, center, 0).rgb;
-    let radius = i32(clamp(round(weights.values[RADIUS_OFFSET]), 1.0, f32(MAX_FILTER_RADIUS)));
 
     let color_raw = weights.values[COLOR_PENALTY_OFFSET];
     let normal_raw = weights.values[NORMAL_PENALTY_OFFSET];
@@ -109,38 +144,32 @@ fn filter_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var sum_luma = 0.0;
     var sum_weight = 0.0;
-    for (var oy = -MAX_FILTER_RADIUS; oy <= MAX_FILTER_RADIUS; oy = oy + 1) {
-        for (var ox = -MAX_FILTER_RADIUS; ox <= MAX_FILTER_RADIUS; ox = ox + 1) {
-            if abs(ox) > radius || abs(oy) > radius {
-                continue;
-            }
+    for (var tap = 0u; tap < FILTER_TAPS; tap = tap + 1u) {
+        let q = clamp_px(px + tap_offset(tap), size);
+        let q_color = textureLoad(noisy_image, q, 0).rgb;
+        let q_luma = luminance(q_color);
+        var log_weight = weights.values[SPATIAL_OFFSET + tap];
 
-            let q = clamp_px(px + vec2<i32>(ox, oy), size);
-            let q_color = textureLoad(noisy_image, q, 0).rgb;
-            let q_luma = luminance(q_color);
-            var log_weight = weights.values[SPATIAL_OFFSET + tap_index(ox, oy)];
-
-            if use_color {
-                log_weight -= color_penalty * sqr_len3(q_color - center_color);
-            }
-            if use_normal {
-                let q_normal = textureLoad(normal_image, q, 0).rgb;
-                log_weight -= normal_penalty * sqr_len3(q_normal - center_normal);
-            }
-            if use_albedo {
-                let q_albedo = textureLoad(albedo_image, q, 0).rgb;
-                log_weight -= albedo_penalty * sqr_len3(q_albedo - center_albedo);
-            }
-            if use_depth {
-                let q_depth = textureLoad(depth_image, q, 0).x;
-                let depth_diff = q_depth - center_depth;
-                log_weight -= depth_penalty * depth_diff * depth_diff;
-            }
-
-            let w = exp(clamp(log_weight, -20.0, 20.0));
-            sum_luma += q_luma * w;
-            sum_weight += w;
+        if use_color {
+            log_weight -= color_penalty * sqr_len3(q_color - center_color);
         }
+        if use_normal {
+            let q_normal = textureLoad(normal_image, q, 0).rgb;
+            log_weight -= normal_penalty * sqr_len3(q_normal - center_normal);
+        }
+        if use_albedo {
+            let q_albedo = textureLoad(albedo_image, q, 0).rgb;
+            log_weight -= albedo_penalty * sqr_len3(q_albedo - center_albedo);
+        }
+        if use_depth {
+            let q_depth = textureLoad(depth_image, q, 0).x;
+            let depth_diff = q_depth - center_depth;
+            log_weight -= depth_penalty * depth_diff * depth_diff;
+        }
+
+        let w = exp(clamp(log_weight, -20.0, 20.0));
+        sum_luma += q_luma * w;
+        sum_weight += w;
     }
 
     let center_luma = luminance(center_color);

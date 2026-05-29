@@ -9,22 +9,38 @@ from pathlib import Path
 
 
 VARIANTS = [
-    ("r1_spatial", 1, "none"),
-    ("r1_color", 1, "color"),
-    ("r1_n", 1, "normal"),
-    ("r1_ad", 1, "albedo,depth"),
-    ("r1_nd", 1, "normal,depth"),
-    ("r1_nad", 1, "normal,albedo,depth"),
-    ("r1_color_nad", 1, "color,normal,albedo,depth"),
-    ("r2_spatial", 2, "none"),
-    ("r2_nd", 2, "normal,depth"),
-    ("r2_nad", 2, "normal,albedo,depth"),
-    ("r2_color_nad", 2, "color,normal,albedo,depth"),
-    ("r3_spatial", 3, "none"),
-    ("r3_nad", 3, "normal,albedo,depth"),
-    ("r3_color_nad", 3, "color,normal,albedo,depth"),
-    ("r4_nad", 4, "normal,albedo,depth"),
-    ("r4_color_nad", 4, "color,normal,albedo,depth"),
+    {
+        "name": "sparse13_spatial",
+        "model": "filter",
+        "tap_pattern": "sparse13",
+        "guides": "none",
+        "resource": "resources/denoiser_weights.bin",
+        "bench_flag": "--filter-denoise",
+    },
+    {
+        "name": "sparse13_nd",
+        "model": "filter",
+        "tap_pattern": "sparse13",
+        "guides": "normal,depth",
+        "resource": "resources/denoiser_weights.bin",
+        "bench_flag": "--filter-denoise",
+    },
+    {
+        "name": "sparse13_nad",
+        "model": "filter",
+        "tap_pattern": "sparse13",
+        "guides": "normal,albedo,depth",
+        "resource": "resources/denoiser_weights.bin",
+        "bench_flag": "--filter-denoise",
+    },
+    {
+        "name": "rgbcnn_h8",
+        "model": "rgb-cnn",
+        "tap_pattern": None,
+        "guides": "none",
+        "resource": "resources/denoiser_rgb_cnn_weights.bin",
+        "bench_flag": "--rgb-cnn-denoise",
+    },
 ]
 
 
@@ -43,7 +59,7 @@ def run(cmd: list[str], cwd: Path) -> str:
 
 
 def parse_loss(output: str) -> float:
-    matches = re.findall(r"epoch \\d+/\\d+ loss ([0-9.]+)", output)
+    matches = re.findall(r"epoch \d+/\d+ loss ([0-9.]+)", output)
     return float(matches[-1]) if matches else float("nan")
 
 
@@ -53,10 +69,12 @@ def parse_val_loss(output: str) -> float:
 
 
 def parse_bench(output: str) -> tuple[float, float]:
-    match = re.search(r"avg_ms=([0-9.]+) fps=([0-9.]+)", output)
+    match = re.search(r"avg_ms=([0-9.]+)(?: fps=([0-9.]+))?", output)
     if not match:
         return float("nan"), float("nan")
-    return float(match.group(1)), float(match.group(2))
+    avg_ms = float(match.group(1))
+    fps = float(match.group(2)) if match.group(2) is not None else 1000.0 / avg_ms
+    return avg_ms, fps
 
 
 def main() -> None:
@@ -80,53 +98,56 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     rows = []
 
-    for name, radius, guides in VARIANTS:
+    for variant in VARIANTS:
+        name = variant["name"]
         weights_path = args.out_dir / f"{name}.bin"
-        train_output = run(
-            [
-                sys.executable,
-                "tools/train_denoiser.py",
-                str(args.dataset),
-                "--epochs",
-                str(args.epochs),
-                "--steps-per-epoch",
-                str(args.steps_per_epoch),
-                "--batch-size",
-                str(args.batch_size),
-                "--crop-size",
-                str(args.crop_size),
-                "--val-steps",
-                str(args.val_steps),
-                "--seed",
-                str(args.seed),
-                "--importance-prob",
-                str(args.importance_prob),
-                "--importance-stride",
-                str(args.importance_stride),
-                "--high-weight",
-                str(args.high_weight),
-                "--radius",
-                str(radius),
-                "--guides",
-                guides,
-                "--output",
-                str(weights_path),
-            ],
-            repo,
-        )
+        train_cmd = [
+            sys.executable,
+            "tools/train_denoiser.py",
+            str(args.dataset),
+            "--model",
+            variant["model"],
+            "--epochs",
+            str(args.epochs),
+            "--steps-per-epoch",
+            str(args.steps_per_epoch),
+            "--batch-size",
+            str(args.batch_size),
+            "--crop-size",
+            str(args.crop_size),
+            "--val-steps",
+            str(args.val_steps),
+            "--seed",
+            str(args.seed),
+            "--importance-prob",
+            str(args.importance_prob),
+            "--importance-stride",
+            str(args.importance_stride),
+            "--high-weight",
+            str(args.high_weight),
+            "--guides",
+            variant["guides"],
+            "--output",
+            str(weights_path),
+        ]
+        if variant["tap_pattern"] is not None:
+            train_cmd.extend(["--tap-pattern", variant["tap_pattern"]])
+        train_output = run(train_cmd, repo)
 
-        shutil.copyfile(weights_path, repo / "resources/denoiser_weights.bin")
+        resource_path = repo / variant["resource"]
+        shutil.copyfile(weights_path, resource_path)
         bench_output = run(
             [
                 "cargo",
                 "run",
                 "--release",
                 "--",
-                "bench",
+                "bench-denoiser",
                 "--frames",
                 str(args.bench_frames),
                 "--warmup",
                 str(args.bench_warmup),
+                variant["bench_flag"],
             ],
             repo,
         )
@@ -134,13 +155,15 @@ def main() -> None:
         rows.append(
             {
                 "name": name,
-                "radius": radius,
-                "guides": guides,
+                "model": variant["model"],
+                "tap_pattern": variant["tap_pattern"] or "",
+                "guides": variant["guides"],
                 "loss": parse_loss(train_output),
                 "val_loss": parse_val_loss(train_output),
                 "avg_ms": avg_ms,
                 "fps": fps,
                 "weights": str(weights_path),
+                "resource": variant["resource"],
             }
         )
 
@@ -148,15 +171,26 @@ def main() -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["name", "radius", "guides", "loss", "val_loss", "avg_ms", "fps", "weights"],
+            fieldnames=[
+                "name",
+                "model",
+                "tap_pattern",
+                "guides",
+                "loss",
+                "val_loss",
+                "avg_ms",
+                "fps",
+                "weights",
+                "resource",
+            ],
         )
         writer.writeheader()
         writer.writerows(rows)
 
     best = min(rows, key=lambda row: (row["val_loss"], row["avg_ms"]))
-    shutil.copyfile(best["weights"], repo / "resources/denoiser_weights.bin")
+    shutil.copyfile(best["weights"], repo / best["resource"])
     print(f"wrote {csv_path}")
-    print(f"selected {best['name']} -> resources/denoiser_weights.bin")
+    print(f"selected {best['name']} -> {best['resource']}")
 
 
 if __name__ == "__main__":

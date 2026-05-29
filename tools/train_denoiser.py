@@ -16,14 +16,43 @@ except ImportError:
 
 MAX_FILTER_RADIUS = 4
 MAX_FILTER_SIZE = MAX_FILTER_RADIUS * 2 + 1
-MAX_FILTER_TAPS = MAX_FILTER_SIZE * MAX_FILTER_SIZE
 DISABLED_PENALTY = -20.0
 MAX_LUMA_BLEND = 0.45
 MAX_CNN_LUMA_DELTA = 0.12
 CNN_HIDDEN_CHANNELS = 32
 CNN_INPUT_CHANNELS = 16
+RGB_CNN_HIDDEN_CHANNELS = 8
+RGB_CNN_INPUT_CHANNELS = 3
 MAX_CNN_RGB_DELTA = 0.22
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
+FILTER_TAP_PATTERNS = {
+    "dense3": [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (0, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ],
+    "sparse13": [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (0, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+        (-4, 0),
+        (4, 0),
+        (0, -4),
+        (0, 4),
+    ],
+}
 
 
 def luminance(rgb: torch.Tensor) -> torch.Tensor:
@@ -32,15 +61,18 @@ def luminance(rgb: torch.Tensor) -> torch.Tensor:
 
 
 class LearnedFilter(torch.nn.Module):
-    def __init__(self, radius: int, guides: set[str]) -> None:
+    def __init__(self, tap_pattern: str, guides: set[str]) -> None:
         super().__init__()
-        self.radius = radius
+        self.tap_pattern = tap_pattern
+        self.tap_offsets = FILTER_TAP_PATTERNS[tap_pattern]
+        self.radius = max(max(abs(x), abs(y)) for x, y in self.tap_offsets)
         self.guides = guides
         offsets = []
-        for y in range(-MAX_FILTER_RADIUS, MAX_FILTER_RADIUS + 1):
-            for x in range(-MAX_FILTER_RADIUS, MAX_FILTER_RADIUS + 1):
-                offsets.append(-0.35 * float(x * x + y * y))
+        for x, y in self.tap_offsets:
+            offsets.append(-0.35 * float(x * x + y * y))
         self.spatial_logits = torch.nn.Parameter(torch.tensor(offsets, dtype=torch.float32))
+        tap_indices = [(y + MAX_FILTER_RADIUS) * MAX_FILTER_SIZE + x + MAX_FILTER_RADIUS for x, y in self.tap_offsets]
+        self.register_buffer("tap_indices", torch.tensor(tap_indices, dtype=torch.long), persistent=False)
         self.color_penalty = torch.nn.Parameter(torch.tensor(1.0))
         self.normal_penalty = torch.nn.Parameter(torch.tensor(2.0))
         self.albedo_penalty = torch.nn.Parameter(torch.tensor(2.0))
@@ -60,7 +92,9 @@ class LearnedFilter(torch.nn.Module):
         )
         patches = F.unfold(padded, kernel_size=MAX_FILTER_SIZE)
         b, _, hw = patches.shape
-        patches = patches.view(b, 10, MAX_FILTER_TAPS, hw)
+        patches = patches.view(b, 10, MAX_FILTER_SIZE * MAX_FILTER_SIZE, hw)
+        patches = patches.index_select(2, self.tap_indices)
+        tap_count = len(self.tap_offsets)
 
         center_color = color.reshape(b, 3, 1, hw)
         center_normal = normal.reshape(b, 3, 1, hw)
@@ -72,7 +106,7 @@ class LearnedFilter(torch.nn.Module):
         patch_albedo = patches[:, 6:9]
         patch_depth = patches[:, 9:10]
 
-        logits = self.spatial_logits.view(1, MAX_FILTER_TAPS, 1)
+        logits = self.spatial_logits.view(1, tap_count, 1)
         if "color" in self.guides:
             color_diff = ((patch_color - center_color) ** 2).sum(dim=1)
             logits = logits - F.softplus(self.color_penalty) * color_diff
@@ -86,12 +120,6 @@ class LearnedFilter(torch.nn.Module):
             depth_diff = ((patch_depth - center_depth) ** 2).sum(dim=1)
             logits = logits - F.softplus(self.depth_penalty) * depth_diff
 
-        active = []
-        for oy in range(-MAX_FILTER_RADIUS, MAX_FILTER_RADIUS + 1):
-            for ox in range(-MAX_FILTER_RADIUS, MAX_FILTER_RADIUS + 1):
-                active.append(abs(ox) <= self.radius and abs(oy) <= self.radius)
-        active_mask = torch.tensor(active, device=x.device, dtype=torch.bool).view(1, MAX_FILTER_TAPS, 1)
-        logits = logits.masked_fill(~active_mask, -1.0e9)
         weights = torch.softmax(logits, dim=1).unsqueeze(1)
         luma_weights = LUMA_WEIGHTS.to(device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
         patch_luma = torch.sum(patch_color * luma_weights, dim=1, keepdim=True)
@@ -157,6 +185,35 @@ class TinyCnnDenoiser(torch.nn.Module):
         return torch.clamp(chroma * out_luma, 0.0, 1.0)
 
 
+class RgbTinyCnnDenoiser(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv0_weight = torch.nn.Parameter(
+            torch.empty(RGB_CNN_HIDDEN_CHANNELS, RGB_CNN_INPUT_CHANNELS, 3, 3)
+        )
+        self.conv0_bias = torch.nn.Parameter(torch.zeros(RGB_CNN_HIDDEN_CHANNELS))
+        self.conv1_weight = torch.nn.Parameter(torch.zeros(3, RGB_CNN_HIDDEN_CHANNELS))
+        self.conv1_bias = torch.nn.Parameter(torch.zeros(3))
+        torch.nn.init.kaiming_uniform_(self.conv0_weight, nonlinearity="relu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        color = x[:, 0:3]
+        b, _, h, w = color.shape
+
+        padded = F.pad(color, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, RGB_CNN_INPUT_CHANNELS, 9, h * w)
+        hidden = torch.einsum(
+            "hct,bctn->bhn",
+            self.conv0_weight.view(RGB_CNN_HIDDEN_CHANNELS, RGB_CNN_INPUT_CHANNELS, 9),
+            patches,
+        )
+        hidden = F.relu(hidden + self.conv0_bias.view(1, RGB_CNN_HIDDEN_CHANNELS, 1))
+        raw_delta = torch.einsum("oh,bhn->bon", self.conv1_weight, hidden)
+        raw_delta = raw_delta + self.conv1_bias.view(1, 3, 1)
+        delta = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta.view(b, 3, h, w))
+        return torch.clamp(color + delta, 0.0, 1.0)
+
+
 class ResidualCnnDenoiser(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -218,12 +275,19 @@ class DenoiserDataset:
         frames: list[int],
         importance_prob: float,
         importance_stride: int,
+        importance_error_weight: float,
+        importance_gradient_weight: float,
+        importance_guide_weight: float,
+        load_guides: bool,
     ) -> None:
         self.root = root
         self.crop_size = crop_size
         self.active_frames = frames
         self.importance_prob = importance_prob
         self.importance_stride = importance_stride
+        self.importance_error_weight = importance_error_weight
+        self.importance_gradient_weight = importance_gradient_weight
+        self.importance_guide_weight = importance_guide_weight
         self.cache: dict[tuple[str, int], np.memmap] = {}
         self.importance_cdf: np.ndarray | None = None
         self.importance_tiles: list[tuple[int, int, int]] = []
@@ -232,6 +296,11 @@ class DenoiserDataset:
         self.width = int(self.meta["width"])
         self.height = int(self.meta["height"])
         self.frames = int(self.meta["frames"])
+        self.load_guides = load_guides
+        self.channels = set(self.meta.get("channels", []))
+        self.has_guides = {"input_normal", "input_albedo", "input_depth"}.issubset(self.channels)
+        if self.load_guides and not self.has_guides:
+            raise ValueError(f"{root} does not contain input guide channels; use --model rgb-cnn")
         if self.importance_prob > 0.0:
             self._build_importance_cdf()
 
@@ -253,7 +322,33 @@ class DenoiserDataset:
         for frame in self.active_frames:
             noisy = self._rgba16f("input_color", frame)[::step, ::step, 0:3].astype(np.float32)
             target = self._rgba16f("target_color", frame)[::step, ::step, 0:3].astype(np.float32)
+
+            target_luma = (
+                0.2126 * target[..., 0]
+                + 0.7152 * target[..., 1]
+                + 0.0722 * target[..., 2]
+            )
             error = np.mean(np.abs(target - noisy), axis=2)
+            grad = np.zeros_like(target_luma)
+            grad[:, 1:] += np.abs(target_luma[:, 1:] - target_luma[:, :-1])
+            grad[1:, :] += np.abs(target_luma[1:, :] - target_luma[:-1, :])
+
+            guide = np.zeros_like(target_luma)
+            if self.load_guides:
+                normal = self._rgba16f("input_normal", frame)[::step, ::step, 0:3].astype(np.float32)
+                albedo = self._rgba16f("input_albedo", frame)[::step, ::step, 0:3].astype(np.float32)
+                depth = self._rgba16f("input_depth", frame)[::step, ::step, 0:1].astype(np.float32)
+                for field in (normal, albedo, depth):
+                    delta = np.zeros_like(target_luma)
+                    delta[:, 1:] += np.mean(np.abs(field[:, 1:] - field[:, :-1]), axis=2)
+                    delta[1:, :] += np.mean(np.abs(field[1:, :] - field[:-1, :]), axis=2)
+                    guide += delta
+
+            score = (
+                self.importance_error_weight * error
+                + self.importance_gradient_weight * grad
+                + self.importance_guide_weight * guide
+            )
             for ty in range(error.shape[0]):
                 for tx in range(error.shape[1]):
                     cx = min(max(tx * step, half), self.width - half - 1)
@@ -261,7 +356,7 @@ class DenoiserDataset:
                     x0 = min(max(cx - half, 0), x_max)
                     y0 = min(max(cy - half, 0), y_max)
                     self.importance_tiles.append((frame, x0, y0))
-                    weights.append(float(error[ty, tx]) + 0.00001)
+                    weights.append(float(score[ty, tx]) + 0.00001)
 
         cdf = np.cumsum(np.asarray(weights, dtype=np.float64))
         if cdf[-1] <= 0.0:
@@ -286,12 +381,15 @@ class DenoiserDataset:
         crop = np.s_[y0 : y0 + self.crop_size, x0 : x0 + self.crop_size]
 
         color = self._rgba16f("input_color", frame)[crop][..., 0:3].astype(np.float32)
-        normal = self._rgba16f("input_normal", frame)[crop][..., 0:3].astype(np.float32)
-        albedo = self._rgba16f("input_albedo", frame)[crop][..., 0:3].astype(np.float32)
-        depth = self._rgba16f("input_depth", frame)[crop][..., 0:1].astype(np.float32)
         target = self._rgba16f("target_color", frame)[crop][..., 0:3].astype(np.float32)
 
-        inp = np.concatenate([color, normal, albedo, depth], axis=2)
+        if self.load_guides:
+            normal = self._rgba16f("input_normal", frame)[crop][..., 0:3].astype(np.float32)
+            albedo = self._rgba16f("input_albedo", frame)[crop][..., 0:3].astype(np.float32)
+            depth = self._rgba16f("input_depth", frame)[crop][..., 0:1].astype(np.float32)
+            inp = np.concatenate([color, normal, albedo, depth], axis=2)
+        else:
+            inp = color
         inp_t = torch.from_numpy(inp).permute(2, 0, 1)
         target_t = torch.from_numpy(target).permute(2, 0, 1)
         return inp_t, target_t
@@ -438,6 +536,20 @@ def export_tiny_cnn_weights(model: TinyCnnDenoiser, output: Path) -> None:
     print(f"wrote {output} ({weights.size} f32 values)")
 
 
+def export_rgb_tiny_cnn_weights(model: RgbTinyCnnDenoiser, output: Path) -> None:
+    weights = np.concatenate(
+        [
+            model.conv0_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv0_bias.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv1_weight.detach().cpu().numpy().astype("<f4").reshape(-1),
+            model.conv1_bias.detach().cpu().numpy().astype("<f4").reshape(-1),
+        ]
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    weights.tofile(output)
+    print(f"wrote {output} ({weights.size} f32 values)")
+
+
 def export_residual_cnn_weights(model: ResidualCnnDenoiser, output: Path) -> None:
     weights = np.concatenate(
         [
@@ -456,7 +568,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--model", choices=["filter", "tiny-cnn", "cnn"], default="cnn")
+    parser.add_argument("--model", choices=["filter", "rgb-cnn", "tiny-cnn", "cnn"], default="cnn")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--steps-per-epoch", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -466,12 +578,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--importance-prob", type=float, default=0.7)
     parser.add_argument("--importance-stride", type=int, default=16)
+    parser.add_argument("--importance-error-weight", type=float, default=1.0)
+    parser.add_argument("--importance-gradient-weight", type=float, default=2.0)
+    parser.add_argument("--importance-guide-weight", type=float, default=1.0)
     parser.add_argument("--high-weight", type=float, default=3.0)
     parser.add_argument("--l1-weight", type=float, default=0.75)
     parser.add_argument("--lpips-weight", type=float, default=0.20)
     parser.add_argument("--gradient-weight", type=float, default=0.05)
     parser.add_argument("--lpips-net", choices=["alex", "vgg", "squeeze"], default="squeeze")
-    parser.add_argument("--radius", type=int, choices=[1, 2, 3, 4], default=1)
+    parser.add_argument("--radius", type=int, choices=[1], default=1, help="legacy dense3 radius")
+    parser.add_argument("--tap-pattern", choices=sorted(FILTER_TAP_PATTERNS), default="dense3")
     parser.add_argument(
         "--guides",
         default="normal,albedo,depth",
@@ -497,12 +613,17 @@ def main() -> None:
     train_frames = list(range(0, max(1, frame_count - val_count)))
     val_frames = list(range(max(0, frame_count - val_count), frame_count))
 
+    load_guides = args.model != "rgb-cnn"
     train_dataset = DenoiserDataset(
         args.dataset,
         args.crop_size,
         train_frames,
         args.importance_prob,
         args.importance_stride,
+        args.importance_error_weight,
+        args.importance_gradient_weight,
+        args.importance_guide_weight,
+        load_guides,
     )
     val_dataset = DenoiserDataset(
         args.dataset,
@@ -510,18 +631,33 @@ def main() -> None:
         val_frames,
         args.importance_prob,
         args.importance_stride,
+        args.importance_error_weight,
+        args.importance_gradient_weight,
+        args.importance_guide_weight,
+        load_guides,
     )
     output = args.output
     if output is None:
-        output = (
-            Path("resources/denoiser_cnn_weights.bin")
-            if args.model in {"tiny-cnn", "cnn"}
-            else Path("resources/denoiser_weights.bin")
-        )
+        if args.model == "rgb-cnn":
+            output = Path("resources/denoiser_rgb_cnn_weights.bin")
+        elif args.model in {"tiny-cnn", "cnn"}:
+            output = Path("resources/denoiser_cnn_weights.bin")
+        else:
+            output = Path("resources/denoiser_weights.bin")
 
-    if args.model == "tiny-cnn":
-        model = TinyCnnDenoiser().to(args.device)
+    if args.model == "rgb-cnn":
+        model = RgbTinyCnnDenoiser().to(args.device)
         loss_fn: torch.nn.Module = PerceptualLoss(
+            args.high_weight,
+            args.l1_weight,
+            args.lpips_weight,
+            args.gradient_weight,
+            args.lpips_net,
+            args.device,
+        )
+    elif args.model == "tiny-cnn":
+        model = TinyCnnDenoiser().to(args.device)
+        loss_fn = PerceptualLoss(
             args.high_weight,
             args.l1_weight,
             0.0,
@@ -540,12 +676,15 @@ def main() -> None:
             args.device,
         )
     else:
-        model = LearnedFilter(args.radius, guides).to(args.device)
-        loss_fn = lambda pred, inputs, targets: legacy_loss_for(
-            pred,
-            inputs,
-            targets,
+        tap_pattern = "dense3" if args.radius == 1 and args.tap_pattern == "dense3" else args.tap_pattern
+        model = LearnedFilter(tap_pattern, guides).to(args.device)
+        loss_fn = PerceptualLoss(
             args.high_weight,
+            args.l1_weight,
+            args.lpips_weight,
+            args.gradient_weight,
+            args.lpips_net,
+            args.device,
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -566,7 +705,9 @@ def main() -> None:
 
     val_loss = validate(model, val_dataset, args.batch_size, args.val_steps, args.device, loss_fn)
     print(f"val_loss {val_loss:.6f}")
-    if isinstance(model, ResidualCnnDenoiser):
+    if isinstance(model, RgbTinyCnnDenoiser):
+        export_rgb_tiny_cnn_weights(model, output)
+    elif isinstance(model, ResidualCnnDenoiser):
         export_residual_cnn_weights(model, output)
     elif isinstance(model, TinyCnnDenoiser):
         export_tiny_cnn_weights(model, output)
