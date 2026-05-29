@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 
 
+RGB_CNN_LAYOUTS = ("dense", "sparse-wide", "dilated3", "dilated5", "axis17")
+RGB_CNN_MODES = ("rgb", "luma")
 VARIANTS = [
     {
         "name": "sparse13_spatial",
@@ -42,6 +44,40 @@ VARIANTS = [
         "bench_flag": "--rgb-cnn-denoise",
     },
 ]
+
+
+def parse_kernel_sizes(value: str) -> list[int]:
+    sizes = []
+    for part in value.split(","):
+        if not part.strip():
+            continue
+        size = int(part)
+        if size <= 0 or size % 2 == 0:
+            raise argparse.ArgumentTypeError("rgb-cnn kernel sizes must be positive odd integers")
+        sizes.append(size)
+    if not sizes:
+        raise argparse.ArgumentTypeError("at least one rgb-cnn kernel size is required")
+    return sizes
+
+
+def parse_rgb_cnn_layouts(value: str) -> list[str]:
+    layouts = [part.strip() for part in value.split(",") if part.strip()]
+    unknown = sorted(set(layouts) - set(RGB_CNN_LAYOUTS))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown rgb-cnn layout(s): {', '.join(unknown)}")
+    if not layouts:
+        raise argparse.ArgumentTypeError("at least one rgb-cnn layout is required")
+    return layouts
+
+
+def parse_rgb_cnn_modes(value: str) -> list[str]:
+    modes = [part.strip() for part in value.split(",") if part.strip()]
+    unknown = sorted(set(modes) - set(RGB_CNN_MODES))
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown rgb-cnn mode(s): {', '.join(unknown)}")
+    if not modes:
+        raise argparse.ArgumentTypeError("at least one rgb-cnn mode is required")
+    return modes
 
 
 def run(cmd: list[str], cwd: Path) -> str:
@@ -92,13 +128,50 @@ def main() -> None:
     parser.add_argument("--importance-prob", type=float, default=0.7)
     parser.add_argument("--importance-stride", type=int, default=16)
     parser.add_argument("--high-weight", type=float, default=3.0)
+    parser.add_argument(
+        "--rgb-cnn-kernels",
+        type=parse_kernel_sizes,
+        default=[3],
+        help="comma-separated odd dense RGB CNN first-layer kernel sizes, e.g. 3,9,17",
+    )
+    parser.add_argument(
+        "--rgb-cnn-layouts",
+        type=parse_rgb_cnn_layouts,
+        default=["dense"],
+        help="comma-separated RGB CNN layouts: dense,sparse-wide,dilated3,dilated5,axis17",
+    )
+    parser.add_argument(
+        "--rgb-cnn-modes",
+        type=parse_rgb_cnn_modes,
+        default=["rgb"],
+        help="comma-separated RGB CNN modes: rgb,luma",
+    )
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[1]
     args.out_dir.mkdir(parents=True, exist_ok=True)
     rows = []
 
+    variants = []
     for variant in VARIANTS:
+        if variant["model"] != "rgb-cnn":
+            variants.append(variant)
+            continue
+        for mode in args.rgb_cnn_modes:
+            for layout in args.rgb_cnn_layouts:
+                kernel_sizes = args.rgb_cnn_kernels if layout == "dense" else [3]
+                for kernel_size in kernel_sizes:
+                    rgb_variant = dict(variant)
+                    rgb_variant["rgb_cnn_mode"] = mode
+                    rgb_variant["rgb_cnn_layout"] = layout
+                    rgb_variant["rgb_cnn_kernel_size"] = kernel_size
+                    suffix = "" if mode == "rgb" and layout == "dense" and kernel_size == 3 else f"_{mode}_{layout}"
+                    if layout == "dense" and kernel_size != 3:
+                        suffix = f"_{mode}_k{kernel_size}"
+                    rgb_variant["name"] = f"{variant['name']}{suffix}"
+                    variants.append(rgb_variant)
+
+    for variant in variants:
         name = variant["name"]
         weights_path = args.out_dir / f"{name}.bin"
         train_cmd = [
@@ -132,30 +205,38 @@ def main() -> None:
         ]
         if variant["tap_pattern"] is not None:
             train_cmd.extend(["--tap-pattern", variant["tap_pattern"]])
+        if variant["model"] == "rgb-cnn":
+            train_cmd.extend(["--rgb-cnn-kernel-size", str(variant["rgb_cnn_kernel_size"])])
+            train_cmd.extend(["--rgb-cnn-layout", variant["rgb_cnn_layout"]])
+            train_cmd.extend(["--rgb-cnn-mode", variant["rgb_cnn_mode"]])
         train_output = run(train_cmd, repo)
 
         resource_path = repo / variant["resource"]
         shutil.copyfile(weights_path, resource_path)
-        bench_output = run(
-            [
-                "cargo",
-                "run",
-                "--release",
-                "--",
-                "bench-denoiser",
-                "--frames",
-                str(args.bench_frames),
-                "--warmup",
-                str(args.bench_warmup),
-                variant["bench_flag"],
-            ],
-            repo,
-        )
+        bench_cmd = [
+            "cargo",
+            "run",
+            "--release",
+            "--",
+            "bench-denoiser",
+            "--frames",
+            str(args.bench_frames),
+            "--warmup",
+            str(args.bench_warmup),
+            variant["bench_flag"],
+        ]
+        if variant["model"] == "rgb-cnn":
+            bench_cmd.extend(["--rgb-cnn-layout", variant["rgb_cnn_layout"]])
+            bench_cmd.extend(["--rgb-cnn-mode", variant["rgb_cnn_mode"]])
+        bench_output = run(bench_cmd, repo)
         avg_ms, fps = parse_bench(bench_output)
         rows.append(
             {
                 "name": name,
                 "model": variant["model"],
+                "rgb_cnn_kernel_size": variant.get("rgb_cnn_kernel_size", ""),
+                "rgb_cnn_layout": variant.get("rgb_cnn_layout", ""),
+                "rgb_cnn_mode": variant.get("rgb_cnn_mode", ""),
                 "tap_pattern": variant["tap_pattern"] or "",
                 "guides": variant["guides"],
                 "loss": parse_loss(train_output),
@@ -174,6 +255,9 @@ def main() -> None:
             fieldnames=[
                 "name",
                 "model",
+                "rgb_cnn_kernel_size",
+                "rgb_cnn_layout",
+                "rgb_cnn_mode",
                 "tap_pattern",
                 "guides",
                 "loss",

@@ -23,7 +23,12 @@ CNN_HIDDEN_CHANNELS = 32
 CNN_INPUT_CHANNELS = 16
 RGB_CNN_HIDDEN_CHANNELS = 8
 RGB_CNN_INPUT_CHANNELS = 3
+RGB_CNN_OUTPUT_CHANNELS = 3
 MAX_CNN_RGB_DELTA = 0.22
+RGB_CNN_LAYOUTS = ("dense", "sparse-wide", "dilated3", "dilated5", "axis17")
+RGB_CNN_MODES = ("rgb", "luma")
+RGB_CNN_CHROMA_EPSILON = 0.0001
+RGB_CNN_CHROMA_FALLBACK_LUMA = 0.01
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
 FILTER_TAP_PATTERNS = {
     "dense3": [
@@ -53,6 +58,93 @@ FILTER_TAP_PATTERNS = {
         (0, 4),
     ],
 }
+
+
+def odd_positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0 or parsed % 2 == 0:
+        raise argparse.ArgumentTypeError("must be a positive odd integer")
+    return parsed
+
+
+def rgb_cnn_tap_offsets(layout: str, kernel_size: int = 3, dilation: int = 4) -> list[tuple[int, int]]:
+    if layout == "dense":
+        radius = kernel_size // 2
+        return [(x, y) for y in range(-radius, radius + 1) for x in range(-radius, radius + 1)]
+    if layout == "sparse-wide":
+        offsets = [(x, y) for y in range(-2, 3) for x in range(-2, 3)]
+        for radius in (4, 8, 12):
+            offsets.extend(
+                [
+                    (radius, 0),
+                    (-radius, 0),
+                    (0, radius),
+                    (0, -radius),
+                    (radius, radius),
+                    (-radius, radius),
+                    (radius, -radius),
+                    (-radius, -radius),
+                ]
+            )
+        return offsets
+    if layout in {"dilated3", "dilated5"}:
+        size = 3 if layout == "dilated3" else 5
+        radius = size // 2
+        return [
+            (x * dilation, y * dilation)
+            for y in range(-radius, radius + 1)
+            for x in range(-radius, radius + 1)
+        ]
+    if layout == "axis17":
+        radius = 8
+        return [(x, 0) for x in range(-radius, radius + 1)] + [
+            (0, y) for y in range(-radius, radius + 1)
+        ]
+    raise ValueError(f"unknown rgb-cnn layout: {layout}")
+
+
+def rgb_cnn_channels(mode: str) -> tuple[int, int]:
+    if mode == "rgb":
+        return RGB_CNN_INPUT_CHANNELS, RGB_CNN_OUTPUT_CHANNELS
+    if mode == "luma":
+        return 1, 1
+    raise ValueError(f"unknown rgb-cnn mode: {mode}")
+
+
+def rgb_cnn_weight_count(kernel_size: int, layout: str = "dense", dilation: int = 4, mode: str = "rgb") -> int:
+    tap_count = len(rgb_cnn_tap_offsets(layout, kernel_size, dilation))
+    input_channels, output_channels = rgb_cnn_channels(mode)
+    return (
+        RGB_CNN_HIDDEN_CHANNELS * input_channels * tap_count
+        + RGB_CNN_HIDDEN_CHANNELS
+        + output_channels * RGB_CNN_HIDDEN_CHANNELS
+        + output_channels
+    )
+
+
+def sample_rgb_offsets(color: torch.Tensor, offsets: list[tuple[int, int]]) -> torch.Tensor:
+    radius = max(max(abs(x), abs(y)) for x, y in offsets)
+    _, _, h, w = color.shape
+    padded = F.pad(color, (radius, radius, radius, radius), mode="replicate")
+    samples = [
+        padded[:, :, y + radius : y + radius + h, x + radius : x + radius + w]
+        for x, y in offsets
+    ]
+    return torch.stack(samples, dim=2)
+
+
+def chroma_preserving_luma(color: torch.Tensor, out_luma: torch.Tensor, fallback_offsets: list[tuple[int, int]]) -> torch.Tensor:
+    center_luma = luminance(color)
+    center_chroma = color / torch.clamp(center_luma, min=RGB_CNN_CHROMA_EPSILON)
+
+    samples = sample_rgb_offsets(color, fallback_offsets)
+    local_color = samples.mean(dim=2)
+    local_luma = luminance(local_color)
+    local_chroma = local_color / torch.clamp(local_luma, min=RGB_CNN_CHROMA_EPSILON)
+
+    use_local = center_luma < RGB_CNN_CHROMA_FALLBACK_LUMA
+    chroma = torch.where(use_local, local_chroma, center_chroma)
+    return torch.clamp(chroma * out_luma, 0.0, 1.0)
 
 
 def luminance(rgb: torch.Tensor) -> torch.Tensor:
@@ -186,32 +278,63 @@ class TinyCnnDenoiser(torch.nn.Module):
 
 
 class RgbTinyCnnDenoiser(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, kernel_size: int = 3, layout: str = "dense", dilation: int = 4, mode: str = "rgb") -> None:
         super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("rgb-cnn kernel size must be a positive odd integer")
+        if dilation <= 0:
+            raise ValueError("rgb-cnn dilation must be positive")
+        if layout not in RGB_CNN_LAYOUTS:
+            raise ValueError(f"unknown rgb-cnn layout: {layout}")
+        if mode not in RGB_CNN_MODES:
+            raise ValueError(f"unknown rgb-cnn mode: {mode}")
+        self.kernel_size = kernel_size
+        self.kernel_radius = kernel_size // 2
+        self.layout = layout
+        self.dilation = dilation
+        self.mode = mode
+        self.tap_offsets = rgb_cnn_tap_offsets(layout, kernel_size, dilation)
+        self.tap_count = len(self.tap_offsets)
+        self.input_channels, self.output_channels = rgb_cnn_channels(mode)
         self.conv0_weight = torch.nn.Parameter(
-            torch.empty(RGB_CNN_HIDDEN_CHANNELS, RGB_CNN_INPUT_CHANNELS, 3, 3)
+            torch.empty(RGB_CNN_HIDDEN_CHANNELS, self.input_channels, self.tap_count)
         )
         self.conv0_bias = torch.nn.Parameter(torch.zeros(RGB_CNN_HIDDEN_CHANNELS))
-        self.conv1_weight = torch.nn.Parameter(torch.zeros(3, RGB_CNN_HIDDEN_CHANNELS))
-        self.conv1_bias = torch.nn.Parameter(torch.zeros(3))
+        self.conv1_weight = torch.nn.Parameter(torch.zeros(self.output_channels, RGB_CNN_HIDDEN_CHANNELS))
+        self.conv1_bias = torch.nn.Parameter(torch.zeros(self.output_channels))
         torch.nn.init.kaiming_uniform_(self.conv0_weight, nonlinearity="relu")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         color = x[:, 0:3]
-        b, _, h, w = color.shape
-
-        padded = F.pad(color, (1, 1, 1, 1), mode="replicate")
-        patches = F.unfold(padded, kernel_size=3).view(b, RGB_CNN_INPUT_CHANNELS, 9, h * w)
-        hidden = torch.einsum(
-            "hct,bctn->bhn",
-            self.conv0_weight.view(RGB_CNN_HIDDEN_CHANNELS, RGB_CNN_INPUT_CHANNELS, 9),
-            patches,
+        conv_input = luminance(color) if self.mode == "luma" else color
+        if self.layout == "dense":
+            padded = F.pad(
+                conv_input,
+                (self.kernel_radius, self.kernel_radius, self.kernel_radius, self.kernel_radius),
+                mode="replicate",
+            )
+            conv0_weight = self.conv0_weight.view(
+                RGB_CNN_HIDDEN_CHANNELS,
+                self.input_channels,
+                self.kernel_size,
+                self.kernel_size,
+            )
+            hidden = F.relu(F.conv2d(padded, conv0_weight, self.conv0_bias))
+        else:
+            samples = sample_rgb_offsets(conv_input, self.tap_offsets)
+            hidden = torch.einsum("hct,bctxy->bhxy", self.conv0_weight, samples)
+            hidden = F.relu(hidden + self.conv0_bias.view(1, RGB_CNN_HIDDEN_CHANNELS, 1, 1))
+        raw_delta = F.conv2d(
+            hidden,
+            self.conv1_weight.view(self.output_channels, RGB_CNN_HIDDEN_CHANNELS, 1, 1),
+            self.conv1_bias,
         )
-        hidden = F.relu(hidden + self.conv0_bias.view(1, RGB_CNN_HIDDEN_CHANNELS, 1))
-        raw_delta = torch.einsum("oh,bhn->bon", self.conv1_weight, hidden)
-        raw_delta = raw_delta + self.conv1_bias.view(1, 3, 1)
-        delta = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta.view(b, 3, h, w))
-        return torch.clamp(color + delta, 0.0, 1.0)
+        if self.mode == "luma":
+            delta_luma = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
+            out_luma = torch.clamp(luminance(color) + delta_luma, 0.0, 1.0)
+            return chroma_preserving_luma(color, out_luma, self.tap_offsets)
+        delta_rgb = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
+        return torch.clamp(color + delta_rgb, 0.0, 1.0)
 
 
 class ResidualCnnDenoiser(torch.nn.Module):
@@ -587,6 +710,30 @@ def main() -> None:
     parser.add_argument("--gradient-weight", type=float, default=0.05)
     parser.add_argument("--lpips-net", choices=["alex", "vgg", "squeeze"], default="squeeze")
     parser.add_argument("--radius", type=int, choices=[1], default=1, help="legacy dense3 radius")
+    parser.add_argument(
+        "--rgb-cnn-kernel-size",
+        type=odd_positive_int,
+        default=3,
+        help="positive odd dense RGB CNN first-layer kernel size; try 9, 17, or 33 for dense experiments",
+    )
+    parser.add_argument(
+        "--rgb-cnn-layout",
+        choices=RGB_CNN_LAYOUTS,
+        default="dense",
+        help="RGB CNN first-layer sample layout",
+    )
+    parser.add_argument(
+        "--rgb-cnn-dilation",
+        type=int,
+        default=4,
+        help="sample spacing for dilated3/dilated5 RGB CNN layouts",
+    )
+    parser.add_argument(
+        "--rgb-cnn-mode",
+        choices=RGB_CNN_MODES,
+        default="rgb",
+        help="rgb predicts color residuals; luma predicts brightness only and preserves chroma",
+    )
     parser.add_argument("--tap-pattern", choices=sorted(FILTER_TAP_PATTERNS), default="dense3")
     parser.add_argument(
         "--guides",
@@ -646,7 +793,27 @@ def main() -> None:
             output = Path("resources/denoiser_weights.bin")
 
     if args.model == "rgb-cnn":
-        model = RgbTinyCnnDenoiser().to(args.device)
+        model = RgbTinyCnnDenoiser(
+            args.rgb_cnn_kernel_size,
+            args.rgb_cnn_layout,
+            args.rgb_cnn_dilation,
+            args.rgb_cnn_mode,
+        ).to(args.device)
+        print(
+            "rgb-cnn mode={} layout={} kernel_size={} dilation={} taps={} weights={} f32".format(
+                args.rgb_cnn_mode,
+                args.rgb_cnn_layout,
+                args.rgb_cnn_kernel_size,
+                args.rgb_cnn_dilation,
+                model.tap_count,
+                rgb_cnn_weight_count(
+                    args.rgb_cnn_kernel_size,
+                    args.rgb_cnn_layout,
+                    args.rgb_cnn_dilation,
+                    args.rgb_cnn_mode,
+                ),
+            )
+        )
         loss_fn: torch.nn.Module = PerceptualLoss(
             args.high_weight,
             args.l1_weight,

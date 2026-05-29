@@ -18,8 +18,13 @@ DISABLED_PENALTY = -10.0
 MAX_LUMA_BLEND = 0.45
 RGB_CNN_HIDDEN_CHANNELS = 8
 RGB_CNN_INPUT_CHANNELS = 3
-RGB_CNN_WEIGHT_COUNT = 251
+RGB_CNN_OUTPUT_CHANNELS = 3
+RGB_CNN_DEFAULT_KERNEL_SIZE = 3
 MAX_CNN_RGB_DELTA = 0.22
+RGB_CNN_LAYOUTS = ("dense", "sparse-wide", "dilated3", "dilated5", "axis17")
+RGB_CNN_MODES = ("rgb", "luma")
+RGB_CNN_CHROMA_EPSILON = 0.0001
+RGB_CNN_CHROMA_FALLBACK_LUMA = 0.01
 LUMA_WEIGHTS = torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32).view(1, 3, 1, 1)
 FILTER_TAP_PATTERNS = {
     "dense3": [
@@ -50,6 +55,103 @@ FILTER_TAP_PATTERNS = {
     ],
 }
 PATTERN_BY_WEIGHT_COUNT = {6 + len(taps): name for name, taps in FILTER_TAP_PATTERNS.items()}
+
+
+def rgb_cnn_tap_offsets(layout: str, kernel_size: int = 3, dilation: int = 4) -> list[tuple[int, int]]:
+    if layout == "dense":
+        radius = kernel_size // 2
+        return [(x, y) for y in range(-radius, radius + 1) for x in range(-radius, radius + 1)]
+    if layout == "sparse-wide":
+        offsets = [(x, y) for y in range(-2, 3) for x in range(-2, 3)]
+        for radius in (4, 8, 12):
+            offsets.extend(
+                [
+                    (radius, 0),
+                    (-radius, 0),
+                    (0, radius),
+                    (0, -radius),
+                    (radius, radius),
+                    (-radius, radius),
+                    (radius, -radius),
+                    (-radius, -radius),
+                ]
+            )
+        return offsets
+    if layout in {"dilated3", "dilated5"}:
+        size = 3 if layout == "dilated3" else 5
+        radius = size // 2
+        return [
+            (x * dilation, y * dilation)
+            for y in range(-radius, radius + 1)
+            for x in range(-radius, radius + 1)
+        ]
+    if layout == "axis17":
+        radius = 8
+        return [(x, 0) for x in range(-radius, radius + 1)] + [
+            (0, y) for y in range(-radius, radius + 1)
+        ]
+    raise ValueError(f"unknown rgb-cnn layout: {layout}")
+
+
+def rgb_cnn_channels(mode: str) -> tuple[int, int]:
+    if mode == "rgb":
+        return RGB_CNN_INPUT_CHANNELS, RGB_CNN_OUTPUT_CHANNELS
+    if mode == "luma":
+        return 1, 1
+    raise ValueError(f"unknown rgb-cnn mode: {mode}")
+
+
+def rgb_cnn_weight_count(kernel_size: int, layout: str = "dense", dilation: int = 4, mode: str = "rgb") -> int:
+    tap_count = len(rgb_cnn_tap_offsets(layout, kernel_size, dilation))
+    input_channels, output_channels = rgb_cnn_channels(mode)
+    return (
+        RGB_CNN_HIDDEN_CHANNELS * input_channels * tap_count
+        + RGB_CNN_HIDDEN_CHANNELS
+        + output_channels * RGB_CNN_HIDDEN_CHANNELS
+        + output_channels
+    )
+
+
+RGB_CNN_WEIGHT_COUNT = rgb_cnn_weight_count(RGB_CNN_DEFAULT_KERNEL_SIZE)
+
+
+def infer_rgb_cnn_kernel_size(weight_count: int, mode: str = "rgb") -> int | None:
+    input_channels, output_channels = rgb_cnn_channels(mode)
+    head_count = RGB_CNN_HIDDEN_CHANNELS + output_channels * RGB_CNN_HIDDEN_CHANNELS + output_channels
+    conv0_values = weight_count - head_count
+    conv0_scale = RGB_CNN_HIDDEN_CHANNELS * input_channels
+    if conv0_values <= 0 or conv0_values % conv0_scale != 0:
+        return None
+    taps = conv0_values // conv0_scale
+    kernel_size = int(taps**0.5)
+    if kernel_size * kernel_size != taps or kernel_size % 2 == 0:
+        return None
+    return kernel_size
+
+
+def sample_rgb_offsets(color: torch.Tensor, offsets: list[tuple[int, int]]) -> torch.Tensor:
+    radius = max(max(abs(x), abs(y)) for x, y in offsets)
+    _, _, h, w = color.shape
+    padded = torch.nn.functional.pad(color, (radius, radius, radius, radius), mode="replicate")
+    samples = [
+        padded[:, :, y + radius : y + radius + h, x + radius : x + radius + w]
+        for x, y in offsets
+    ]
+    return torch.stack(samples, dim=2)
+
+
+def chroma_preserving_luma(color: torch.Tensor, out_luma: torch.Tensor, fallback_offsets: list[tuple[int, int]]) -> torch.Tensor:
+    center_luma = luminance(color)
+    center_chroma = color / torch.clamp(center_luma, min=RGB_CNN_CHROMA_EPSILON)
+
+    samples = sample_rgb_offsets(color, fallback_offsets)
+    local_color = samples.mean(dim=2)
+    local_luma = luminance(local_color)
+    local_chroma = local_color / torch.clamp(local_luma, min=RGB_CNN_CHROMA_EPSILON)
+
+    use_local = center_luma < RGB_CNN_CHROMA_FALLBACK_LUMA
+    chroma = torch.where(use_local, local_chroma, center_chroma)
+    return torch.clamp(chroma * out_luma, 0.0, 1.0)
 
 
 def luminance(rgb: torch.Tensor) -> torch.Tensor:
@@ -159,32 +261,62 @@ def learned_filter(inputs: torch.Tensor, weights: torch.Tensor, tap_offsets: lis
     return torch.clamp(chroma * out_luma, 0.0, 1.0)
 
 
-def rgb_cnn(inputs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def rgb_cnn(
+    inputs: torch.Tensor,
+    weights: torch.Tensor,
+    kernel_size: int | None = None,
+    layout: str = "dense",
+    dilation: int = 4,
+    mode: str = "rgb",
+) -> torch.Tensor:
     color = inputs[:, 0:3]
-    b, _, h, w = color.shape
-    conv0_size = RGB_CNN_HIDDEN_CHANNELS * RGB_CNN_INPUT_CHANNELS * 3 * 3
+    input_channels, output_channels = rgb_cnn_channels(mode)
+    if layout == "dense" and kernel_size is None:
+        kernel_size = infer_rgb_cnn_kernel_size(weights.numel(), mode)
+    if layout == "dense" and kernel_size is None:
+        raise ValueError(f"cannot infer rgb-cnn kernel size from {weights.numel()} f32 values")
+    if kernel_size is None:
+        kernel_size = RGB_CNN_DEFAULT_KERNEL_SIZE
+    tap_offsets = rgb_cnn_tap_offsets(layout, kernel_size, dilation)
+    tap_count = len(tap_offsets)
+    conv0_size = RGB_CNN_HIDDEN_CHANNELS * input_channels * tap_count
     conv0_bias_offset = conv0_size
     conv1_weight_offset = conv0_bias_offset + RGB_CNN_HIDDEN_CHANNELS
-    conv1_bias_offset = conv1_weight_offset + 3 * RGB_CNN_HIDDEN_CHANNELS
+    conv1_bias_offset = conv1_weight_offset + output_channels * RGB_CNN_HIDDEN_CHANNELS
+    expected_count = conv1_bias_offset + output_channels
+    if weights.numel() != expected_count:
+        raise ValueError(
+            f"rgb-cnn mode={mode} layout={layout} kernel_size={kernel_size} dilation={dilation} "
+            f"expects {expected_count} f32 values, found {weights.numel()}"
+        )
 
-    conv0_weight = weights[:conv0_size].view(RGB_CNN_HIDDEN_CHANNELS, RGB_CNN_INPUT_CHANNELS, 3, 3)
+    conv0_weight = weights[:conv0_size].view(RGB_CNN_HIDDEN_CHANNELS, input_channels, tap_count)
     conv0_bias = weights[conv0_bias_offset:conv1_weight_offset]
-    conv1_weight = weights[conv1_weight_offset:conv1_bias_offset].view(3, RGB_CNN_HIDDEN_CHANNELS)
-    conv1_bias = weights[conv1_bias_offset:RGB_CNN_WEIGHT_COUNT]
+    conv1_weight = weights[conv1_weight_offset:conv1_bias_offset].view(output_channels, RGB_CNN_HIDDEN_CHANNELS, 1, 1)
+    conv1_bias = weights[conv1_bias_offset:expected_count]
 
-    padded = torch.nn.functional.pad(color, (1, 1, 1, 1), mode="replicate")
-    patches = torch.nn.functional.unfold(padded, kernel_size=3).view(
-        b,
-        RGB_CNN_INPUT_CHANNELS,
-        9,
-        h * w,
-    )
-    hidden = torch.einsum("hct,bctn->bhn", conv0_weight.view(RGB_CNN_HIDDEN_CHANNELS, RGB_CNN_INPUT_CHANNELS, 9), patches)
-    hidden = torch.nn.functional.relu(hidden + conv0_bias.view(1, RGB_CNN_HIDDEN_CHANNELS, 1))
-    raw_delta = torch.einsum("oh,bhn->bon", conv1_weight, hidden)
-    raw_delta = raw_delta + conv1_bias.view(1, 3, 1)
-    delta = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta.view(b, 3, h, w))
-    return torch.clamp(color + delta, 0.0, 1.0)
+    conv_input = luminance(color) if mode == "luma" else color
+    if layout == "dense":
+        radius = kernel_size // 2
+        padded = torch.nn.functional.pad(conv_input, (radius, radius, radius, radius), mode="replicate")
+        hidden = torch.nn.functional.relu(
+            torch.nn.functional.conv2d(
+                padded,
+                conv0_weight.view(RGB_CNN_HIDDEN_CHANNELS, input_channels, kernel_size, kernel_size),
+                conv0_bias,
+            )
+        )
+    else:
+        samples = sample_rgb_offsets(conv_input, tap_offsets)
+        hidden = torch.einsum("hct,bctxy->bhxy", conv0_weight, samples)
+        hidden = torch.nn.functional.relu(hidden + conv0_bias.view(1, RGB_CNN_HIDDEN_CHANNELS, 1, 1))
+    raw_delta = torch.nn.functional.conv2d(hidden, conv1_weight, conv1_bias)
+    if mode == "luma":
+        delta_luma = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
+        out_luma = torch.clamp(luminance(color) + delta_luma, 0.0, 1.0)
+        return chroma_preserving_luma(color, out_luma, tap_offsets)
+    delta_rgb = MAX_CNN_RGB_DELTA * torch.tanh(raw_delta)
+    return torch.clamp(color + delta_rgb, 0.0, 1.0)
 
 
 def parse_weight_arg(value: str) -> tuple[str, Path]:
@@ -202,6 +334,10 @@ def main() -> None:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--crops-per-frame", type=int, default=4)
     parser.add_argument("--lpips-net", choices=["alex", "vgg", "squeeze"], default="squeeze")
+    parser.add_argument("--rgb-cnn-layout", choices=RGB_CNN_LAYOUTS, default="dense")
+    parser.add_argument("--rgb-cnn-mode", choices=RGB_CNN_MODES, default="rgb")
+    parser.add_argument("--rgb-cnn-kernel-size", type=int)
+    parser.add_argument("--rgb-cnn-dilation", type=int, default=4)
     parser.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -228,11 +364,14 @@ def main() -> None:
         pattern_name = PATTERN_BY_WEIGHT_COUNT.get(raw.size)
         if pattern_name is not None:
             candidates.append((name, "filter", torch.from_numpy(raw.astype(np.float32)).to(args.device), FILTER_TAP_PATTERNS[pattern_name]))
-        elif raw.size == RGB_CNN_WEIGHT_COUNT:
+        elif args.rgb_cnn_layout != "dense" or infer_rgb_cnn_kernel_size(raw.size, args.rgb_cnn_mode) is not None:
             candidates.append((name, "rgb-cnn", torch.from_numpy(raw.astype(np.float32)).to(args.device), None))
         else:
             expected = ", ".join(f"{6 + len(taps)} ({name})" for name, taps in FILTER_TAP_PATTERNS.items())
-            raise ValueError(f"{path} has {raw.size} floats, expected one of: {expected}, {RGB_CNN_WEIGHT_COUNT} (rgb-cnn)")
+            raise ValueError(
+                f"{path} has {raw.size} floats, expected one of: {expected}, "
+                "or rgb-cnn weights with an odd-square kernel footprint"
+            )
     needs_guides = any(kind == "filter" for _, kind, _, _ in candidates)
     has_guides = {"input_normal", "input_albedo", "input_depth"}.issubset(channels)
     if needs_guides and not has_guides:
@@ -261,7 +400,14 @@ def main() -> None:
                     if kind == "noisy":
                         pred = inputs[:, 0:3]
                     elif kind == "rgb-cnn":
-                        pred = rgb_cnn(inputs, weights)
+                        pred = rgb_cnn(
+                            inputs,
+                            weights,
+                            args.rgb_cnn_kernel_size,
+                            args.rgb_cnn_layout,
+                            args.rgb_cnn_dilation,
+                            args.rgb_cnn_mode,
+                        )
                     else:
                         pred = learned_filter(inputs, weights, tap_offsets)
                     lpips_values.append(float(lpips_model(pred * 2.0 - 1.0, targets * 2.0 - 1.0).cpu()))

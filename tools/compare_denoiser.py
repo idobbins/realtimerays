@@ -10,7 +10,9 @@ from PIL import Image, ImageDraw
 from evaluate_denoiser import (
     FILTER_TAP_PATTERNS,
     PATTERN_BY_WEIGHT_COUNT,
-    RGB_CNN_WEIGHT_COUNT,
+    RGB_CNN_LAYOUTS,
+    RGB_CNN_MODES,
+    infer_rgb_cnn_kernel_size,
     learned_filter,
     load_crop,
     parse_weight_arg,
@@ -33,6 +35,10 @@ def main() -> None:
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--x", type=int)
     parser.add_argument("--y", type=int)
+    parser.add_argument("--rgb-cnn-layout", choices=RGB_CNN_LAYOUTS, default="dense")
+    parser.add_argument("--rgb-cnn-mode", choices=RGB_CNN_MODES, default="rgb")
+    parser.add_argument("--rgb-cnn-kernel-size", type=int)
+    parser.add_argument("--rgb-cnn-dilation", type=int, default=4)
     parser.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -55,12 +61,15 @@ def main() -> None:
             weights = torch.from_numpy(raw.astype(np.float32)).to(args.device)
             candidates.append((name, "filter", weights, FILTER_TAP_PATTERNS[pattern_name]))
             needs_guides = True
-        elif raw.size == RGB_CNN_WEIGHT_COUNT:
+        elif args.rgb_cnn_layout != "dense" or infer_rgb_cnn_kernel_size(raw.size, args.rgb_cnn_mode) is not None:
             weights = torch.from_numpy(raw.astype(np.float32)).to(args.device)
             candidates.append((name, "rgb-cnn", weights, None))
         else:
             expected = ", ".join(f"{6 + len(taps)} ({name})" for name, taps in FILTER_TAP_PATTERNS.items())
-            raise ValueError(f"{path} has {raw.size} floats, expected one of: {expected}, {RGB_CNN_WEIGHT_COUNT} (rgb-cnn)")
+            raise ValueError(
+                f"{path} has {raw.size} floats, expected one of: {expected}, "
+                "or rgb-cnn weights with an odd-square kernel footprint"
+            )
     channels = set(meta.get("channels", []))
     has_guides = {"input_normal", "input_albedo", "input_depth"}.issubset(channels)
     if needs_guides and not has_guides:
@@ -75,7 +84,14 @@ def main() -> None:
     ]
     for name, kind, weights, tap_offsets in candidates:
         if kind == "rgb-cnn":
-            pred = rgb_cnn(inputs, weights)
+            pred = rgb_cnn(
+                inputs,
+                weights,
+                args.rgb_cnn_kernel_size,
+                args.rgb_cnn_layout,
+                args.rgb_cnn_dilation,
+                args.rgb_cnn_mode,
+            )
         else:
             pred = learned_filter(inputs, weights, tap_offsets)
         columns.append((name, to_srgb8(pred)))

@@ -27,7 +27,10 @@ const DATASET_INPUT_SPP: u32 = 2;
 const DATASET_TARGET_SPP: u32 = 64;
 const RENDER_FLAG_GUIDES: u32 = 1;
 const FILTER_DENOISER_WEIGHT_COUNT: usize = 19;
-const RGB_CNN_DENOISER_WEIGHT_COUNT: usize = 251;
+const RGB_CNN_HIDDEN_CHANNELS: usize = 8;
+const RGB_CNN_INPUT_CHANNELS: usize = 3;
+const RGB_CNN_OUTPUT_CHANNELS: usize = 3;
+const RGB_CNN_DEFAULT_KERNEL_SIZE: usize = 3;
 const CNN_DENOISER_WEIGHT_COUNT: usize = 4739;
 
 const CAMERA_ORBIT_SPEED: f32 = 0.12;
@@ -57,10 +60,113 @@ const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.
 const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RgbCnnLayout {
+    Dense,
+    SparseWide,
+    Dilated3,
+    Dilated5,
+    Axis17,
+}
+
+impl RgbCnnLayout {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "dense" => Some(Self::Dense),
+            "sparse-wide" => Some(Self::SparseWide),
+            "dilated3" => Some(Self::Dilated3),
+            "dilated5" => Some(Self::Dilated5),
+            "axis17" => Some(Self::Axis17),
+            _ => None,
+        }
+    }
+
+    const fn id(self) -> u32 {
+        match self {
+            Self::Dense => 0,
+            Self::SparseWide => 1,
+            Self::Dilated3 => 2,
+            Self::Dilated5 => 3,
+            Self::Axis17 => 4,
+        }
+    }
+
+    const fn tap_count(self) -> usize {
+        match self {
+            Self::Dense => RGB_CNN_DEFAULT_KERNEL_SIZE * RGB_CNN_DEFAULT_KERNEL_SIZE,
+            Self::SparseWide => 49,
+            Self::Dilated3 => 9,
+            Self::Dilated5 => 25,
+            Self::Axis17 => 34,
+        }
+    }
+
+    const fn radius(self) -> u32 {
+        match self {
+            Self::Dense => (RGB_CNN_DEFAULT_KERNEL_SIZE / 2) as u32,
+            Self::SparseWide => 12,
+            Self::Dilated3 => 4,
+            Self::Dilated5 => 8,
+            Self::Axis17 => 8,
+        }
+    }
+
+    const fn dilation(self) -> u32 {
+        match self {
+            Self::Dilated3 | Self::Dilated5 => 4,
+            _ => 1,
+        }
+    }
+
+    const fn weight_count(self, mode: RgbCnnMode) -> usize {
+        RGB_CNN_HIDDEN_CHANNELS * mode.input_channels() * self.tap_count()
+            + RGB_CNN_HIDDEN_CHANNELS
+            + mode.output_channels() * RGB_CNN_HIDDEN_CHANNELS
+            + mode.output_channels()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RgbCnnMode {
+    Rgb,
+    Luma,
+}
+
+impl RgbCnnMode {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "rgb" => Some(Self::Rgb),
+            "luma" => Some(Self::Luma),
+            _ => None,
+        }
+    }
+
+    const fn id(self) -> u32 {
+        match self {
+            Self::Rgb => 0,
+            Self::Luma => 1,
+        }
+    }
+
+    const fn input_channels(self) -> usize {
+        match self {
+            Self::Rgb => RGB_CNN_INPUT_CHANNELS,
+            Self::Luma => 1,
+        }
+    }
+
+    const fn output_channels(self) -> usize {
+        match self {
+            Self::Rgb => RGB_CNN_OUTPUT_CHANNELS,
+            Self::Luma => 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DenoiserKind {
     Filter,
-    RgbCnn,
+    RgbCnn(RgbCnnLayout, RgbCnnMode),
     Cnn,
     Atrous,
 }
@@ -69,7 +175,7 @@ impl DenoiserKind {
     fn weight_count(self) -> Option<usize> {
         match self {
             Self::Filter => Some(FILTER_DENOISER_WEIGHT_COUNT),
-            Self::RgbCnn => Some(RGB_CNN_DENOISER_WEIGHT_COUNT),
+            Self::RgbCnn(layout, mode) => Some(layout.weight_count(mode)),
             Self::Cnn => Some(CNN_DENOISER_WEIGHT_COUNT),
             Self::Atrous => None,
         }
@@ -78,7 +184,7 @@ impl DenoiserKind {
     fn weight_path(self) -> Option<&'static str> {
         match self {
             Self::Filter => Some("resources/denoiser_weights.bin"),
-            Self::RgbCnn => Some("resources/denoiser_rgb_cnn_weights.bin"),
+            Self::RgbCnn(_, _) => Some("resources/denoiser_rgb_cnn_weights.bin"),
             Self::Cnn => Some("resources/denoiser_cnn_weights.bin"),
             Self::Atrous => None,
         }
@@ -87,7 +193,7 @@ impl DenoiserKind {
     fn shader_source(self) -> &'static str {
         match self {
             Self::Filter => DENOISE_SHADER,
-            Self::RgbCnn => DENOISE_RGB_CNN_SHADER,
+            Self::RgbCnn(_, _) => DENOISE_RGB_CNN_SHADER,
             Self::Cnn => DENOISE_CNN_SHADER,
             Self::Atrous => DENOISE_ATROUS_SHADER,
         }
@@ -96,25 +202,86 @@ impl DenoiserKind {
     fn shader_label(self) -> &'static str {
         match self {
             Self::Filter => "denoise shader",
-            Self::RgbCnn => "rgb cnn denoise shader",
+            Self::RgbCnn(_, _) => "rgb cnn denoise shader",
             Self::Cnn => "cnn denoise shader",
             Self::Atrous => "atrous denoise shader",
         }
     }
 
     fn is_single_pass(self) -> bool {
-        matches!(self, Self::Filter | Self::RgbCnn | Self::Cnn)
+        matches!(self, Self::Filter | Self::RgbCnn(_, _) | Self::Cnn)
     }
 
     fn needs_guides(self) -> bool {
-        !matches!(self, Self::RgbCnn)
+        !matches!(self, Self::RgbCnn(_, _))
     }
 
     fn runtime_spp(self) -> u32 {
         match self {
             Self::Atrous => 1,
-            Self::Filter | Self::RgbCnn | Self::Cnn => RUNTIME_SPP,
+            Self::Filter | Self::RgbCnn(_, _) | Self::Cnn => RUNTIME_SPP,
         }
+    }
+
+    fn rgb_cnn_layout(self) -> Option<RgbCnnLayout> {
+        match self {
+            Self::RgbCnn(layout, _) => Some(layout),
+            _ => None,
+        }
+    }
+
+    fn rgb_cnn_mode(self) -> Option<RgbCnnMode> {
+        match self {
+            Self::RgbCnn(_, mode) => Some(mode),
+            _ => None,
+        }
+    }
+}
+
+struct LoadedDenoiserWeights {
+    values: Vec<f32>,
+    rgb_cnn_layout: Option<RgbCnnRuntimeLayout>,
+}
+
+#[derive(Clone, Copy)]
+struct RgbCnnRuntimeLayout {
+    mode_id: u32,
+    input_channels: u32,
+    output_channels: u32,
+    layout_id: u32,
+    tap_count: u32,
+    radius: u32,
+    dilation: u32,
+}
+
+fn infer_rgb_cnn_kernel_size(weight_count: usize, mode: RgbCnnMode) -> Option<usize> {
+    let head_count = RGB_CNN_HIDDEN_CHANNELS
+        + mode.output_channels() * RGB_CNN_HIDDEN_CHANNELS
+        + mode.output_channels();
+    let conv0_values = weight_count.checked_sub(head_count)?;
+    let conv0_scale = RGB_CNN_HIDDEN_CHANNELS * mode.input_channels();
+    if conv0_values == 0 || conv0_values % conv0_scale != 0 {
+        return None;
+    }
+
+    let taps = conv0_values / conv0_scale;
+    let kernel_size = (taps as f64).sqrt() as usize;
+    if kernel_size * kernel_size == taps && kernel_size % 2 == 1 {
+        Some(kernel_size)
+    } else {
+        None
+    }
+}
+
+fn runtime_rgb_cnn_layout(layout: RgbCnnLayout, mode: RgbCnnMode) -> RgbCnnRuntimeLayout {
+    RgbCnnRuntimeLayout {
+        mode_id: mode.id(),
+        input_channels: mode.input_channels() as u32,
+        output_channels: mode.output_channels() as u32,
+        layout_id: layout.id(),
+        tap_count: layout.tap_count() as u32,
+        radius: layout.radius(),
+        dilation: layout.dilation(),
     }
 }
 
@@ -749,31 +916,105 @@ fn create_frame_textures(device: &wgpu::Device, width: u32, height: u32) -> Fram
     }
 }
 
-fn load_denoiser_weights(kind: DenoiserKind) -> Vec<f32> {
+fn fallback_denoiser_weights(kind: DenoiserKind) -> LoadedDenoiserWeights {
     let weight_count = kind.weight_count().expect("denoiser kind has weights");
+    LoadedDenoiserWeights {
+        values: vec![0.0; weight_count],
+        rgb_cnn_layout: kind
+            .rgb_cnn_layout()
+            .zip(kind.rgb_cnn_mode())
+            .map(|(layout, mode)| runtime_rgb_cnn_layout(layout, mode)),
+    }
+}
+
+fn load_denoiser_weights(kind: DenoiserKind) -> LoadedDenoiserWeights {
+    let fallback_weight_count = kind.weight_count().expect("denoiser kind has weights");
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(kind.weight_path().expect("denoiser kind has weights"));
     let Ok(bytes) = fs::read(&path) else {
-        return vec![0.0; weight_count];
+        return fallback_denoiser_weights(kind);
     };
-    if bytes.len() != weight_count * std::mem::size_of::<f32>() {
+
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
         eprintln!(
-            "ignoring {}, expected {} bytes but found {}",
+            "ignoring {}, expected a whole number of f32 values but found {} bytes",
             path.display(),
-            weight_count * std::mem::size_of::<f32>(),
             bytes.len()
         );
-        return vec![0.0; weight_count];
+        return fallback_denoiser_weights(kind);
     }
 
-    bytes
+    let weight_count = bytes.len() / std::mem::size_of::<f32>();
+    let rgb_cnn_layout = if let Some((layout, mode)) =
+        kind.rgb_cnn_layout().zip(kind.rgb_cnn_mode())
+    {
+        if layout == RgbCnnLayout::Dense {
+            let Some(kernel_size) = infer_rgb_cnn_kernel_size(weight_count, mode) else {
+                eprintln!(
+                    "ignoring {}, expected dense rgb-cnn weights with an odd-square kernel footprint but found {} f32 values",
+                    path.display(),
+                    weight_count
+                );
+                return fallback_denoiser_weights(kind);
+            };
+            Some(RgbCnnRuntimeLayout {
+                mode_id: mode.id(),
+                input_channels: mode.input_channels() as u32,
+                output_channels: mode.output_channels() as u32,
+                layout_id: layout.id(),
+                tap_count: (kernel_size * kernel_size) as u32,
+                radius: (kernel_size / 2) as u32,
+                dilation: 1,
+            })
+        } else {
+            if weight_count != layout.weight_count(mode) {
+                eprintln!(
+                    "ignoring {}, rgb-cnn layout expects {} bytes but found {}",
+                    path.display(),
+                    layout.weight_count(mode) * std::mem::size_of::<f32>(),
+                    bytes.len()
+                );
+                return fallback_denoiser_weights(kind);
+            }
+            Some(runtime_rgb_cnn_layout(layout, mode))
+        }
+    } else {
+        if weight_count != fallback_weight_count {
+            eprintln!(
+                "ignoring {}, expected {} bytes but found {}",
+                path.display(),
+                fallback_weight_count * std::mem::size_of::<f32>(),
+                bytes.len()
+            );
+            return fallback_denoiser_weights(kind);
+        }
+        None
+    };
+
+    let values = bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(runtime_layout) = rgb_cnn_layout {
+        eprintln!(
+            "loaded {} rgb-cnn mode={} layout={} taps={} radius={} dilation={} weights={} f32",
+            path.display(),
+            runtime_layout.mode_id,
+            runtime_layout.layout_id,
+            runtime_layout.tap_count,
+            runtime_layout.radius,
+            runtime_layout.dilation,
+            values.len()
+        );
+    }
+
+    LoadedDenoiserWeights {
+        values,
+        rgb_cnn_layout,
+    }
 }
 
-fn create_denoiser_weight_buffer(device: &wgpu::Device, kind: DenoiserKind) -> wgpu::Buffer {
-    let weights = load_denoiser_weights(kind);
+fn create_denoiser_weight_buffer(device: &wgpu::Device, weights: &[f32]) -> wgpu::Buffer {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("denoiser weights"),
         size: (weights.len() * std::mem::size_of::<f32>()) as u64,
@@ -1257,6 +1498,17 @@ fn create_compute_pipeline(
     layout: &wgpu::BindGroupLayout,
     entry_point: &'static str,
 ) -> wgpu::ComputePipeline {
+    create_compute_pipeline_with_constants(device, label, shader, layout, entry_point, &[])
+}
+
+fn create_compute_pipeline_with_constants(
+    device: &wgpu::Device,
+    label: &'static str,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    entry_point: &'static str,
+    constants: &[(&str, f64)],
+) -> wgpu::ComputePipeline {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &[Some(layout)],
@@ -1267,9 +1519,34 @@ fn create_compute_pipeline(
         layout: Some(&pipeline_layout),
         module: shader,
         entry_point: Some(entry_point),
-        compilation_options: Default::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants,
+            ..Default::default()
+        },
         cache: None,
     })
+}
+
+fn denoiser_pipeline_constants(
+    kind: DenoiserKind,
+    weights: &LoadedDenoiserWeights,
+) -> Vec<(&'static str, f64)> {
+    if matches!(kind, DenoiserKind::RgbCnn(_, _)) {
+        let layout = weights
+            .rgb_cnn_layout
+            .expect("rgb-cnn weights include runtime layout");
+        vec![
+            ("RGB_CNN_MODE", f64::from(layout.mode_id)),
+            ("RGB_CNN_INPUT_CHANNELS", f64::from(layout.input_channels)),
+            ("RGB_CNN_OUTPUT_CHANNELS", f64::from(layout.output_channels)),
+            ("RGB_CNN_LAYOUT", f64::from(layout.layout_id)),
+            ("RGB_CNN_TAP_COUNT", f64::from(layout.tap_count)),
+            ("RGB_CNN_KERNEL_RADIUS", f64::from(layout.radius)),
+            ("RGB_CNN_DILATION", f64::from(layout.dilation)),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 impl Renderer {
@@ -1406,9 +1683,12 @@ impl Renderer {
         });
 
         let frame_textures = create_frame_textures(&device, config.width, config.height);
-        let denoiser_weight_buffer = denoiser
+        let denoiser_weights = denoiser
             .filter(|kind| kind.is_single_pass())
-            .map(|kind| create_denoiser_weight_buffer(&device, kind));
+            .map(load_denoiser_weights);
+        let denoiser_weight_buffer = denoiser_weights
+            .as_ref()
+            .map(|weights| create_denoiser_weight_buffer(&device, &weights.values));
         let trace_bind_group = create_trace_bind_group(
             &device,
             &trace_bind_group_layout,
@@ -1416,13 +1696,20 @@ impl Renderer {
             &camera_buffer,
             &scene_buffer,
         );
-        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|_| {
-            create_compute_pipeline(
+        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|kind| {
+            let constants = denoiser_pipeline_constants(
+                kind,
+                denoiser_weights
+                    .as_ref()
+                    .expect("single-pass denoiser weights"),
+            );
+            create_compute_pipeline_with_constants(
                 &device,
                 "denoise filter pipeline",
                 &denoise_shader,
                 &denoise_filter_layout,
                 "filter_main",
+                &constants,
             )
         });
         let denoise_bind_group = denoiser_weight_buffer.as_ref().map(|weights| {
@@ -1512,7 +1799,7 @@ impl Renderer {
         }
 
         match self.denoiser {
-            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn | DenoiserKind::Cnn) => {
+            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn(_, _) | DenoiserKind::Cnn) => {
                 self.dispatch_denoiser(&mut encoder)
             }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(&mut encoder),
@@ -1665,9 +1952,12 @@ impl Recorder {
             denoiser_shader_kind.shader_source(),
         );
         let frame_textures = create_frame_textures(&device, width, height);
-        let denoiser_weight_buffer = denoiser
+        let denoiser_weights = denoiser
             .filter(|kind| kind.is_single_pass())
-            .map(|kind| create_denoiser_weight_buffer(&device, kind));
+            .map(load_denoiser_weights);
+        let denoiser_weight_buffer = denoiser_weights
+            .as_ref()
+            .map(|weights| create_denoiser_weight_buffer(&device, &weights.values));
         let trace_bind_group = create_trace_bind_group(
             &device,
             &trace_layout,
@@ -1675,13 +1965,20 @@ impl Recorder {
             &camera_buffer,
             &scene_buffer,
         );
-        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|_| {
-            create_compute_pipeline(
+        let denoise_pipeline = denoiser.filter(|kind| kind.is_single_pass()).map(|kind| {
+            let constants = denoiser_pipeline_constants(
+                kind,
+                denoiser_weights
+                    .as_ref()
+                    .expect("single-pass denoiser weights"),
+            );
+            create_compute_pipeline_with_constants(
                 &device,
                 "record denoise filter pipeline",
                 &denoise_shader,
                 &denoise_filter_layout,
                 "filter_main",
+                &constants,
             )
         });
         let display_copy_pipeline = if matches!(denoiser, Some(DenoiserKind::Atrous)) {
@@ -1816,7 +2113,7 @@ impl Recorder {
             );
         }
         match self.denoiser {
-            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn | DenoiserKind::Cnn) => {
+            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn(_, _) | DenoiserKind::Cnn) => {
                 self.dispatch_denoiser(encoder)
             }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
@@ -1826,7 +2123,7 @@ impl Recorder {
 
     fn encode_denoiser_only(&self, encoder: &mut wgpu::CommandEncoder) {
         match self.denoiser {
-            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn | DenoiserKind::Cnn) => {
+            Some(DenoiserKind::Filter | DenoiserKind::RgbCnn(_, _) | DenoiserKind::Cnn) => {
                 self.dispatch_denoiser(encoder)
             }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
@@ -2408,7 +2705,7 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("renders/shot01"));
     let frame_count = parse_frame_count(args)?;
-    let denoiser = parse_optional_denoiser_kind(args);
+    let denoiser = parse_optional_denoiser_kind(args)?;
     let default_spp = denoiser
         .map(DenoiserKind::runtime_spp)
         .unwrap_or(RUNTIME_SPP);
@@ -2551,32 +2848,73 @@ fn parse_sample_count_override(args: &[String]) -> Result<Option<u32>, Box<dyn E
     }
 }
 
-fn parse_denoiser_kind(args: &[String]) -> DenoiserKind {
+fn parse_rgb_cnn_layout(args: &[String]) -> Result<RgbCnnLayout, Box<dyn Error>> {
+    let Some(index) = args.iter().position(|arg| arg == "--rgb-cnn-layout") else {
+        return Ok(RgbCnnLayout::Dense);
+    };
+    let value = args.get(index + 1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--rgb-cnn-layout requires a layout name",
+        )
+    })?;
+    RgbCnnLayout::parse(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown rgb-cnn layout: {value}"),
+        )
+        .into()
+    })
+}
+
+fn parse_rgb_cnn_mode(args: &[String]) -> Result<RgbCnnMode, Box<dyn Error>> {
+    let Some(index) = args.iter().position(|arg| arg == "--rgb-cnn-mode") else {
+        return Ok(RgbCnnMode::Rgb);
+    };
+    let value = args.get(index + 1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--rgb-cnn-mode requires a mode name",
+        )
+    })?;
+    RgbCnnMode::parse(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown rgb-cnn mode: {value}"),
+        )
+        .into()
+    })
+}
+
+fn parse_denoiser_kind(args: &[String]) -> Result<DenoiserKind, Box<dyn Error>> {
     if args.iter().any(|arg| arg == "--atrous-denoise") {
-        DenoiserKind::Atrous
+        Ok(DenoiserKind::Atrous)
     } else if args.iter().any(|arg| arg == "--filter-denoise") {
-        DenoiserKind::Filter
+        Ok(DenoiserKind::Filter)
     } else if args.iter().any(|arg| arg == "--rgb-cnn-denoise") {
-        DenoiserKind::RgbCnn
+        Ok(DenoiserKind::RgbCnn(
+            parse_rgb_cnn_layout(args)?,
+            parse_rgb_cnn_mode(args)?,
+        ))
     } else if args.iter().any(|arg| arg == "--cnn-denoise") {
-        DenoiserKind::Cnn
+        Ok(DenoiserKind::Cnn)
     } else {
-        DenoiserKind::Cnn
+        Ok(DenoiserKind::Cnn)
     }
 }
 
-fn parse_optional_denoiser_kind(args: &[String]) -> Option<DenoiserKind> {
+fn parse_optional_denoiser_kind(args: &[String]) -> Result<Option<DenoiserKind>, Box<dyn Error>> {
     if args.iter().any(|arg| arg == "--no-denoise") {
-        None
+        Ok(None)
     } else {
-        Some(parse_denoiser_kind(args))
+        Ok(Some(parse_denoiser_kind(args)?))
     }
 }
 
 fn run_denoiser_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
     let frames = parse_arg_u32(args, "--frames", 240)?;
     let warmup = parse_arg_u32(args, "--warmup", 20)?;
-    let denoiser = parse_optional_denoiser_kind(args);
+    let denoiser = parse_optional_denoiser_kind(args)?;
     let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     let sample_count = denoiser
@@ -2614,7 +2952,7 @@ fn run_denoiser_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
     let frames = parse_arg_u32(args, "--frames", 120)?;
     let warmup = parse_arg_u32(args, "--warmup", 10)?;
-    let denoiser = parse_optional_denoiser_kind(args);
+    let denoiser = parse_optional_denoiser_kind(args)?;
     let default_spp = denoiser
         .map(DenoiserKind::runtime_spp)
         .unwrap_or(RUNTIME_SPP);
@@ -2732,16 +3070,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("usage:");
             println!("  realtimerays");
             println!("  realtimerays --no-denoise");
-            println!("  realtimerays --rgb-cnn-denoise");
+            println!(
+                "  realtimerays --rgb-cnn-denoise [--rgb-cnn-layout dense|sparse-wide|dilated3|dilated5|axis17] [--rgb-cnn-mode rgb|luma]"
+            );
             println!("  realtimerays --cnn-denoise");
             println!("  realtimerays --filter-denoise");
             println!("  realtimerays --atrous-denoise");
             println!("  realtimerays --spp N");
             println!(
-                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--rgb-cnn-denoise [--rgb-cnn-layout NAME] [--rgb-cnn-mode rgb|luma]|--cnn-denoise|--filter-denoise|--atrous-denoise]"
             );
             println!(
-                "  realtimerays bench-denoiser [--frames N] [--warmup N] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays bench-denoiser [--frames N] [--warmup N] [--no-denoise|--rgb-cnn-denoise [--rgb-cnn-layout NAME] [--rgb-cnn-mode rgb|luma]|--cnn-denoise|--filter-denoise|--atrous-denoise]"
             );
             println!("  realtimerays dataset [output-dir] [--frames N] [--rgb-only]");
             println!(
@@ -2756,6 +3096,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("--filter-denoise") => {}
         Some("--atrous-denoise") => {}
         Some("--spp") => {}
+        Some("--rgb-cnn-layout") => {}
+        Some("--rgb-cnn-mode") => {}
         Some(other) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2769,19 +3111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let denoiser = if args.iter().any(|arg| arg == "--no-denoise") {
-        None
-    } else if args.iter().any(|arg| arg == "--atrous-denoise") {
-        Some(DenoiserKind::Atrous)
-    } else if args.iter().any(|arg| arg == "--filter-denoise") {
-        Some(DenoiserKind::Filter)
-    } else if args.iter().any(|arg| arg == "--rgb-cnn-denoise") {
-        Some(DenoiserKind::RgbCnn)
-    } else if args.iter().any(|arg| arg == "--cnn-denoise") {
-        Some(DenoiserKind::Cnn)
-    } else {
-        Some(DenoiserKind::Cnn)
-    };
+    let denoiser = parse_optional_denoiser_kind(&args)?;
     let sample_count_override = parse_sample_count_override(&args)?;
     let mut app = App::new(denoiser, sample_count_override);
     event_loop.run_app(&mut app)?;
