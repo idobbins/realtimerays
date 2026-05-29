@@ -124,6 +124,78 @@ fn seed(px: vec2<i32>, sample_index: i32) -> u32 {
     );
 }
 
+fn coverage_probability() -> f32 {
+    let coverage = bitcast<f32>(pc.render.w);
+    if coverage > 0.0 && coverage < 1.0 {
+        return coverage;
+    }
+    return 1.0;
+}
+
+fn bayer4_rank(px: vec2<i32>) -> u32 {
+    let x = u32(px.x) & 3u;
+    let y = u32(px.y) & 3u;
+
+    if y == 0u {
+        if x == 0u {
+            return 0u;
+        }
+        if x == 1u {
+            return 8u;
+        }
+        if x == 2u {
+            return 2u;
+        }
+        return 10u;
+    }
+    if y == 1u {
+        if x == 0u {
+            return 12u;
+        }
+        if x == 1u {
+            return 4u;
+        }
+        if x == 2u {
+            return 14u;
+        }
+        return 6u;
+    }
+    if y == 2u {
+        if x == 0u {
+            return 3u;
+        }
+        if x == 1u {
+            return 11u;
+        }
+        if x == 2u {
+            return 1u;
+        }
+        return 9u;
+    }
+
+    if x == 0u {
+        return 15u;
+    }
+    if x == 1u {
+        return 7u;
+    }
+    if x == 2u {
+        return 13u;
+    }
+    return 5u;
+}
+
+fn coverage_selected(px: vec2<i32>) -> bool {
+    let coverage = coverage_probability();
+    if coverage >= 1.0 {
+        return true;
+    }
+
+    let temporal_phase = (pc.render.y * 5u) & 15u;
+    let rank = (bayer4_rank(px) + temporal_phase) & 15u;
+    return (f32(rank) + 0.5) / 16.0 < coverage;
+}
+
 fn albedo(m: u32) -> vec3<f32> {
     if m == MAT_GRASS {
         return vec3<f32>(0.32, 0.55, 0.22);
@@ -617,6 +689,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if write_guides {
         let center_ray = camera_ray(cam, pixel_uv(px, size, vec2<f32>(0.0)));
         guides = first_hit_guides(cam.ro, center_ray);
+    }
+
+    if !coverage_selected(px) {
+        textureStore(color_image, px, vec4<f32>(0.0));
+        if write_guides {
+            textureStore(normal_image, px, vec4<f32>(guides.normal, 1.0));
+            textureStore(albedo_image, px, vec4<f32>(guides.albedo, 1.0));
+            textureStore(depth_image, px, vec4<f32>(guides.depth, 0.0, 0.0, 1.0));
+        }
+        return;
     }
 
     for (var i = 0; i < sample_count; i = i + 1) {

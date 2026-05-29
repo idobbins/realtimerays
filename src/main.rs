@@ -29,6 +29,7 @@ const RENDER_FLAG_GUIDES: u32 = 1;
 const FILTER_DENOISER_WEIGHT_COUNT: usize = 19;
 const RGB_CNN_HIDDEN_CHANNELS: usize = 8;
 const RGB_CNN_INPUT_CHANNELS: usize = 3;
+const RECON_CNN_INPUT_CHANNELS: usize = 4;
 const RGB_CNN_OUTPUT_CHANNELS: usize = 3;
 const RGB_CNN_DEFAULT_KERNEL_SIZE: usize = 3;
 const CNN_DENOISER_WEIGHT_COUNT: usize = 4739;
@@ -58,6 +59,7 @@ const DENOISE_SHADER: &str = include_str!("../resources/shaders/denoise.wgsl");
 const DENOISE_RGB_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_rgb_cnn.wgsl");
 const DENOISE_CNN_SHADER: &str = include_str!("../resources/shaders/denoise_cnn.wgsl");
 const DENOISE_ATROUS_SHADER: &str = include_str!("../resources/shaders/denoise_atrous.wgsl");
+const DENOISE_TEMPORAL_SHADER: &str = include_str!("../resources/shaders/denoise_temporal.wgsl");
 const BLIT_SHADER: &str = include_str!("../resources/shaders/blit.wgsl");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +132,7 @@ impl RgbCnnLayout {
 enum RgbCnnMode {
     Rgb,
     Luma,
+    Recon,
 }
 
 impl RgbCnnMode {
@@ -137,6 +140,7 @@ impl RgbCnnMode {
         match name {
             "rgb" => Some(Self::Rgb),
             "luma" => Some(Self::Luma),
+            "recon" => Some(Self::Recon),
             _ => None,
         }
     }
@@ -145,6 +149,7 @@ impl RgbCnnMode {
         match self {
             Self::Rgb => 0,
             Self::Luma => 1,
+            Self::Recon => 2,
         }
     }
 
@@ -152,6 +157,7 @@ impl RgbCnnMode {
         match self {
             Self::Rgb => RGB_CNN_INPUT_CHANNELS,
             Self::Luma => 1,
+            Self::Recon => RECON_CNN_INPUT_CHANNELS,
         }
     }
 
@@ -159,6 +165,7 @@ impl RgbCnnMode {
         match self {
             Self::Rgb => RGB_CNN_OUTPUT_CHANNELS,
             Self::Luma => 1,
+            Self::Recon => RGB_CNN_OUTPUT_CHANNELS,
         }
     }
 }
@@ -169,6 +176,7 @@ enum DenoiserKind {
     RgbCnn(RgbCnnLayout, RgbCnnMode),
     Cnn,
     Atrous,
+    Temporal,
 }
 
 impl DenoiserKind {
@@ -177,16 +185,17 @@ impl DenoiserKind {
             Self::Filter => Some(FILTER_DENOISER_WEIGHT_COUNT),
             Self::RgbCnn(layout, mode) => Some(layout.weight_count(mode)),
             Self::Cnn => Some(CNN_DENOISER_WEIGHT_COUNT),
-            Self::Atrous => None,
+            Self::Atrous | Self::Temporal => None,
         }
     }
 
     fn weight_path(self) -> Option<&'static str> {
         match self {
             Self::Filter => Some("resources/denoiser_weights.bin"),
+            Self::RgbCnn(_, RgbCnnMode::Recon) => Some("resources/denoiser_recon_cnn_weights.bin"),
             Self::RgbCnn(_, _) => Some("resources/denoiser_rgb_cnn_weights.bin"),
             Self::Cnn => Some("resources/denoiser_cnn_weights.bin"),
-            Self::Atrous => None,
+            Self::Atrous | Self::Temporal => None,
         }
     }
 
@@ -196,6 +205,7 @@ impl DenoiserKind {
             Self::RgbCnn(_, _) => DENOISE_RGB_CNN_SHADER,
             Self::Cnn => DENOISE_CNN_SHADER,
             Self::Atrous => DENOISE_ATROUS_SHADER,
+            Self::Temporal => DENOISE_TEMPORAL_SHADER,
         }
     }
 
@@ -205,6 +215,7 @@ impl DenoiserKind {
             Self::RgbCnn(_, _) => "rgb cnn denoise shader",
             Self::Cnn => "cnn denoise shader",
             Self::Atrous => "atrous denoise shader",
+            Self::Temporal => "temporal denoise shader",
         }
     }
 
@@ -219,6 +230,8 @@ impl DenoiserKind {
     fn runtime_spp(self) -> u32 {
         match self {
             Self::Atrous => 1,
+            Self::Temporal => 1,
+            Self::RgbCnn(_, RgbCnnMode::Recon) => 1,
             Self::Filter | Self::RgbCnn(_, _) | Self::Cnn => RUNTIME_SPP,
         }
     }
@@ -672,6 +685,7 @@ fn camera_uniform(
     sample_count: u32,
     seed_offset: u32,
     write_guides: bool,
+    coverage: f32,
 ) -> CameraUniform {
     let a = CAMERA_ORBIT_ANGLE + time * CAMERA_ORBIT_SPEED;
     let target = [0.0, 2.25, 0.0];
@@ -696,7 +710,7 @@ fn camera_uniform(
             sample_count,
             seed_offset,
             if write_guides { RENDER_FLAG_GUIDES } else { 0 },
-            0,
+            coverage.to_bits(),
         ],
     }
 }
@@ -746,12 +760,14 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     camera_buffer: wgpu::Buffer,
+    previous_camera_buffer: wgpu::Buffer,
     _scene_buffer: wgpu::Buffer,
     _denoiser_weight_buffer: Option<wgpu::Buffer>,
     _frame_textures: FrameTextures,
     trace_bind_group: wgpu::BindGroup,
     denoise_bind_group: Option<wgpu::BindGroup>,
     atrous_denoiser: Option<AtrousDenoiser>,
+    temporal_denoiser: Option<TemporalDenoiser>,
     display_copy_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
     trace_pipeline: wgpu::ComputePipeline,
@@ -759,6 +775,7 @@ struct Renderer {
     display_copy_pipeline: wgpu::ComputePipeline,
     blit_pipeline: wgpu::RenderPipeline,
     denoiser: Option<DenoiserKind>,
+    previous_camera: CameraUniform,
     frame_index: u32,
 }
 
@@ -768,17 +785,21 @@ struct Recorder {
     width: u32,
     height: u32,
     camera_buffer: wgpu::Buffer,
+    previous_camera_buffer: wgpu::Buffer,
     _scene_buffer: wgpu::Buffer,
     _denoiser_weight_buffer: Option<wgpu::Buffer>,
     frame_textures: FrameTextures,
     trace_bind_group: wgpu::BindGroup,
     denoise_bind_group: Option<wgpu::BindGroup>,
     atrous_denoiser: Option<AtrousDenoiser>,
+    temporal_denoiser: Option<TemporalDenoiser>,
     trace_pipeline: wgpu::ComputePipeline,
     denoise_pipeline: Option<wgpu::ComputePipeline>,
     display_copy_bind_group: Option<wgpu::BindGroup>,
     display_copy_pipeline: Option<wgpu::ComputePipeline>,
     denoiser: Option<DenoiserKind>,
+    previous_camera: CameraUniform,
+    frame_index: u32,
 }
 
 struct DatasetRecorder {
@@ -811,12 +832,24 @@ struct FrameTextures {
     trace: TraceTextures,
     atrous_a: wgpu::Texture,
     atrous_b: wgpu::Texture,
+    temporal_a: TemporalHistoryTextures,
+    temporal_b: TemporalHistoryTextures,
+}
+
+struct TemporalHistoryTextures {
+    color: wgpu::Texture,
+    albedo_depth: wgpu::Texture,
 }
 
 struct AtrousDenoiser {
     pipelines: Vec<wgpu::ComputePipeline>,
     bind_groups: Vec<wgpu::BindGroup>,
     display_bind_group: wgpu::BindGroup,
+}
+
+struct TemporalDenoiser {
+    pipeline: wgpu::ComputePipeline,
+    bind_groups: Vec<wgpu::BindGroup>,
 }
 
 fn create_texture(
@@ -893,6 +926,33 @@ fn create_trace_textures(device: &wgpu::Device, width: u32, height: u32) -> Trac
     }
 }
 
+fn create_temporal_history_textures(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label_prefix: &'static str,
+) -> TemporalHistoryTextures {
+    let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+    TemporalHistoryTextures {
+        color: create_texture(
+            device,
+            label_prefix,
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            usage,
+        ),
+        albedo_depth: create_texture(
+            device,
+            "temporal history albedo depth",
+            width,
+            height,
+            wgpu::TextureFormat::Rgba16Float,
+            usage,
+        ),
+    }
+}
+
 fn create_frame_textures(device: &wgpu::Device, width: u32, height: u32) -> FrameTextures {
     let denoise_usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
     FrameTextures {
@@ -912,6 +972,18 @@ fn create_frame_textures(device: &wgpu::Device, width: u32, height: u32) -> Fram
             height,
             wgpu::TextureFormat::Rgba16Float,
             denoise_usage,
+        ),
+        temporal_a: create_temporal_history_textures(
+            device,
+            width,
+            height,
+            "temporal history color a",
+        ),
+        temporal_b: create_temporal_history_textures(
+            device,
+            width,
+            height,
+            "temporal history color b",
         ),
     }
 }
@@ -1087,6 +1159,19 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 fn weights_entry() -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding: 6,
@@ -1106,6 +1191,24 @@ fn create_display_copy_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         entries: &[
             texture_entry(0),
             storage_texture_entry(20, wgpu::TextureFormat::Rgba8Unorm),
+        ],
+    })
+}
+
+fn create_temporal_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("temporal denoise bind group layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(2),
+            texture_entry(3),
+            texture_entry(4),
+            texture_entry(6),
+            uniform_entry(8),
+            uniform_entry(9),
+            storage_texture_entry(20, wgpu::TextureFormat::Rgba8Unorm),
+            storage_texture_entry(21, wgpu::TextureFormat::Rgba16Float),
+            storage_texture_entry(23, wgpu::TextureFormat::Rgba16Float),
         ],
     })
 }
@@ -1408,6 +1511,92 @@ fn create_atrous_display_bind_group(
     })
 }
 
+fn create_temporal_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    textures: &FrameTextures,
+    previous: &TemporalHistoryTextures,
+    next: &TemporalHistoryTextures,
+    camera_buffer: &wgpu::Buffer,
+    previous_camera_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let current_color_view = textures
+        .trace
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let current_albedo_view = textures
+        .trace
+        .albedo
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let current_depth_view = textures
+        .trace
+        .depth
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let previous_color_view = previous
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let previous_albedo_depth_view = previous
+        .albedo_depth
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let display_view = textures
+        .trace
+        .display
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let next_color_view = next
+        .color
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let next_albedo_depth_view = next
+        .albedo_depth
+        .create_view(&wgpu::TextureViewDescriptor::default());
+
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("temporal denoise bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&current_color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&current_albedo_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&current_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&previous_color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&previous_albedo_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: camera_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: previous_camera_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(&display_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::TextureView(&next_color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: wgpu::BindingResource::TextureView(&next_albedo_depth_view),
+            },
+        ],
+    })
+}
+
 fn create_atrous_denoiser(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -1458,6 +1647,48 @@ fn create_atrous_denoiser(
         pipelines,
         bind_groups,
         display_bind_group,
+    }
+}
+
+fn create_temporal_denoiser(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    temporal_layout: &wgpu::BindGroupLayout,
+    textures: &FrameTextures,
+    camera_buffer: &wgpu::Buffer,
+    previous_camera_buffer: &wgpu::Buffer,
+) -> TemporalDenoiser {
+    let pipeline = create_compute_pipeline(
+        device,
+        "temporal denoise pipeline",
+        shader,
+        temporal_layout,
+        "filter_main",
+    );
+    let bind_groups = vec![
+        create_temporal_bind_group(
+            device,
+            temporal_layout,
+            textures,
+            &textures.temporal_b,
+            &textures.temporal_a,
+            camera_buffer,
+            previous_camera_buffer,
+        ),
+        create_temporal_bind_group(
+            device,
+            temporal_layout,
+            textures,
+            &textures.temporal_a,
+            &textures.temporal_b,
+            camera_buffer,
+            previous_camera_buffer,
+        ),
+    ];
+
+    TemporalDenoiser {
+        pipeline,
+        bind_groups,
     }
 }
 
@@ -1550,7 +1781,7 @@ fn denoiser_pipeline_constants(
 }
 
 impl Renderer {
-    fn new(window: Arc<Window>, denoiser: Option<DenoiserKind>) -> Self {
+    fn new(window: Arc<Window>, denoiser: Option<DenoiserKind>, no_vsync: bool) -> Self {
         let size = window.inner_size();
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = wgpu::Backends::METAL;
@@ -1582,12 +1813,21 @@ impl Renderer {
             .find(|format| *format == wgpu::TextureFormat::Bgra8Unorm)
             .or_else(|| capabilities.formats.first().copied())
             .expect("surface format");
-        let present_mode = capabilities
-            .present_modes
-            .iter()
-            .copied()
-            .find(|mode| *mode == wgpu::PresentMode::Fifo)
-            .unwrap_or(capabilities.present_modes[0]);
+        let present_mode = if no_vsync {
+            capabilities
+                .present_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::PresentMode::Immediate)
+                .unwrap_or(wgpu::PresentMode::AutoNoVsync)
+        } else {
+            capabilities
+                .present_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::PresentMode::Fifo)
+                .unwrap_or(capabilities.present_modes[0])
+        };
         let alpha_mode = capabilities
             .alpha_modes
             .iter()
@@ -1612,12 +1852,19 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let previous_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("previous camera uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let (scene_buffer, use_grid) = create_scene_buffer(&device);
 
         let trace_bind_group_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
         let atrous_layout = create_atrous_layout(&device);
         let atrous_display_layout = create_atrous_display_layout(&device);
+        let temporal_layout = create_temporal_layout(&device);
         let display_copy_layout = create_display_copy_layout(&device);
         let blit_bind_group_layout = create_blit_bind_group_layout(&device);
 
@@ -1731,6 +1978,18 @@ impl Renderer {
         } else {
             None
         };
+        let temporal_denoiser = if matches!(denoiser, Some(DenoiserKind::Temporal)) {
+            Some(create_temporal_denoiser(
+                &device,
+                &denoise_shader,
+                &temporal_layout,
+                &frame_textures,
+                &camera_buffer,
+                &previous_camera_buffer,
+            ))
+        } else {
+            None
+        };
         let display_copy_bind_group =
             create_display_copy_bind_group(&device, &display_copy_layout, &frame_textures.trace);
         let blit_bind_group = create_blit_bind_group(
@@ -1746,12 +2005,14 @@ impl Renderer {
             queue,
             config,
             camera_buffer,
+            previous_camera_buffer,
             _scene_buffer: scene_buffer,
             _denoiser_weight_buffer: denoiser_weight_buffer,
             _frame_textures: frame_textures,
             trace_bind_group,
             denoise_bind_group,
             atrous_denoiser,
+            temporal_denoiser,
             display_copy_bind_group,
             blit_bind_group,
             trace_pipeline,
@@ -1759,13 +2020,24 @@ impl Renderer {
             display_copy_pipeline,
             blit_pipeline,
             denoiser,
+            previous_camera: CameraUniform::zeroed(),
             frame_index: 0,
         }
     }
 
     fn render(&mut self, camera: &CameraUniform) {
+        let previous_camera = if self.frame_index == 0 {
+            *camera
+        } else {
+            self.previous_camera
+        };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.queue.write_buffer(
+            &self.previous_camera_buffer,
+            0,
+            bytemuck::bytes_of(&previous_camera),
+        );
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -1803,6 +2075,7 @@ impl Renderer {
                 self.dispatch_denoiser(&mut encoder)
             }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(&mut encoder),
+            Some(DenoiserKind::Temporal) => self.dispatch_temporal_denoiser(&mut encoder),
             None => self.dispatch_display_copy(&mut encoder),
         }
 
@@ -1830,6 +2103,7 @@ impl Renderer {
 
         self.queue.submit([encoder.finish()]);
         frame.present();
+        self.previous_camera = *camera;
         self.frame_index = self.frame_index.wrapping_add(1);
     }
 
@@ -1874,6 +2148,22 @@ impl Renderer {
         });
         pass.set_pipeline(&self.display_copy_pipeline);
         pass.set_bind_group(0, &atrous.display_bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.config.width.div_ceil(TILE_SIZE),
+            self.config.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+
+    fn dispatch_temporal_denoiser(&self, encoder: &mut wgpu::CommandEncoder) {
+        let temporal = self.temporal_denoiser.as_ref().expect("temporal denoiser");
+        let bind_group = &temporal.bind_groups[(self.frame_index as usize) & 1];
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("temporal denoise pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&temporal.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(
             self.config.width.div_ceil(TILE_SIZE),
             self.config.height.div_ceil(TILE_SIZE),
@@ -1927,12 +2217,19 @@ impl Recorder {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let previous_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("record previous camera uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let (scene_buffer, use_grid) = create_scene_buffer(&device);
 
         let trace_layout = create_trace_bind_group_layout(&device);
         let denoise_filter_layout = create_denoise_filter_layout(&device);
         let atrous_layout = create_atrous_layout(&device);
         let atrous_display_layout = create_atrous_display_layout(&device);
+        let temporal_layout = create_temporal_layout(&device);
         let display_copy_layout = create_display_copy_layout(&device);
         let denoiser_shader_kind = denoiser.unwrap_or(DenoiserKind::Filter);
 
@@ -2028,6 +2325,18 @@ impl Recorder {
         } else {
             None
         };
+        let temporal_denoiser = if matches!(denoiser, Some(DenoiserKind::Temporal)) {
+            Some(create_temporal_denoiser(
+                &device,
+                &denoise_shader,
+                &temporal_layout,
+                &frame_textures,
+                &camera_buffer,
+                &previous_camera_buffer,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             device,
@@ -2035,23 +2344,46 @@ impl Recorder {
             width,
             height,
             camera_buffer,
+            previous_camera_buffer,
             _scene_buffer: scene_buffer,
             _denoiser_weight_buffer: denoiser_weight_buffer,
             frame_textures,
             trace_bind_group,
             denoise_bind_group,
             atrous_denoiser,
+            temporal_denoiser,
             trace_pipeline,
             denoise_pipeline,
             display_copy_bind_group,
             display_copy_pipeline,
             denoiser,
+            previous_camera: CameraUniform::zeroed(),
+            frame_index: 0,
         })
     }
 
-    fn capture_frame(&self, camera: &CameraUniform) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn write_frame_cameras(&mut self, camera: &CameraUniform) {
+        let previous_camera = if self.frame_index == 0 {
+            *camera
+        } else {
+            self.previous_camera
+        };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.queue.write_buffer(
+            &self.previous_camera_buffer,
+            0,
+            bytemuck::bytes_of(&previous_camera),
+        );
+    }
+
+    fn advance_frame(&mut self, camera: &CameraUniform) {
+        self.previous_camera = *camera;
+        self.frame_index = self.frame_index.wrapping_add(1);
+    }
+
+    fn capture_frame(&mut self, camera: &CameraUniform) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.write_frame_cameras(camera);
 
         let mut encoder = self
             .device
@@ -2069,12 +2401,12 @@ impl Recorder {
             "record readback",
         )?;
         self.queue.submit([encoder.finish()]);
+        self.advance_frame(camera);
         map_readback(&self.device, pixels)
     }
 
-    fn submit_frame(&self, camera: &CameraUniform) -> Result<(), Box<dyn Error>> {
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+    fn submit_frame(&mut self, camera: &CameraUniform) -> Result<(), Box<dyn Error>> {
+        self.write_frame_cameras(camera);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2082,6 +2414,7 @@ impl Recorder {
             });
         self.encode_frame(&mut encoder);
         self.queue.submit([encoder.finish()]);
+        self.advance_frame(camera);
         self.device.poll(wgpu::PollType::wait_indefinitely())?;
         Ok(())
     }
@@ -2117,6 +2450,7 @@ impl Recorder {
                 self.dispatch_denoiser(encoder)
             }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
+            Some(DenoiserKind::Temporal) => self.dispatch_temporal_denoiser(encoder),
             None => self.dispatch_display_copy(encoder),
         }
     }
@@ -2127,6 +2461,7 @@ impl Recorder {
                 self.dispatch_denoiser(encoder)
             }
             Some(DenoiserKind::Atrous) => self.dispatch_atrous_denoiser(encoder),
+            Some(DenoiserKind::Temporal) => self.dispatch_temporal_denoiser(encoder),
             None => self.dispatch_display_copy(encoder),
         }
     }
@@ -2183,6 +2518,25 @@ impl Recorder {
                 .expect("record atrous display copy pipeline"),
         );
         pass.set_bind_group(0, &atrous.display_bind_group, &[]);
+        pass.dispatch_workgroups(
+            self.width.div_ceil(TILE_SIZE),
+            self.height.div_ceil(TILE_SIZE),
+            1,
+        );
+    }
+
+    fn dispatch_temporal_denoiser(&self, encoder: &mut wgpu::CommandEncoder) {
+        let temporal = self
+            .temporal_denoiser
+            .as_ref()
+            .expect("record temporal denoiser");
+        let bind_group = &temporal.bind_groups[(self.frame_index as usize) & 1];
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("record temporal denoise pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&temporal.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(
             self.width.div_ceil(TILE_SIZE),
             self.height.div_ceil(TILE_SIZE),
@@ -2481,15 +2835,24 @@ struct App {
     stats: FrameStats,
     denoiser: Option<DenoiserKind>,
     sample_count_override: Option<u32>,
+    sample_coverage: f32,
+    no_vsync: bool,
 }
 
 impl App {
-    fn new(denoiser: Option<DenoiserKind>, sample_count_override: Option<u32>) -> Self {
+    fn new(
+        denoiser: Option<DenoiserKind>,
+        sample_count_override: Option<u32>,
+        sample_coverage: f32,
+        no_vsync: bool,
+    ) -> Self {
         Self {
             renderer: None,
             stats: FrameStats::new(),
             denoiser,
             sample_count_override,
+            sample_coverage,
+            no_vsync,
         }
     }
 }
@@ -2507,7 +2870,7 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         center_window(&window);
-        let renderer = Renderer::new(Arc::clone(&window), self.denoiser);
+        let renderer = Renderer::new(Arc::clone(&window), self.denoiser, self.no_vsync);
         window.request_redraw();
 
         self.renderer = Some(renderer);
@@ -2539,7 +2902,13 @@ impl ApplicationHandler for App {
                         .unwrap_or(RUNTIME_SPP)
                 });
                 let write_guides = renderer.denoiser.is_some_and(DenoiserKind::needs_guides);
-                let camera = camera_uniform(time, sample_count, seed_offset, write_guides);
+                let camera = camera_uniform(
+                    time,
+                    sample_count,
+                    seed_offset,
+                    write_guides,
+                    self.sample_coverage,
+                );
                 renderer.render(&camera);
             }
             _ => {}
@@ -2710,9 +3079,10 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map(DenoiserKind::runtime_spp)
         .unwrap_or(RUNTIME_SPP);
     let sample_count = parse_sample_count(args, default_spp)?;
+    let sample_coverage = parse_sample_coverage(args)?;
 
     fs::create_dir_all(&output_dir)?;
-    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
+    let mut recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
@@ -2721,6 +3091,7 @@ fn run_record_x(args: &[String]) -> Result<(), Box<dyn Error>> {
             sample_count,
             frame_index,
             denoiser.is_some_and(DenoiserKind::needs_guides),
+            sample_coverage,
         ))?;
         let path = output_dir.join(format!("frame_{frame_index:06}.png"));
         write_png(&path, WIDTH, HEIGHT, &pixels)?;
@@ -2746,6 +3117,9 @@ fn run_dataset(args: &[String]) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| PathBuf::from("renders/denoiser_dataset"));
     let frame_count = parse_frame_count(args)?;
     let rgb_only = args.iter().any(|arg| arg == "--rgb-only");
+    let input_spp = parse_arg_u32(args, "--input-spp", DATASET_INPUT_SPP)?;
+    let target_spp = parse_arg_u32(args, "--target-spp", DATASET_TARGET_SPP)?;
+    let input_coverage = parse_sample_coverage(args)?;
     let channels = if rgb_only {
         "[\"input_color\", \"target_color\"]"
     } else {
@@ -2754,15 +3128,15 @@ fn run_dataset(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     fs::create_dir_all(&output_dir)?;
     let meta = format!(
-        "{{\n  \"width\": {WIDTH},\n  \"height\": {HEIGHT},\n  \"input_spp\": {DATASET_INPUT_SPP},\n  \"target_spp\": {DATASET_TARGET_SPP},\n  \"frames\": {frame_count},\n  \"rgb_only\": {rgb_only},\n  \"format\": \"rgba16float little-endian raw files plus rgba8 debug pngs\",\n  \"channels\": {channels}\n}}\n"
+        "{{\n  \"width\": {WIDTH},\n  \"height\": {HEIGHT},\n  \"input_spp\": {input_spp},\n  \"target_spp\": {target_spp},\n  \"input_coverage\": {input_coverage},\n  \"frames\": {frame_count},\n  \"rgb_only\": {rgb_only},\n  \"format\": \"rgba16float little-endian raw files plus rgba8 debug pngs; input_color alpha stores coverage\",\n  \"channels\": {channels}\n}}\n"
     );
     write_bytes(&output_dir.join("dataset_meta.json"), meta.as_bytes())?;
 
     let recorder = DatasetRecorder::new(WIDTH, HEIGHT)?;
     for frame_index in 0..frame_count {
         let time = frame_index as f32 / RECORD_FPS as f32;
-        let input_camera = camera_uniform(time, DATASET_INPUT_SPP, frame_index, !rgb_only);
-        let target_camera = camera_uniform(time, DATASET_TARGET_SPP, frame_index, false);
+        let input_camera = camera_uniform(time, input_spp, frame_index, !rgb_only, input_coverage);
+        let target_camera = camera_uniform(time, target_spp, frame_index, false, 1.0);
         let frame = recorder.capture_pair(&input_camera, &target_camera, !rgb_only)?;
 
         write_bytes(
@@ -2836,6 +3210,19 @@ fn parse_arg_u32(args: &[String], name: &str, default: u32) -> Result<u32, Box<d
     Ok(parsed)
 }
 
+fn parse_arg_f32(args: &[String], name: &str, default: f32) -> Result<f32, Box<dyn Error>> {
+    let Some(index) = args.iter().position(|arg| arg == name) else {
+        return Ok(default);
+    };
+    let value = args.get(index + 1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} requires a value"),
+        )
+    })?;
+    Ok(value.parse::<f32>()?)
+}
+
 fn parse_sample_count(args: &[String], default: u32) -> Result<u32, Box<dyn Error>> {
     parse_arg_u32(args, "--spp", default)
 }
@@ -2846,6 +3233,22 @@ fn parse_sample_count_override(args: &[String]) -> Result<Option<u32>, Box<dyn E
     } else {
         Ok(None)
     }
+}
+
+fn parse_sample_coverage(args: &[String]) -> Result<f32, Box<dyn Error>> {
+    let coverage = parse_arg_f32(args, "--coverage", 1.0)?;
+    if !(coverage > 0.0 && coverage <= 1.0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--coverage must be > 0 and <= 1",
+        )
+        .into());
+    }
+    Ok(coverage)
+}
+
+fn parse_no_vsync(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--no-vsync")
 }
 
 fn parse_rgb_cnn_layout(args: &[String]) -> Result<RgbCnnLayout, Box<dyn Error>> {
@@ -2887,7 +3290,9 @@ fn parse_rgb_cnn_mode(args: &[String]) -> Result<RgbCnnMode, Box<dyn Error>> {
 }
 
 fn parse_denoiser_kind(args: &[String]) -> Result<DenoiserKind, Box<dyn Error>> {
-    if args.iter().any(|arg| arg == "--atrous-denoise") {
+    if args.iter().any(|arg| arg == "--temporal-denoise") {
+        Ok(DenoiserKind::Temporal)
+    } else if args.iter().any(|arg| arg == "--atrous-denoise") {
         Ok(DenoiserKind::Atrous)
     } else if args.iter().any(|arg| arg == "--filter-denoise") {
         Ok(DenoiserKind::Filter)
@@ -2915,7 +3320,8 @@ fn run_denoiser_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
     let frames = parse_arg_u32(args, "--frames", 240)?;
     let warmup = parse_arg_u32(args, "--warmup", 20)?;
     let denoiser = parse_optional_denoiser_kind(args)?;
-    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
+    let sample_coverage = parse_sample_coverage(args)?;
+    let mut recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     let sample_count = denoiser
         .map(DenoiserKind::runtime_spp)
@@ -2925,6 +3331,7 @@ fn run_denoiser_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
         sample_count,
         0,
         denoiser.is_some_and(DenoiserKind::needs_guides),
+        sample_coverage,
     ))?;
     for _ in 0..warmup {
         recorder.submit_denoiser_only()?;
@@ -2957,7 +3364,8 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
         .map(DenoiserKind::runtime_spp)
         .unwrap_or(RUNTIME_SPP);
     let sample_count = parse_sample_count(args, default_spp)?;
-    let recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
+    let sample_coverage = parse_sample_coverage(args)?;
+    let mut recorder = Recorder::new(WIDTH, HEIGHT, denoiser)?;
 
     for frame_index in 0..warmup {
         let time = frame_index as f32 / RECORD_FPS as f32;
@@ -2966,6 +3374,7 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
             sample_count,
             frame_index,
             denoiser.is_some_and(DenoiserKind::needs_guides),
+            sample_coverage,
         ))?;
     }
 
@@ -2977,6 +3386,7 @@ fn run_bench(args: &[String]) -> Result<(), Box<dyn Error>> {
             sample_count,
             warmup + frame_index,
             denoiser.is_some_and(DenoiserKind::needs_guides),
+            sample_coverage,
         ))?;
     }
     let seconds = start.elapsed().as_secs_f64();
@@ -3071,21 +3481,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("  realtimerays");
             println!("  realtimerays --no-denoise");
             println!(
-                "  realtimerays --rgb-cnn-denoise [--rgb-cnn-layout dense|sparse-wide|dilated3|dilated5|axis17] [--rgb-cnn-mode rgb|luma]"
+                "  realtimerays --rgb-cnn-denoise [--rgb-cnn-layout dense|sparse-wide|dilated3|dilated5|axis17] [--rgb-cnn-mode rgb|luma|recon]"
             );
             println!("  realtimerays --cnn-denoise");
             println!("  realtimerays --filter-denoise");
             println!("  realtimerays --atrous-denoise");
-            println!("  realtimerays --spp N");
+            println!("  realtimerays --temporal-denoise");
+            println!("  realtimerays --spp N [--coverage P] [--no-vsync]");
             println!(
-                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--no-denoise|--rgb-cnn-denoise [--rgb-cnn-layout NAME] [--rgb-cnn-mode rgb|luma]|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays bench [--frames N] [--warmup N] [--spp N] [--coverage P] [--no-denoise|--rgb-cnn-denoise [--rgb-cnn-layout NAME] [--rgb-cnn-mode rgb|luma|recon]|--cnn-denoise|--filter-denoise|--atrous-denoise|--temporal-denoise]"
             );
             println!(
-                "  realtimerays bench-denoiser [--frames N] [--warmup N] [--no-denoise|--rgb-cnn-denoise [--rgb-cnn-layout NAME] [--rgb-cnn-mode rgb|luma]|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays bench-denoiser [--frames N] [--warmup N] [--coverage P] [--no-denoise|--rgb-cnn-denoise [--rgb-cnn-layout NAME] [--rgb-cnn-mode rgb|luma|recon]|--cnn-denoise|--filter-denoise|--atrous-denoise|--temporal-denoise]"
             );
-            println!("  realtimerays dataset [output-dir] [--frames N] [--rgb-only]");
+            println!("  realtimerays dataset [output-dir] [--frames N] [--rgb-only] [--input-spp N] [--target-spp N] [--coverage P]");
             println!(
-                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise]"
+                "  realtimerays record-x [output-dir] [--frames N] [--spp N] [--coverage P] [--no-denoise|--rgb-cnn-denoise|--cnn-denoise|--filter-denoise|--atrous-denoise|--temporal-denoise]"
             );
             println!("  realtimerays remux [output-dir]");
             return Ok(());
@@ -3095,7 +3506,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("--cnn-denoise") => {}
         Some("--filter-denoise") => {}
         Some("--atrous-denoise") => {}
+        Some("--temporal-denoise") => {}
         Some("--spp") => {}
+        Some("--coverage") => {}
+        Some("--no-vsync") => {}
         Some("--rgb-cnn-layout") => {}
         Some("--rgb-cnn-mode") => {}
         Some(other) => {
@@ -3113,7 +3527,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let denoiser = parse_optional_denoiser_kind(&args)?;
     let sample_count_override = parse_sample_count_override(&args)?;
-    let mut app = App::new(denoiser, sample_count_override);
+    let sample_coverage = parse_sample_coverage(&args)?;
+    let no_vsync = parse_no_vsync(&args);
+    let mut app = App::new(denoiser, sample_count_override, sample_coverage, no_vsync);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
