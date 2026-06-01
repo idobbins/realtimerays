@@ -1,10 +1,12 @@
 #![allow(static_mut_refs)]
 
 use crate::macos;
-use crate::scene;
 use crate::vk::{self, VkResult};
-use std::ffi::{c_char, c_int, c_void};
+use realtimerays::scene;
+use std::ffi::{c_char, c_int, c_void, CStr};
+use std::io::Write;
 use std::mem::{size_of, size_of_val};
+use std::time::Instant;
 
 include!(concat!(env!("OUT_DIR"), "/trace_comp_spv.rs"));
 
@@ -825,4 +827,566 @@ pub unsafe fn frame() {
     }
 
     RTR_FRAME_INDEX += 1;
+}
+
+#[derive(Clone, Copy)]
+struct SampleStats {
+    avg: f64,
+    min: f64,
+    p50: f64,
+    p95: f64,
+    max: f64,
+}
+
+fn duration_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+fn sample_stats(samples: &[f64]) -> Option<SampleStats> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let sum: f64 = samples.iter().sum();
+    let mid = sorted.len() / 2;
+    let p50 = if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) * 0.5
+    } else {
+        sorted[mid]
+    };
+    let p95_rank = ((95 * sorted.len() + 99) / 100).saturating_sub(1);
+    let p95 = sorted[p95_rank.min(sorted.len() - 1)];
+
+    Some(SampleStats {
+        avg: sum / samples.len() as f64,
+        min: sorted[0],
+        p50,
+        p95,
+        max: sorted[sorted.len() - 1],
+    })
+}
+
+fn eprint_sample_stats(label: &str, samples: &[f64]) {
+    if let Some(stats) = sample_stats(samples) {
+        eprintln!(
+            "xpost {label}: avg {:.3} ms min {:.3} p50 {:.3} p95 {:.3} max {:.3}",
+            stats.avg, stats.min, stats.p50, stats.p95, stats.max
+        );
+    }
+}
+
+unsafe fn physical_device_name(props: &vk::PhysicalDeviceProperties) -> String {
+    CStr::from_ptr(props.device_name.as_ptr())
+        .to_string_lossy()
+        .into_owned()
+}
+
+unsafe fn collect_gpu_sample(samples: &mut Vec<f64>) {
+    if RTR_TIMING_SUPPORTED == 0 {
+        return;
+    }
+
+    let mut timestamp = [0u64; 2];
+    if device()
+        .get_query_pool_results(
+            RTR_TIMING_QUERY_POOL,
+            0,
+            &mut timestamp,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    let mut ticks = timestamp[1] - timestamp[0];
+    if RTR_TIMESTAMP_VALID_BITS < 64 {
+        let mask = (1u64 << RTR_TIMESTAMP_VALID_BITS) - 1;
+        ticks = (timestamp[1] - timestamp[0]) & mask;
+    }
+
+    samples.push(ticks as f64 * RTR_TIMESTAMP_PERIOD as f64 / 1_000_000.0);
+}
+
+unsafe fn record_export_frame(
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    staging_buffer: vk::Buffer,
+    old_layout: vk::ImageLayout,
+) -> VkResult<()> {
+    let image_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        level_count: 1,
+        layer_count: 1,
+        ..Default::default()
+    };
+
+    device().begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
+
+    if RTR_TIMING_SUPPORTED != 0 {
+        device().cmd_reset_query_pool(command_buffer, RTR_TIMING_QUERY_POOL, 0, 2);
+    }
+
+    let (src_stage, src_access) = if old_layout == vk::ImageLayout::UNDEFINED {
+        (
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::empty(),
+        )
+    } else {
+        (
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_READ,
+        )
+    };
+    let to_general = [vk::ImageMemoryBarrier {
+        src_access_mask: src_access,
+        dst_access_mask: vk::AccessFlags::SHADER_WRITE,
+        old_layout,
+        new_layout: vk::ImageLayout::GENERAL,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: image_range,
+        ..Default::default()
+    }];
+    device().cmd_pipeline_barrier(
+        command_buffer,
+        src_stage,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_general,
+    );
+
+    let memory_barrier = [vk::BufferMemoryBarrier {
+        src_access_mask: vk::AccessFlags::HOST_WRITE | vk::AccessFlags::SHADER_WRITE,
+        dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        buffer: RTR_MEMORY_BUFFER,
+        size: vk::WHOLE_SIZE,
+        ..Default::default()
+    }];
+    device().cmd_pipeline_barrier(
+        command_buffer,
+        vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &memory_barrier,
+        &[],
+    );
+
+    if RTR_TIMING_SUPPORTED != 0 {
+        device().cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            RTR_TIMING_QUERY_POOL,
+            0,
+        );
+    }
+
+    device().cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, RTR_PIPELINE);
+    device().cmd_bind_descriptor_sets(
+        command_buffer,
+        vk::PipelineBindPoint::COMPUTE,
+        RTR_PIPELINE_LAYOUT,
+        0,
+        &[RTR_DESCRIPTOR_SETS[0]],
+        &[],
+    );
+    device().cmd_dispatch(
+        command_buffer,
+        (RTR_SWAP_EXTENT.width + RTR_TILE_SIZE - 1) / RTR_TILE_SIZE,
+        (RTR_SWAP_EXTENT.height + RTR_TILE_SIZE - 1) / RTR_TILE_SIZE,
+        1,
+    );
+
+    if RTR_TIMING_SUPPORTED != 0 {
+        device().cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            RTR_TIMING_QUERY_POOL,
+            1,
+        );
+    }
+
+    let to_transfer = [vk::ImageMemoryBarrier {
+        src_access_mask: vk::AccessFlags::SHADER_WRITE,
+        dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+        old_layout: vk::ImageLayout::GENERAL,
+        new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: image_range,
+        ..Default::default()
+    }];
+    device().cmd_pipeline_barrier(
+        command_buffer,
+        vk::PipelineStageFlags::COMPUTE_SHADER,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_transfer,
+    );
+
+    let copy = [vk::BufferImageCopy {
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            layer_count: 1,
+            ..Default::default()
+        },
+        image_extent: vk::Extent3D {
+            width: RTR_SWAP_EXTENT.width,
+            height: RTR_SWAP_EXTENT.height,
+            depth: 1,
+        },
+        ..Default::default()
+    }];
+    device().cmd_copy_image_to_buffer(
+        command_buffer,
+        image,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        staging_buffer,
+        &copy,
+    );
+
+    device().end_command_buffer(command_buffer)
+}
+
+pub unsafe fn write_frames<W: Write>(
+    out: &mut W,
+    width: u32,
+    height: u32,
+    frames: u32,
+    fps: u32,
+) -> VkResult<()> {
+    if width == 0 || height == 0 || frames == 0 || fps == 0 {
+        return Err(rtr_error());
+    }
+
+    let total_start = Instant::now();
+    clock_gettime(CLOCK_MONOTONIC, &mut RTR_START_TIME);
+    RTR_SWAP_EXTENT = vk::Extent2D { width, height };
+    RTR_FRAME_INDEX = 0;
+    RTR_TIMING_PENDING = 0;
+    RTR_TIMING_SAMPLE_COUNT = 0;
+
+    let _metal_surface_loader = create_instance()?;
+
+    let physical_devices = instance().enumerate_physical_devices()?;
+    if physical_devices.is_empty() {
+        return Err(rtr_error());
+    }
+    RTR_PHYSICAL_DEVICE = physical_devices[0];
+
+    let device_props = instance().get_physical_device_properties(RTR_PHYSICAL_DEVICE);
+    let queue_family_props =
+        instance().get_physical_device_queue_family_properties(RTR_PHYSICAL_DEVICE);
+    if queue_family_props.is_empty() {
+        return Err(rtr_error());
+    }
+    let queue_family_props = queue_family_props[0];
+    RTR_TIMESTAMP_PERIOD = device_props.limits.timestamp_period;
+    RTR_TIMESTAMP_VALID_BITS = queue_family_props.timestamp_valid_bits;
+    RTR_TIMING_SUPPORTED = u32::from(
+        device_props.limits.timestamp_compute_and_graphics != 0
+            && RTR_TIMESTAMP_VALID_BITS > 0
+            && RTR_TIMESTAMP_PERIOD > 0.0,
+    );
+    let device_name = physical_device_name(&device_props);
+
+    create_device()?;
+    create_memory_buffer()?;
+    create_timing_query_pool()?;
+
+    let image_bytes = u64::from(width) * u64::from(height) * 4;
+    let image_info = vk::ImageCreateInfo {
+        image_type: vk::ImageType::TYPE_2D,
+        format: vk::Format::R8G8B8A8_UNORM,
+        extent: vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: vk::SampleCountFlags::TYPE_1,
+        tiling: vk::ImageTiling::OPTIMAL,
+        usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        initial_layout: vk::ImageLayout::UNDEFINED,
+        ..Default::default()
+    };
+    let image = device().create_image(&image_info, None)?;
+
+    let image_req = device().get_image_memory_requirements(image);
+    let image_memory_type = find_memory_type(
+        image_req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    );
+    if image_memory_type == u32::MAX {
+        return Err(rtr_error());
+    }
+    let image_alloc = vk::MemoryAllocateInfo {
+        allocation_size: image_req.size,
+        memory_type_index: image_memory_type,
+        ..Default::default()
+    };
+    let image_memory = device().allocate_memory(&image_alloc, None)?;
+    device().bind_image_memory(image, image_memory, 0)?;
+
+    let image_view_info = vk::ImageViewCreateInfo {
+        image,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::R8G8B8A8_UNORM,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            level_count: 1,
+            layer_count: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let image_view = device().create_image_view(&image_view_info, None)?;
+
+    let staging_info = vk::BufferCreateInfo {
+        size: image_bytes,
+        usage: vk::BufferUsageFlags::TRANSFER_DST,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+    let staging_buffer = device().create_buffer(&staging_info, None)?;
+    let staging_req = device().get_buffer_memory_requirements(staging_buffer);
+    let staging_memory_type = find_memory_type(
+        staging_req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    );
+    if staging_memory_type == u32::MAX {
+        return Err(rtr_error());
+    }
+    let staging_alloc = vk::MemoryAllocateInfo {
+        allocation_size: staging_req.size,
+        memory_type_index: staging_memory_type,
+        ..Default::default()
+    };
+    let staging_memory = device().allocate_memory(&staging_alloc, None)?;
+    device().bind_buffer_memory(staging_buffer, staging_memory, 0)?;
+    let staging_pixels = device()
+        .map_memory(staging_memory, 0, image_bytes, vk::MemoryMapFlags::empty())?
+        .cast::<u8>();
+
+    let bindings = [
+        vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
+    ];
+    let layout_info = vk::DescriptorSetLayoutCreateInfo {
+        binding_count: bindings.len() as u32,
+        p_bindings: bindings.as_ptr(),
+        ..Default::default()
+    };
+    RTR_DESCRIPTOR_SET_LAYOUT = device().create_descriptor_set_layout(&layout_info, None)?;
+
+    let pool_sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: 1,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+        },
+    ];
+    let pool_info = vk::DescriptorPoolCreateInfo {
+        max_sets: 1,
+        pool_size_count: pool_sizes.len() as u32,
+        p_pool_sizes: pool_sizes.as_ptr(),
+        ..Default::default()
+    };
+    RTR_DESCRIPTOR_POOL = device().create_descriptor_pool(&pool_info, None)?;
+
+    let set_layouts = [RTR_DESCRIPTOR_SET_LAYOUT];
+    let set_info = vk::DescriptorSetAllocateInfo {
+        descriptor_pool: RTR_DESCRIPTOR_POOL,
+        descriptor_set_count: set_layouts.len() as u32,
+        p_set_layouts: set_layouts.as_ptr(),
+        ..Default::default()
+    };
+    let descriptor_sets = device().allocate_descriptor_sets(&set_info)?;
+    RTR_DESCRIPTOR_SETS[0] = descriptor_sets[0];
+
+    let image_infos = [vk::DescriptorImageInfo {
+        image_view,
+        image_layout: vk::ImageLayout::GENERAL,
+        ..Default::default()
+    }];
+    let buffer_infos = [vk::DescriptorBufferInfo {
+        buffer: RTR_MEMORY_BUFFER,
+        range: vk::WHOLE_SIZE,
+        ..Default::default()
+    }];
+    let writes = [
+        vk::WriteDescriptorSet {
+            dst_set: RTR_DESCRIPTOR_SETS[0],
+            dst_binding: 0,
+            descriptor_count: image_infos.len() as u32,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            p_image_info: image_infos.as_ptr(),
+            ..Default::default()
+        },
+        vk::WriteDescriptorSet {
+            dst_set: RTR_DESCRIPTOR_SETS[0],
+            dst_binding: 1,
+            descriptor_count: buffer_infos.len() as u32,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: buffer_infos.as_ptr(),
+            ..Default::default()
+        },
+    ];
+    device().update_descriptor_sets(&writes, &[]);
+
+    let pipeline_set_layouts = [RTR_DESCRIPTOR_SET_LAYOUT];
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+        set_layout_count: pipeline_set_layouts.len() as u32,
+        p_set_layouts: pipeline_set_layouts.as_ptr(),
+        ..Default::default()
+    };
+    RTR_PIPELINE_LAYOUT = device().create_pipeline_layout(&pipeline_layout_info, None)?;
+
+    let shader_info = vk::ShaderModuleCreateInfo {
+        code_size: size_of_val(&TRACE_COMP_SPV),
+        p_code: TRACE_COMP_SPV.as_ptr(),
+        ..Default::default()
+    };
+    let shader_module = device().create_shader_module(&shader_info, None)?;
+    let stage_info = vk::PipelineShaderStageCreateInfo {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: shader_module,
+        p_name: c"main".as_ptr(),
+        ..Default::default()
+    };
+    let pipeline_info = vk::ComputePipelineCreateInfo {
+        stage: stage_info,
+        layout: RTR_PIPELINE_LAYOUT,
+        ..Default::default()
+    };
+    let pipeline_infos = [pipeline_info];
+    let pipeline_result =
+        device().create_compute_pipelines(vk::PipelineCache::null(), &pipeline_infos, None);
+    device().destroy_shader_module(shader_module, None);
+    match pipeline_result {
+        Ok(pipelines) => RTR_PIPELINE = pipelines[0],
+        Err((_pipelines, result)) => return Err(result),
+    }
+
+    let command_pool_info = vk::CommandPoolCreateInfo {
+        flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+        queue_family_index: 0,
+        ..Default::default()
+    };
+    RTR_COMMAND_POOL = device().create_command_pool(&command_pool_info, None)?;
+
+    let command_alloc_info = vk::CommandBufferAllocateInfo {
+        command_pool: RTR_COMMAND_POOL,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: 1,
+        ..Default::default()
+    };
+    let command_buffers = device().allocate_command_buffers(&command_alloc_info)?;
+    RTR_COMMAND_BUFFERS[0] = command_buffers[0];
+
+    let fence = device().create_fence(&vk::FenceCreateInfo::default(), None)?;
+    let setup_ms = duration_ms(total_start);
+    let seconds = frames as f64 / fps as f64;
+    eprintln!(
+        "xpost render: {width}x{height} {frames} frames @ {fps} fps ({seconds:.2}s) on {device_name}"
+    );
+    eprintln!(
+        "xpost gpu_timestamps: {}",
+        if RTR_TIMING_SUPPORTED != 0 {
+            "enabled"
+        } else {
+            "unavailable"
+        }
+    );
+
+    let render_start = Instant::now();
+    let mut old_layout = vk::ImageLayout::UNDEFINED;
+    let mut bytes_written = 0u64;
+    let mut gpu_samples = Vec::with_capacity(frames as usize);
+    let mut submit_wait_samples = Vec::with_capacity(frames as usize);
+    let mut write_samples = Vec::with_capacity(frames as usize);
+    let mut total_frame_samples = Vec::with_capacity(frames as usize);
+    let progress_interval = if frames >= 300 { 100 } else { frames.max(1) };
+
+    for frame in 0..frames {
+        let frame_start = Instant::now();
+        update_memory_with(frame as f32 / fps as f32, -1.0, -1.0);
+        device()
+            .reset_command_buffer(RTR_COMMAND_BUFFERS[0], vk::CommandBufferResetFlags::empty())?;
+        record_export_frame(RTR_COMMAND_BUFFERS[0], image, staging_buffer, old_layout)?;
+        old_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+
+        let command_buffers = [RTR_COMMAND_BUFFERS[0]];
+        let submit = vk::SubmitInfo {
+            command_buffer_count: command_buffers.len() as u32,
+            p_command_buffers: command_buffers.as_ptr(),
+            ..Default::default()
+        };
+        device().queue_submit(RTR_QUEUE, &[submit], fence)?;
+        device().wait_for_fences(&[fence], true, u64::MAX)?;
+        device().reset_fences(&[fence])?;
+        submit_wait_samples.push(duration_ms(frame_start));
+        collect_gpu_sample(&mut gpu_samples);
+
+        let write_start = Instant::now();
+        let pixels = std::slice::from_raw_parts(staging_pixels, image_bytes as usize);
+        out.write_all(pixels).map_err(|_| rtr_error())?;
+        bytes_written += image_bytes;
+        write_samples.push(duration_ms(write_start));
+        total_frame_samples.push(duration_ms(frame_start));
+
+        RTR_FRAME_INDEX += 1;
+        let done = frame + 1;
+        if done == frames || done % progress_interval == 0 {
+            eprintln!("xpost progress: {done}/{frames} frames");
+        }
+    }
+
+    out.flush().map_err(|_| rtr_error())?;
+
+    let render_wall_ms = duration_ms(render_start);
+    let total_wall_ms = duration_ms(total_start);
+    let effective_fps = frames as f64 / (render_wall_ms / 1000.0);
+    eprintln!(
+        "xpost summary: raw rgba bytes {bytes_written} setup {:.3} ms render {:.3} s total {:.3} s effective {:.2} fps",
+        setup_ms,
+        render_wall_ms / 1000.0,
+        total_wall_ms / 1000.0,
+        effective_fps
+    );
+    eprint_sample_stats("cpu_submit_wait", &submit_wait_samples);
+    eprint_sample_stats("stdout_write", &write_samples);
+    eprint_sample_stats("frame_total", &total_frame_samples);
+    eprint_sample_stats("gpu_compute", &gpu_samples);
+
+    Ok(())
 }

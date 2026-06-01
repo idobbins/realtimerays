@@ -189,6 +189,7 @@ impl StructureType {
     pub const SEMAPHORE_CREATE_INFO: Self = Self(9);
     pub const QUERY_POOL_CREATE_INFO: Self = Self(11);
     pub const BUFFER_CREATE_INFO: Self = Self(12);
+    pub const IMAGE_CREATE_INFO: Self = Self(14);
     pub const IMAGE_VIEW_CREATE_INFO: Self = Self(15);
     pub const SHADER_MODULE_CREATE_INFO: Self = Self(16);
     pub const PIPELINE_SHADER_STAGE_CREATE_INFO: Self = Self(18);
@@ -210,6 +211,7 @@ impl StructureType {
 
 vk_enum!(Format);
 impl Format {
+    pub const R8G8B8A8_UNORM: Self = Self(37);
     pub const B8G8R8A8_UNORM: Self = Self(44);
 }
 
@@ -223,7 +225,18 @@ vk_enum!(ImageLayout);
 impl ImageLayout {
     pub const UNDEFINED: Self = Self(0);
     pub const GENERAL: Self = Self(1);
+    pub const TRANSFER_SRC_OPTIMAL: Self = Self(6);
     pub const PRESENT_SRC_KHR: Self = Self(1_000_001_002);
+}
+
+vk_enum!(ImageTiling);
+impl ImageTiling {
+    pub const OPTIMAL: Self = Self(0);
+}
+
+vk_enum!(ImageType);
+impl ImageType {
+    pub const TYPE_2D: Self = Self(1);
 }
 
 vk_enum!(ImageViewType);
@@ -273,16 +286,20 @@ vk_flags!(DeviceCreateFlags);
 vk_flags!(BufferCreateFlags);
 vk_flags!(BufferUsageFlags);
 impl BufferUsageFlags {
+    pub const TRANSFER_DST: Self = Self(0x0000_0002);
     pub const STORAGE_BUFFER: Self = Self(0x0000_0020);
 }
 
+vk_flags!(ImageCreateFlags);
 vk_flags!(ImageUsageFlags);
 impl ImageUsageFlags {
+    pub const TRANSFER_SRC: Self = Self(0x0000_0001);
     pub const STORAGE: Self = Self(0x0000_0008);
 }
 
 vk_flags!(MemoryPropertyFlags);
 impl MemoryPropertyFlags {
+    pub const DEVICE_LOCAL: Self = Self(0x0000_0001);
     pub const HOST_VISIBLE: Self = Self(0x0000_0002);
     pub const HOST_COHERENT: Self = Self(0x0000_0004);
 }
@@ -298,6 +315,7 @@ vk_flags!(PipelineStageFlags);
 impl PipelineStageFlags {
     pub const TOP_OF_PIPE: Self = Self(0x0000_0001);
     pub const COMPUTE_SHADER: Self = Self(0x0000_0800);
+    pub const TRANSFER: Self = Self(0x0000_1000);
     pub const BOTTOM_OF_PIPE: Self = Self(0x0000_2000);
     pub const HOST: Self = Self(0x0000_4000);
 }
@@ -327,11 +345,17 @@ vk_flags!(AccessFlags);
 impl AccessFlags {
     pub const SHADER_READ: Self = Self(0x0000_0020);
     pub const SHADER_WRITE: Self = Self(0x0000_0040);
+    pub const TRANSFER_READ: Self = Self(0x0000_0800);
     pub const HOST_WRITE: Self = Self(0x0000_4000);
 }
 
 vk_flags!(DependencyFlags);
 vk_flags!(CommandPoolCreateFlags);
+impl CommandPoolCreateFlags {
+    pub const RESET_COMMAND_BUFFER: Self = Self(0x0000_0002);
+}
+
+vk_flags!(CommandBufferResetFlags);
 vk_flags!(CommandBufferUsageFlags);
 vk_flags!(ShaderModuleCreateFlags);
 vk_flags!(PipelineShaderStageCreateFlags);
@@ -348,6 +372,10 @@ impl CompositeAlphaFlagsKHR {
 }
 
 vk_flags!(SampleCountFlags);
+impl SampleCountFlags {
+    pub const TYPE_1: Self = Self(0x0000_0001);
+}
+
 vk_flags!(MetalSurfaceCreateFlagsEXT);
 
 #[repr(C)]
@@ -363,6 +391,14 @@ pub struct Extent3D {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Offset3D {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
 }
 
 #[repr(C)]
@@ -822,6 +858,50 @@ impl Default for BufferCreateInfo<'_> {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ImageCreateInfo<'a> {
+    pub s_type: StructureType,
+    pub p_next: *const c_void,
+    pub flags: ImageCreateFlags,
+    pub image_type: ImageType,
+    pub format: Format,
+    pub extent: Extent3D,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub samples: SampleCountFlags,
+    pub tiling: ImageTiling,
+    pub usage: ImageUsageFlags,
+    pub sharing_mode: SharingMode,
+    pub queue_family_index_count: u32,
+    pub p_queue_family_indices: *const u32,
+    pub initial_layout: ImageLayout,
+    pub _marker: PhantomData<&'a ()>,
+}
+
+impl Default for ImageCreateInfo<'_> {
+    fn default() -> Self {
+        Self {
+            s_type: StructureType::IMAGE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: ImageCreateFlags::empty(),
+            image_type: ImageType::default(),
+            format: Format::default(),
+            extent: Extent3D::default(),
+            mip_levels: 0,
+            array_layers: 0,
+            samples: SampleCountFlags::empty(),
+            tiling: ImageTiling::default(),
+            usage: ImageUsageFlags::empty(),
+            sharing_mode: SharingMode::default(),
+            queue_family_index_count: 0,
+            p_queue_family_indices: ptr::null(),
+            initial_layout: ImageLayout::default(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ComponentMapping {
     pub r: ComponentSwizzle,
@@ -838,6 +918,26 @@ pub struct ImageSubresourceRange {
     pub level_count: u32,
     pub base_array_layer: u32,
     pub layer_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ImageSubresourceLayers {
+    pub aspect_mask: ImageAspectFlags,
+    pub mip_level: u32,
+    pub base_array_layer: u32,
+    pub layer_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BufferImageCopy {
+    pub buffer_offset: DeviceSize,
+    pub buffer_row_length: u32,
+    pub buffer_image_height: u32,
+    pub image_subresource: ImageSubresourceLayers,
+    pub image_offset: Offset3D,
+    pub image_extent: Extent3D,
 }
 
 #[repr(C)]
@@ -1514,9 +1614,20 @@ unsafe extern "system" {
         memory: DeviceMemory,
         offset: DeviceSize,
     ) -> Result;
+    fn vkBindImageMemory(
+        device: Device,
+        image: Image,
+        memory: DeviceMemory,
+        offset: DeviceSize,
+    ) -> Result;
     fn vkGetBufferMemoryRequirements(
         device: Device,
         buffer: Buffer,
+        p_requirements: *mut MemoryRequirements,
+    );
+    fn vkGetImageMemoryRequirements(
+        device: Device,
+        image: Image,
         p_requirements: *mut MemoryRequirements,
     );
     fn vkCreateFence(
@@ -1560,6 +1671,12 @@ unsafe extern "system" {
         p_info: *const BufferCreateInfo<'_>,
         p_allocator: *const AllocationCallbacks<'_>,
         p_buffer: *mut Buffer,
+    ) -> Result;
+    fn vkCreateImage(
+        device: Device,
+        p_info: *const ImageCreateInfo<'_>,
+        p_allocator: *const AllocationCallbacks<'_>,
+        p_image: *mut Image,
     ) -> Result;
     fn vkCreateImageView(
         device: Device,
@@ -1632,6 +1749,7 @@ unsafe extern "system" {
         p_info: *const CommandBufferBeginInfo<'_>,
     ) -> Result;
     fn vkEndCommandBuffer(buffer: CommandBuffer) -> Result;
+    fn vkResetCommandBuffer(buffer: CommandBuffer, flags: CommandBufferResetFlags) -> Result;
     fn vkCmdBindPipeline(buffer: CommandBuffer, bind_point: PipelineBindPoint, pipeline: Pipeline);
     fn vkCmdBindDescriptorSets(
         buffer: CommandBuffer,
@@ -1648,6 +1766,14 @@ unsafe extern "system" {
         group_count_x: u32,
         group_count_y: u32,
         group_count_z: u32,
+    );
+    fn vkCmdCopyImageToBuffer(
+        buffer: CommandBuffer,
+        src_image: Image,
+        src_image_layout: ImageLayout,
+        dst_buffer: Buffer,
+        region_count: u32,
+        p_regions: *const BufferImageCopy,
     );
     fn vkCmdPipelineBarrier(
         buffer: CommandBuffer,
@@ -1847,9 +1973,30 @@ impl DeviceCommands {
         .assume_init_on_success(buffer)
     }
 
+    pub unsafe fn create_image(
+        &self,
+        info: &ImageCreateInfo<'_>,
+        callbacks: Option<&AllocationCallbacks<'_>>,
+    ) -> VkResult<Image> {
+        let mut image = MaybeUninit::uninit();
+        vkCreateImage(
+            self.handle,
+            info,
+            callbacks_ptr(callbacks),
+            image.as_mut_ptr(),
+        )
+        .assume_init_on_success(image)
+    }
+
     pub unsafe fn get_buffer_memory_requirements(&self, buffer: Buffer) -> MemoryRequirements {
         let mut requirements = MaybeUninit::uninit();
         vkGetBufferMemoryRequirements(self.handle, buffer, requirements.as_mut_ptr());
+        requirements.assume_init()
+    }
+
+    pub unsafe fn get_image_memory_requirements(&self, image: Image) -> MemoryRequirements {
+        let mut requirements = MaybeUninit::uninit();
+        vkGetImageMemoryRequirements(self.handle, image, requirements.as_mut_ptr());
         requirements.assume_init()
     }
 
@@ -1875,6 +2022,15 @@ impl DeviceCommands {
         offset: DeviceSize,
     ) -> VkResult<()> {
         vkBindBufferMemory(self.handle, buffer, memory, offset).result()
+    }
+
+    pub unsafe fn bind_image_memory(
+        &self,
+        image: Image,
+        memory: DeviceMemory,
+        offset: DeviceSize,
+    ) -> VkResult<()> {
+        vkBindImageMemory(self.handle, image, memory, offset).result()
     }
 
     pub unsafe fn map_memory(
@@ -2091,6 +2247,14 @@ impl DeviceCommands {
         vkEndCommandBuffer(buffer).result()
     }
 
+    pub unsafe fn reset_command_buffer(
+        &self,
+        buffer: CommandBuffer,
+        flags: CommandBufferResetFlags,
+    ) -> VkResult<()> {
+        vkResetCommandBuffer(buffer, flags).result()
+    }
+
     pub unsafe fn cmd_reset_query_pool(
         &self,
         buffer: CommandBuffer,
@@ -2167,6 +2331,24 @@ impl DeviceCommands {
 
     pub unsafe fn cmd_dispatch(&self, buffer: CommandBuffer, x: u32, y: u32, z: u32) {
         vkCmdDispatch(buffer, x, y, z);
+    }
+
+    pub unsafe fn cmd_copy_image_to_buffer(
+        &self,
+        buffer: CommandBuffer,
+        src_image: Image,
+        src_image_layout: ImageLayout,
+        dst_buffer: Buffer,
+        regions: &[BufferImageCopy],
+    ) {
+        vkCmdCopyImageToBuffer(
+            buffer,
+            src_image,
+            src_image_layout,
+            dst_buffer,
+            regions.len() as u32,
+            regions.as_ptr(),
+        );
     }
 
     pub unsafe fn create_semaphore(
