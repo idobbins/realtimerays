@@ -1,4 +1,0 @@
-[alias]
-"record-x" = "run --release -- record-x"
-dataset = "run --release -- dataset"
-remux = "run --release -- remux"

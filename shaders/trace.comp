@@ -1,0 +1,242 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
+
+layout(std430, binding = 1) buffer RTRMemory {
+    uint rtrMem[];
+};
+
+const uint RTR_FRAME_WORD = 4u;
+const uint RTR_MOUSE_X_WORD = 5u;
+const uint RTR_TIME_WORD = 7u;
+
+const float RTR_PI = 3.14159265359;
+const float RTR_INF = 1.0e20;
+const float RTR_EPS = 0.001;
+
+struct RTRHit {
+    float t;
+    vec3 n;
+    vec3 albedo;
+    vec3 emission;
+};
+
+uint rtrLoadU32(uint word)
+{
+    return rtrMem[word];
+}
+
+float rtrLoadF32(uint word)
+{
+    return uintBitsToFloat(rtrLoadU32(word));
+}
+
+uint rtrHash(uint x)
+{
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float rtrRand(inout uint s)
+{
+    s = rtrHash(s);
+    return float(s) / 4294967295.0;
+}
+
+vec3 rtrSky(vec3 rd)
+{
+    float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+    return mix(vec3(0.55, 0.60, 0.66), vec3(0.08, 0.13, 0.20), h);
+}
+
+bool rtrSphere(vec3 ro, vec3 rd, vec3 c, float r, vec3 albedo, vec3 emission, inout RTRHit hit)
+{
+    vec3 oc = ro - c;
+    float b = dot(oc, rd);
+    float q = dot(oc, oc) - r * r;
+    float d = b * b - q;
+    if (d < 0.0) return false;
+
+    float s = sqrt(d);
+    float t = -b - s;
+    if (t < RTR_EPS) t = -b + s;
+    if (t < RTR_EPS || t >= hit.t) return false;
+
+    hit.t = t;
+    hit.n = normalize(ro + rd * t - c);
+    hit.albedo = albedo;
+    hit.emission = emission;
+    return true;
+}
+
+bool rtrPlane(vec3 ro, vec3 rd, vec3 n, float d, vec3 albedo, inout RTRHit hit)
+{
+    float denom = dot(rd, n);
+    if (abs(denom) < 0.00001) return false;
+
+    float t = -(dot(ro, n) + d) / denom;
+    if (t < RTR_EPS || t >= hit.t) return false;
+
+    vec3 p = ro + rd * t;
+    vec2 cell = floor(p.xz);
+    float check = mod(cell.x + cell.y, 2.0);
+
+    hit.t = t;
+    hit.n = n;
+    hit.albedo = albedo * mix(0.76, 1.0, check);
+    hit.emission = vec3(0.0);
+    return true;
+}
+
+bool rtrBox(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, vec3 albedo, inout RTRHit hit)
+{
+    vec3 invRd = 1.0 / rd;
+    vec3 t0 = (bmin - ro) * invRd;
+    vec3 t1 = (bmax - ro) * invRd;
+    vec3 lo = min(t0, t1);
+    vec3 hi = max(t0, t1);
+    float nearT = max(max(lo.x, lo.y), lo.z);
+    float farT = min(min(hi.x, hi.y), hi.z);
+    if (farT < max(nearT, RTR_EPS) || nearT >= hit.t) return false;
+
+    vec3 p = ro + rd * nearT;
+    vec3 da = abs(p - bmin);
+    vec3 db = abs(p - bmax);
+    vec3 n = vec3(0.0);
+    float m = min(min(min(da.x, db.x), min(da.y, db.y)), min(da.z, db.z));
+    if (m == da.x) n = vec3(-1.0, 0.0, 0.0);
+    else if (m == db.x) n = vec3(1.0, 0.0, 0.0);
+    else if (m == da.y) n = vec3(0.0, -1.0, 0.0);
+    else if (m == db.y) n = vec3(0.0, 1.0, 0.0);
+    else if (m == da.z) n = vec3(0.0, 0.0, -1.0);
+    else n = vec3(0.0, 0.0, 1.0);
+
+    hit.t = nearT;
+    hit.n = n;
+    hit.albedo = albedo;
+    hit.emission = vec3(0.0);
+    return true;
+}
+
+RTRHit rtrTrace(vec3 ro, vec3 rd)
+{
+    RTRHit hit;
+    hit.t = RTR_INF;
+    hit.n = vec3(0.0, 1.0, 0.0);
+    hit.albedo = vec3(0.0);
+    hit.emission = vec3(0.0);
+
+    rtrPlane(ro, rd, vec3(0.0, 1.0, 0.0), 1.0, vec3(0.58, 0.60, 0.54), hit);
+    rtrSphere(ro, rd, vec3(-1.15, 0.0, 0.0), 1.0, vec3(0.83, 0.22, 0.18), vec3(0.0), hit);
+    rtrSphere(ro, rd, vec3(1.18, -0.22, -0.45), 0.78, vec3(0.13, 0.48, 0.80), vec3(0.0), hit);
+    rtrSphere(ro, rd, vec3(0.05, 2.65, -1.25), 0.45, vec3(1.0), vec3(10.0, 8.0, 5.6), hit);
+    rtrBox(ro, rd, vec3(-0.36, -1.0, 1.10), vec3(0.62, 0.15, 1.92), vec3(0.88, 0.67, 0.28), hit);
+
+    return hit;
+}
+
+vec3 rtrTangent(vec3 n)
+{
+    if (abs(n.y) < 0.99) return normalize(cross(n, vec3(0.0, 1.0, 0.0)));
+    return normalize(cross(n, vec3(1.0, 0.0, 0.0)));
+}
+
+vec3 rtrCosineHemisphere(vec3 n, inout uint rng)
+{
+    float u = rtrRand(rng);
+    float v = rtrRand(rng);
+    float r = sqrt(u);
+    float a = 2.0 * RTR_PI * v;
+    vec3 t = rtrTangent(n);
+    vec3 b = cross(n, t);
+    return normalize(t * (cos(a) * r) + b * (sin(a) * r) + n * sqrt(max(0.0, 1.0 - u)));
+}
+
+float rtrShadow(vec3 p, vec3 lightPos)
+{
+    vec3 toLight = lightPos - p;
+    float maxT = length(toLight);
+    vec3 rd = toLight / maxT;
+    RTRHit h = rtrTrace(p + rd * RTR_EPS * 2.0, rd);
+    if (h.t < maxT - 0.02 && length(h.emission) < 0.01) return 0.0;
+    return 1.0;
+}
+
+vec3 rtrRadiance(vec3 ro, vec3 rd, inout uint rng)
+{
+    vec3 throughput = vec3(1.0);
+    vec3 color = vec3(0.0);
+
+    for (int bounce = 0; bounce < 2; bounce++) {
+        RTRHit hit = rtrTrace(ro, rd);
+        if (hit.t == RTR_INF) {
+            color += throughput * rtrSky(rd);
+            break;
+        }
+
+        vec3 p = ro + rd * hit.t;
+        color += throughput * hit.emission;
+
+        vec3 lightPos = vec3(-0.55 + rtrRand(rng) * 1.10,
+                             2.70 + rtrRand(rng) * 0.20,
+                             -1.70 + rtrRand(rng) * 1.10);
+        vec3 toLight = lightPos - p;
+        float lightDist2 = max(dot(toLight, toLight), 0.001);
+        vec3 l = normalize(toLight);
+        float ndotl = max(dot(hit.n, l), 0.0);
+        float shade = rtrShadow(p + hit.n * RTR_EPS * 2.0, lightPos);
+        color += throughput * hit.albedo * vec3(9.0, 7.2, 4.8) * ndotl * shade / lightDist2;
+
+        throughput *= hit.albedo;
+        ro = p + hit.n * RTR_EPS * 2.0;
+        rd = rtrCosineHemisphere(hit.n, rng);
+    }
+
+    return color;
+}
+
+vec3 rtrTonemap(vec3 color)
+{
+    color = color / (color + vec3(1.0));
+    return pow(color, vec3(1.0 / 2.2));
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(rtrOutImage);
+    if (any(greaterThanEqual(p, sz))) return;
+
+    float time = rtrLoadF32(RTR_TIME_WORD);
+    uint frame = rtrLoadU32(RTR_FRAME_WORD);
+    uint rng = rtrHash(uint(p.x) * 1973u ^ uint(p.y) * 9277u ^ frame * 26699u);
+    vec2 jitter = vec2(rtrRand(rng), rtrRand(rng)) - 0.5;
+    vec2 uv = (vec2(p) + 0.5 + jitter) / vec2(sz);
+    vec2 screen = uv * 2.0 - 1.0;
+    screen.x *= float(sz.x) / float(sz.y);
+    screen.y = -screen.y;
+
+    float mouseX = rtrLoadF32(RTR_MOUSE_X_WORD);
+    float mouseAngle = mouseX >= 0.0 ? (mouseX / max(float(sz.x), 1.0) - 0.5) * 3.2 : 0.0;
+    float angle = 0.35 + time * 0.08 + mouseAngle;
+    vec3 ro = vec3(sin(angle) * 4.1, 1.55, cos(angle) * 4.1);
+    vec3 target = vec3(0.0, -0.12, 0.1);
+    vec3 forward = normalize(target - ro);
+    vec3 right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
+    vec3 up = cross(right, forward);
+    vec3 rd = normalize(forward * 1.55 + right * screen.x + up * screen.y);
+
+    vec3 color = vec3(0.0);
+    for (int i = 0; i < 2; i++) {
+        color += rtrRadiance(ro, rd, rng);
+    }
+    color *= 0.5;
+
+    imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+}

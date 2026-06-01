@@ -1,18 +1,8 @@
-/.idea
-/.vscode
+.DS_Store
+.cache/
 
-/.cache*
-/.direnv
-/.venv
-__pycache__/
-*.pyc
-
-/build
-/target
-/result
-/renders
-/.nix-zsh
+/build/
 /compile_commands.json
-/raw
 
-/resources/external
+*.o
+*.dSYM/
