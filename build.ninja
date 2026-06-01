@@ -1,0 +1,63 @@
+ninja_required_version = 1.10
+
+build_dir = build
+builddir = $build_dir
+bin = $build_dir/realtimerays
+
+cc = cc
+cflags = -std=c99 -Wall -Wextra -pedantic -O2
+vulkan_cflags = -I/usr/local/include
+ldflags = -framework AppKit -framework QuartzCore -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lvulkan
+glslc = glslc
+
+rule mkdir
+  command = mkdir -p $build_dir && touch $out
+  description = MKDIR $build_dir
+
+rule glslc
+  command = $glslc $in -o $out
+  description = GLSLC $in
+
+rule xxd
+  command = xxd -i -n traceCompSpv $in $out
+  description = XXD $out
+
+rule cc
+  command = $cc $cflags $vulkan_cflags -I$build_dir -MMD -MF $out.d -c $in -o $out
+  depfile = $out.d
+  deps = gcc
+  description = CC $in
+
+rule objc
+  command = $cc -x objective-c $cflags -MMD -MF $out.d -c $in -o $out
+  depfile = $out.d
+  deps = gcc
+  description = OBJC $in
+
+rule link
+  command = $cc -o $out $in $ldflags
+  description = LINK $out
+
+rule run
+  command = icd="$${VULKAN_SDK:-}/share/vulkan/icd.d/MoltenVK_icd.json"; if [ -z "$${VK_ICD_FILENAMES:-}" ] && [ -f "$$icd" ]; then VK_ICD_FILENAMES="$$icd" $bin; else $bin; fi
+  description = RUN $bin
+  pool = console
+
+rule compdb
+  command = ninja -t compdb cc objc > $out
+  description = COMPDB $out
+
+build $build_dir/.dir: mkdir
+build $build_dir/trace.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
+build $build_dir/trace_comp_spv.h: xxd $build_dir/trace.comp.spv || $build_dir/.dir
+build $build_dir/main.o: cc main.c || $build_dir/.dir
+build $build_dir/vulkan.o: cc vulkan.c | $build_dir/trace_comp_spv.h || $build_dir/.dir
+build $build_dir/macos.o: objc macos.m || $build_dir/.dir
+build $bin: link $build_dir/main.o $build_dir/vulkan.o $build_dir/macos.o
+build compile_commands.json: compdb build.ninja
+
+build build: phony $bin
+build run: run $bin
+build compile-commands: phony compile_commands.json
+
+default $bin

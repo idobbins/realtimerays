@@ -3,8 +3,8 @@
 int rtrInitWindow(uint32_t width, uint32_t height, const char *title);
 void *rtrWindowSurface(void);
 int rtrPumpEventsOnce(void);
-
-#include "vulkan.c"
+int rtrVulkanInit(void *windowSurface);
+void rtrVulkanFrame(void);
 
 int main(void)
 {
