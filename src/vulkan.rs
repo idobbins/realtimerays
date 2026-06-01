@@ -1,10 +1,9 @@
 #![allow(static_mut_refs)]
 
 use crate::macos;
-use ash::prelude::VkResult;
-use ash::vk;
+use crate::vk::{self, VkResult};
 use std::ffi::{c_char, c_int, c_void};
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 
 include!(concat!(env!("OUT_DIR"), "/trace_comp_spv.rs"));
 
@@ -48,12 +47,12 @@ unsafe extern "C" {
     fn clock_gettime(clock_id: c_int, tp: *mut Timespec) -> c_int;
 }
 
-static mut RTR_INSTANCE: Option<ash::Instance> = None;
-static mut RTR_SURFACE_LOADER: Option<ash::khr::surface::Instance> = None;
-static mut RTR_SWAPCHAIN_LOADER: Option<ash::khr::swapchain::Device> = None;
+static mut RTR_INSTANCE: Option<vk::InstanceCommands> = None;
+static mut RTR_SURFACE_LOADER: Option<vk::SurfaceLoader> = None;
+static mut RTR_SWAPCHAIN_LOADER: Option<vk::SwapchainLoader> = None;
 static mut RTR_SURFACE: vk::SurfaceKHR = vk::SurfaceKHR::null();
 static mut RTR_PHYSICAL_DEVICE: vk::PhysicalDevice = vk::PhysicalDevice::null();
-static mut RTR_DEVICE: Option<ash::Device> = None;
+static mut RTR_DEVICE: Option<vk::DeviceCommands> = None;
 static mut RTR_QUEUE: vk::Queue = vk::Queue::null();
 static mut RTR_SWAPCHAIN: vk::SwapchainKHR = vk::SwapchainKHR::null();
 static mut RTR_SWAP_EXTENT: vk::Extent2D = vk::Extent2D {
@@ -95,19 +94,19 @@ static mut RTR_START_TIME: Timespec = Timespec {
     tv_nsec: 0,
 };
 
-unsafe fn instance() -> &'static ash::Instance {
+unsafe fn instance() -> &'static vk::InstanceCommands {
     RTR_INSTANCE.as_ref().unwrap()
 }
 
-unsafe fn surface_loader() -> &'static ash::khr::surface::Instance {
+unsafe fn surface_loader() -> &'static vk::SurfaceLoader {
     RTR_SURFACE_LOADER.as_ref().unwrap()
 }
 
-unsafe fn swapchain_loader() -> &'static ash::khr::swapchain::Device {
+unsafe fn swapchain_loader() -> &'static vk::SwapchainLoader {
     RTR_SWAPCHAIN_LOADER.as_ref().unwrap()
 }
 
-unsafe fn device() -> &'static ash::Device {
+unsafe fn device() -> &'static vk::DeviceCommands {
     RTR_DEVICE.as_ref().unwrap()
 }
 
@@ -115,28 +114,33 @@ fn rtr_error() -> vk::Result {
     vk::Result::ERROR_INITIALIZATION_FAILED
 }
 
-unsafe fn create_instance() -> VkResult<ash::ext::metal_surface::Instance> {
-    let entry = ash::Entry::linked();
+unsafe fn create_instance() -> VkResult<vk::MetalSurfaceLoader> {
+    let entry = vk::Entry::linked();
     let app = c"realtimerays";
     let instance_exts = [
-        ash::khr::surface::NAME.as_ptr(),
-        ash::ext::metal_surface::NAME.as_ptr(),
-        ash::khr::portability_enumeration::NAME.as_ptr(),
+        vk::khr::surface::NAME.as_ptr(),
+        vk::ext::metal_surface::NAME.as_ptr(),
+        vk::khr::portability_enumeration::NAME.as_ptr(),
     ];
-    let app_info = vk::ApplicationInfo::default()
-        .application_name(app)
-        .application_version(vk::make_api_version(0, 0, 1, 0))
-        .engine_name(app)
-        .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::API_VERSION_1_3);
-    let create_info = vk::InstanceCreateInfo::default()
-        .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
-        .application_info(&app_info)
-        .enabled_extension_names(&instance_exts);
+    let app_info = vk::ApplicationInfo {
+        p_application_name: app.as_ptr(),
+        application_version: vk::make_api_version(0, 0, 1, 0),
+        p_engine_name: app.as_ptr(),
+        engine_version: vk::make_api_version(0, 0, 1, 0),
+        api_version: vk::API_VERSION_1_3,
+        ..Default::default()
+    };
+    let create_info = vk::InstanceCreateInfo {
+        flags: vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR,
+        p_application_info: &app_info,
+        enabled_extension_count: instance_exts.len() as u32,
+        pp_enabled_extension_names: instance_exts.as_ptr(),
+        ..Default::default()
+    };
 
     let instance = entry.create_instance(&create_info, None)?;
-    let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
-    let metal_surface_loader = ash::ext::metal_surface::Instance::new(&entry, &instance);
+    let surface_loader = vk::SurfaceLoader::new(&instance);
+    let metal_surface_loader = vk::MetalSurfaceLoader::new(&instance);
     RTR_INSTANCE = Some(instance);
     RTR_SURFACE_LOADER = Some(surface_loader);
 
@@ -147,20 +151,27 @@ unsafe fn create_device() -> VkResult<()> {
     let priority = 1.0f32;
     let priorities = [priority];
     let device_exts = [
-        ash::khr::swapchain::NAME.as_ptr(),
-        ash::khr::portability_subset::NAME.as_ptr(),
+        vk::khr::swapchain::NAME.as_ptr(),
+        vk::khr::portability_subset::NAME.as_ptr(),
     ];
-    let queue_info = vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(0)
-        .queue_priorities(&priorities);
+    let queue_info = vk::DeviceQueueCreateInfo {
+        queue_family_index: 0,
+        queue_count: priorities.len() as u32,
+        p_queue_priorities: priorities.as_ptr(),
+        ..Default::default()
+    };
     let queue_infos = [queue_info];
-    let create_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(&queue_infos)
-        .enabled_extension_names(&device_exts);
+    let create_info = vk::DeviceCreateInfo {
+        queue_create_info_count: queue_infos.len() as u32,
+        p_queue_create_infos: queue_infos.as_ptr(),
+        enabled_extension_count: device_exts.len() as u32,
+        pp_enabled_extension_names: device_exts.as_ptr(),
+        ..Default::default()
+    };
 
     let device = instance().create_device(RTR_PHYSICAL_DEVICE, &create_info, None)?;
     RTR_QUEUE = device.get_device_queue(0, 0);
-    RTR_SWAPCHAIN_LOADER = Some(ash::khr::swapchain::Device::new(instance(), &device));
+    RTR_SWAPCHAIN_LOADER = Some(vk::SwapchainLoader::new(&device));
     RTR_DEVICE = Some(device);
 
     Ok(())
@@ -189,10 +200,12 @@ unsafe fn create_memory_buffer() -> VkResult<()> {
     let memory_words = RTR_MEMORY_HEADER_WORDS + history_words;
     let memory_size = memory_words * size_of::<u32>() as u64;
 
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(memory_size)
-        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer_info = vk::BufferCreateInfo {
+        size: memory_size,
+        usage: vk::BufferUsageFlags::STORAGE_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
     RTR_MEMORY_BUFFER = device().create_buffer(&buffer_info, None)?;
 
     let requirements = device().get_buffer_memory_requirements(RTR_MEMORY_BUFFER);
@@ -204,9 +217,11 @@ unsafe fn create_memory_buffer() -> VkResult<()> {
         return Err(rtr_error());
     }
 
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type);
+    let alloc_info = vk::MemoryAllocateInfo {
+        allocation_size: requirements.size,
+        memory_type_index: memory_type,
+        ..Default::default()
+    };
     RTR_MEMORY_BUFFER_MEMORY = device().allocate_memory(&alloc_info, None)?;
     device().bind_buffer_memory(RTR_MEMORY_BUFFER, RTR_MEMORY_BUFFER_MEMORY, 0)?;
 
@@ -269,9 +284,11 @@ unsafe fn create_timing_query_pool() -> VkResult<()> {
         return Ok(());
     }
 
-    let info = vk::QueryPoolCreateInfo::default()
-        .query_type(vk::QueryType::TIMESTAMP)
-        .query_count((RTR_MAX_SWAP_IMAGES * 2) as u32);
+    let info = vk::QueryPoolCreateInfo {
+        query_type: vk::QueryType::TIMESTAMP,
+        query_count: (RTR_MAX_SWAP_IMAGES * 2) as u32,
+        ..Default::default()
+    };
     match device().create_query_pool(&info, None) {
         Ok(pool) => RTR_TIMING_QUERY_POOL = pool,
         Err(_) => RTR_TIMING_SUPPORTED = 0,
@@ -381,8 +398,10 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
 
     let metal_surface_loader = create_instance()?;
 
-    let metal_info =
-        vk::MetalSurfaceCreateInfoEXT::default().layer(window_surface.cast::<vk::CAMetalLayer>());
+    let metal_info = vk::MetalSurfaceCreateInfoEXT {
+        p_layer: window_surface.cast::<vk::CAMetalLayer>(),
+        ..Default::default()
+    };
     RTR_SURFACE = metal_surface_loader.create_metal_surface(&metal_info, None)?;
 
     let physical_devices = instance().enumerate_physical_devices()?;
@@ -419,19 +438,21 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
         min_image_count = caps.max_image_count;
     }
 
-    let swapchain_info = vk::SwapchainCreateInfoKHR::default()
-        .surface(RTR_SURFACE)
-        .min_image_count(min_image_count)
-        .image_format(vk::Format::B8G8R8A8_UNORM)
-        .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
-        .image_extent(RTR_SWAP_EXTENT)
-        .image_array_layers(1)
-        .image_usage(vk::ImageUsageFlags::STORAGE)
-        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .pre_transform(caps.current_transform)
-        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        .present_mode(vk::PresentModeKHR::FIFO)
-        .clipped(true);
+    let swapchain_info = vk::SwapchainCreateInfoKHR {
+        surface: RTR_SURFACE,
+        min_image_count,
+        image_format: vk::Format::B8G8R8A8_UNORM,
+        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        image_extent: RTR_SWAP_EXTENT,
+        image_array_layers: 1,
+        image_usage: vk::ImageUsageFlags::STORAGE,
+        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        pre_transform: caps.current_transform,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode: vk::PresentModeKHR::FIFO,
+        clipped: vk::TRUE,
+        ..Default::default()
+    };
     RTR_SWAPCHAIN = swapchain_loader().create_swapchain(&swapchain_info, None)?;
 
     let swap_images = swapchain_loader().get_swapchain_images(RTR_SWAPCHAIN)?;
@@ -449,37 +470,53 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
     create_timing_query_pool()?;
 
     let bindings = [
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
     ];
-    let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    let layout_info = vk::DescriptorSetLayoutCreateInfo {
+        binding_count: bindings.len() as u32,
+        p_bindings: bindings.as_ptr(),
+        ..Default::default()
+    };
     RTR_DESCRIPTOR_SET_LAYOUT = device().create_descriptor_set_layout(&layout_info, None)?;
 
     let pool_sizes = [
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_IMAGE)
-            .descriptor_count(RTR_MAX_SWAP_IMAGES as u32),
-        vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(RTR_MAX_SWAP_IMAGES as u32),
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: RTR_MAX_SWAP_IMAGES as u32,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: RTR_MAX_SWAP_IMAGES as u32,
+        },
     ];
-    let pool_info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(RTR_MAX_SWAP_IMAGES as u32)
-        .pool_sizes(&pool_sizes);
+    let pool_info = vk::DescriptorPoolCreateInfo {
+        max_sets: RTR_MAX_SWAP_IMAGES as u32,
+        pool_size_count: pool_sizes.len() as u32,
+        p_pool_sizes: pool_sizes.as_ptr(),
+        ..Default::default()
+    };
     RTR_DESCRIPTOR_POOL = device().create_descriptor_pool(&pool_info, None)?;
 
     let set_layouts = [RTR_DESCRIPTOR_SET_LAYOUT; RTR_MAX_SWAP_IMAGES];
-    let set_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(RTR_DESCRIPTOR_POOL)
-        .set_layouts(&set_layouts);
+    let set_info = vk::DescriptorSetAllocateInfo {
+        descriptor_pool: RTR_DESCRIPTOR_POOL,
+        descriptor_set_count: set_layouts.len() as u32,
+        p_set_layouts: set_layouts.as_ptr(),
+        ..Default::default()
+    };
     let descriptor_sets = device().allocate_descriptor_sets(&set_info)?;
     i = 0;
     while i < RTR_MAX_SWAP_IMAGES {
@@ -488,19 +525,30 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
     }
 
     let pipeline_set_layouts = [RTR_DESCRIPTOR_SET_LAYOUT];
-    let pipeline_layout_info =
-        vk::PipelineLayoutCreateInfo::default().set_layouts(&pipeline_set_layouts);
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+        set_layout_count: pipeline_set_layouts.len() as u32,
+        p_set_layouts: pipeline_set_layouts.as_ptr(),
+        ..Default::default()
+    };
     RTR_PIPELINE_LAYOUT = device().create_pipeline_layout(&pipeline_layout_info, None)?;
 
-    let shader_info = vk::ShaderModuleCreateInfo::default().code(&TRACE_COMP_SPV);
+    let shader_info = vk::ShaderModuleCreateInfo {
+        code_size: size_of_val(&TRACE_COMP_SPV),
+        p_code: TRACE_COMP_SPV.as_ptr(),
+        ..Default::default()
+    };
     let shader_module = device().create_shader_module(&shader_info, None)?;
-    let stage_info = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader_module)
-        .name(c"main");
-    let pipeline_info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage_info)
-        .layout(RTR_PIPELINE_LAYOUT);
+    let stage_info = vk::PipelineShaderStageCreateInfo {
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module: shader_module,
+        p_name: c"main".as_ptr(),
+        ..Default::default()
+    };
+    let pipeline_info = vk::ComputePipelineCreateInfo {
+        stage: stage_info,
+        layout: RTR_PIPELINE_LAYOUT,
+        ..Default::default()
+    };
     let pipeline_infos = [pipeline_info];
     let pipeline_result =
         device().create_compute_pipelines(vk::PipelineCache::null(), &pipeline_infos, None);
@@ -510,13 +558,18 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
         Err((_pipelines, result)) => return Err(result),
     }
 
-    let command_pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(0);
+    let command_pool_info = vk::CommandPoolCreateInfo {
+        queue_family_index: 0,
+        ..Default::default()
+    };
     RTR_COMMAND_POOL = device().create_command_pool(&command_pool_info, None)?;
 
-    let command_alloc_info = vk::CommandBufferAllocateInfo::default()
-        .command_pool(RTR_COMMAND_POOL)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(swap_image_count as u32);
+    let command_alloc_info = vk::CommandBufferAllocateInfo {
+        command_pool: RTR_COMMAND_POOL,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: swap_image_count as u32,
+        ..Default::default()
+    };
     let command_buffers = device().allocate_command_buffers(&command_alloc_info)?;
     i = 0;
     while i < swap_image_count {
@@ -524,41 +577,52 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
         i += 1;
     }
 
-    let image_range = vk::ImageSubresourceRange::default()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1);
+    let image_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        level_count: 1,
+        layer_count: 1,
+        ..Default::default()
+    };
 
     i = 0;
     while i < swap_image_count {
-        let image_view_info = vk::ImageViewCreateInfo::default()
-            .image(RTR_SWAP_IMAGES[i])
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
-            .components(vk::ComponentMapping::default())
-            .subresource_range(image_range);
+        let image_view_info = vk::ImageViewCreateInfo {
+            image: RTR_SWAP_IMAGES[i],
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            components: vk::ComponentMapping::default(),
+            subresource_range: image_range,
+            ..Default::default()
+        };
         RTR_SWAP_IMAGE_VIEWS[i] = device().create_image_view(&image_view_info, None)?;
 
-        let image_infos = [vk::DescriptorImageInfo::default()
-            .image_view(RTR_SWAP_IMAGE_VIEWS[i])
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let buffer_infos = [vk::DescriptorBufferInfo::default()
-            .buffer(RTR_MEMORY_BUFFER)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
+        let image_infos = [vk::DescriptorImageInfo {
+            image_view: RTR_SWAP_IMAGE_VIEWS[i],
+            image_layout: vk::ImageLayout::GENERAL,
+            ..Default::default()
+        }];
+        let buffer_infos = [vk::DescriptorBufferInfo {
+            buffer: RTR_MEMORY_BUFFER,
+            range: vk::WHOLE_SIZE,
+            ..Default::default()
+        }];
         let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(RTR_DESCRIPTOR_SETS[i])
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&image_infos),
-            vk::WriteDescriptorSet::default()
-                .dst_set(RTR_DESCRIPTOR_SETS[i])
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&buffer_infos),
+            vk::WriteDescriptorSet {
+                dst_set: RTR_DESCRIPTOR_SETS[i],
+                dst_binding: 0,
+                descriptor_count: image_infos.len() as u32,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                p_image_info: image_infos.as_ptr(),
+                ..Default::default()
+            },
+            vk::WriteDescriptorSet {
+                dst_set: RTR_DESCRIPTOR_SETS[i],
+                dst_binding: 1,
+                descriptor_count: buffer_infos.len() as u32,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                p_buffer_info: buffer_infos.as_ptr(),
+                ..Default::default()
+            },
         ];
         device().update_descriptor_sets(&writes, &[]);
 
@@ -574,14 +638,16 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
             );
         }
 
-        let to_general = [vk::ImageMemoryBarrier::default()
-            .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(RTR_SWAP_IMAGES[i])
-            .subresource_range(image_range)];
+        let to_general = [vk::ImageMemoryBarrier {
+            dst_access_mask: vk::AccessFlags::SHADER_WRITE,
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::GENERAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image: RTR_SWAP_IMAGES[i],
+            subresource_range: image_range,
+            ..Default::default()
+        }];
         device().cmd_pipeline_barrier(
             RTR_COMMAND_BUFFERS[i],
             vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -601,14 +667,15 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
             );
         }
 
-        let memory_barrier = [vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(RTR_MEMORY_BUFFER)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)];
+        let memory_barrier = [vk::BufferMemoryBarrier {
+            src_access_mask: vk::AccessFlags::HOST_WRITE | vk::AccessFlags::SHADER_WRITE,
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            buffer: RTR_MEMORY_BUFFER,
+            size: vk::WHOLE_SIZE,
+            ..Default::default()
+        }];
         device().cmd_pipeline_barrier(
             RTR_COMMAND_BUFFERS[i],
             vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -648,14 +715,16 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
             );
         }
 
-        let to_present = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(RTR_SWAP_IMAGES[i])
-            .subresource_range(image_range)];
+        let to_present = [vk::ImageMemoryBarrier {
+            src_access_mask: vk::AccessFlags::SHADER_WRITE,
+            old_layout: vk::ImageLayout::GENERAL,
+            new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image: RTR_SWAP_IMAGES[i],
+            subresource_range: image_range,
+            ..Default::default()
+        }];
         device().cmd_pipeline_barrier(
             RTR_COMMAND_BUFFERS[i],
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -674,7 +743,10 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
     RTR_IMAGE_AVAILABLE_SEMAPHORE = device().create_semaphore(&semaphore_info, None)?;
     RTR_RENDER_FINISHED_SEMAPHORE = device().create_semaphore(&semaphore_info, None)?;
 
-    let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+    let fence_info = vk::FenceCreateInfo {
+        flags: vk::FenceCreateFlags::SIGNALED,
+        ..Default::default()
+    };
     RTR_IN_FLIGHT_FENCE = device().create_fence(&fence_info, None)?;
 
     Ok(())
@@ -700,20 +772,29 @@ pub unsafe fn frame() {
     let wait_semaphores = [RTR_IMAGE_AVAILABLE_SEMAPHORE];
     let command_buffers = [RTR_COMMAND_BUFFERS[image_index as usize]];
     let signal_semaphores = [RTR_RENDER_FINISHED_SEMAPHORE];
-    let submit = vk::SubmitInfo::default()
-        .wait_semaphores(&wait_semaphores)
-        .wait_dst_stage_mask(&wait_stages)
-        .command_buffers(&command_buffers)
-        .signal_semaphores(&signal_semaphores);
+    let submit = vk::SubmitInfo {
+        wait_semaphore_count: wait_semaphores.len() as u32,
+        p_wait_semaphores: wait_semaphores.as_ptr(),
+        p_wait_dst_stage_mask: wait_stages.as_ptr(),
+        command_buffer_count: command_buffers.len() as u32,
+        p_command_buffers: command_buffers.as_ptr(),
+        signal_semaphore_count: signal_semaphores.len() as u32,
+        p_signal_semaphores: signal_semaphores.as_ptr(),
+        ..Default::default()
+    };
     let submits = [submit];
     let _ = device().queue_submit(RTR_QUEUE, &submits, RTR_IN_FLIGHT_FENCE);
 
     let swapchains = [RTR_SWAPCHAIN];
     let image_indices = [image_index];
-    let present = vk::PresentInfoKHR::default()
-        .wait_semaphores(&signal_semaphores)
-        .swapchains(&swapchains)
-        .image_indices(&image_indices);
+    let present = vk::PresentInfoKHR {
+        wait_semaphore_count: signal_semaphores.len() as u32,
+        p_wait_semaphores: signal_semaphores.as_ptr(),
+        swapchain_count: swapchains.len() as u32,
+        p_swapchains: swapchains.as_ptr(),
+        p_image_indices: image_indices.as_ptr(),
+        ..Default::default()
+    };
     let _ = swapchain_loader().queue_present(RTR_QUEUE, &present);
 
     if RTR_TIMING_SUPPORTED != 0 {
