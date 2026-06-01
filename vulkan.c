@@ -14,7 +14,9 @@
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
-#define RTR_MEMORY_WORDS 16u
+#define RTR_MEMORY_HEADER_WORDS 16u
+#define RTR_HISTORY_WORDS_PER_PIXEL 15u
+#define RTR_HISTORY_PAGE_COUNT 2u
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
@@ -29,6 +31,9 @@ enum {
     RTR_MEMORY_MOUSE_X_WORD = 5,
     RTR_MEMORY_MOUSE_Y_WORD = 6,
     RTR_MEMORY_TIME_WORD = 7,
+    RTR_MEMORY_PREV_TIME_WORD = 8,
+    RTR_MEMORY_PREV_MOUSE_X_WORD = 9,
+    RTR_MEMORY_PREV_MOUSE_Y_WORD = 10,
 };
 
 static const char *const rtrInstanceExts[] = {
@@ -113,7 +118,14 @@ static float rtrElapsedSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
-    const VkDeviceSize rtrMemorySize = (VkDeviceSize)RTR_MEMORY_WORDS * (VkDeviceSize)sizeof(uint32_t);
+    const VkDeviceSize historyWords =
+        (VkDeviceSize)rtrSwapExtent.width *
+        (VkDeviceSize)rtrSwapExtent.height *
+        (VkDeviceSize)RTR_HISTORY_WORDS_PER_PIXEL *
+        (VkDeviceSize)RTR_HISTORY_PAGE_COUNT;
+    const VkDeviceSize rtrMemorySize =
+        ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS + historyWords) *
+        (VkDeviceSize)sizeof(uint32_t);
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = rtrMemorySize,
@@ -145,12 +157,17 @@ static int rtrCreateMemoryBuffer(void)
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(-1.0f);
+    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_X_WORD] = rtrF32Word(-1.0f);
+    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_Y_WORD] = rtrF32Word(-1.0f);
 
     return 0;
 }
 
 static void rtrUpdateMemory(void)
 {
+    const uint32_t prevTimeWord = rtrMemoryWords[RTR_MEMORY_TIME_WORD];
+    const uint32_t prevMouseXWord = rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD];
+    const uint32_t prevMouseYWord = rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD];
     float mouseX = -1.0f;
     float mouseY = -1.0f;
     rtrWindowMouse(&mouseX, &mouseY);
@@ -161,6 +178,9 @@ static void rtrUpdateMemory(void)
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(mouseX);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(mouseY);
     rtrMemoryWords[RTR_MEMORY_TIME_WORD] = rtrF32Word(rtrElapsedSeconds());
+    rtrMemoryWords[RTR_MEMORY_PREV_TIME_WORD] = prevTimeWord;
+    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_X_WORD] = prevMouseXWord;
+    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_Y_WORD] = prevMouseYWord;
 }
 
 static int rtrCreateTimingQueryPool(void)
@@ -517,6 +537,20 @@ int rtrVulkanInit(void *windowSurface)
                                 rtrTimingQueryPool,
                                 i * 2u);
         }
+
+        vkCmdPipelineBarrier(rtrCommandBuffers[i],
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                             0u, NULL, 1u, &(VkBufferMemoryBarrier){
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = rtrMemoryBuffer,
+            .offset = 0u,
+            .size = VK_WHOLE_SIZE,
+        }, 0u, NULL);
 
         vkCmdBindPipeline(rtrCommandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, rtrPipeline);
         vkCmdBindDescriptorSets(rtrCommandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
