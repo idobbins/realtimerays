@@ -1,5 +1,4 @@
 mod macos;
-mod vk;
 mod vulkan;
 
 fn main() {

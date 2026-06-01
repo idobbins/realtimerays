@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["linked", "std"] }
 
 [profile.release]
 panic = "abort"
