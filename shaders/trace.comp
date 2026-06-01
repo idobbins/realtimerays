@@ -26,7 +26,7 @@ const uint RTR_BVH_STACK_SIZE = 64u;
 const float RTR_PI = 3.14159265359;
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.001;
-const float RTR_FOCAL = 1.35;
+const float RTR_FOCAL = 2.15;
 const float RTR_FEEDBACK_MIN = 0.80;
 const float RTR_FEEDBACK_MAX = 0.96;
 const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
@@ -424,8 +424,8 @@ void rtrCamera(float time, float mouseX, vec2 sz, out vec3 ro, out vec3 forward,
 {
     float mouseAngle = mouseX >= 0.0 ? (mouseX / max(sz.x, 1.0) - 0.5) * 3.2 : 0.0;
     float angle = 0.42 + time * 0.035 + mouseAngle;
-    ro = vec3(sin(angle) * 9.4, 4.2, cos(angle) * 9.4);
-    vec3 target = vec3(0.0, 0.95, 0.0);
+    ro = vec3(sin(angle) * 13.6, 5.1, cos(angle) * 13.6);
+    vec3 target = vec3(0.0, 1.05, 0.0);
     forward = normalize(target - ro);
     right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
     up = cross(right, forward);
