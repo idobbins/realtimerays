@@ -14,7 +14,7 @@ const uint RTR_TIME_WORD = 7u;
 const uint RTR_PREV_TIME_WORD = 8u;
 const uint RTR_PREV_MOUSE_X_WORD = 9u;
 const uint RTR_HISTORY_WORD = 16u;
-const uint RTR_HISTORY_WORDS_PER_PIXEL = 15u;
+const uint RTR_HISTORY_WORDS_PER_PIXEL = 20u;
 
 const float RTR_PI = 3.14159265359;
 const float RTR_INF = 1.0e20;
@@ -22,12 +22,30 @@ const float RTR_EPS = 0.001;
 const float RTR_FOCAL = 1.55;
 const float RTR_FEEDBACK_MIN = 0.80;
 const float RTR_FEEDBACK_MAX = 0.96;
+const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
+const uint RTR_RESTIR_MAX_SOURCE_M = 64u;
+const vec3 RTR_LIGHT_CENTER = vec3(0.05, 2.65, -1.25);
+const float RTR_LIGHT_RADIUS = 0.45;
+const vec3 RTR_LIGHT_EMISSION = vec3(10.0, 8.0, 5.6);
 
 struct RTRHit {
     float t;
     vec3 n;
     vec3 albedo;
     vec3 emission;
+};
+
+struct RTRLightSample {
+    vec3 pos;
+    vec3 n;
+};
+
+struct RTRReservoir {
+    vec3 lightPos;
+    float wSum;
+    float W;
+    uint M;
+    bool valid;
 };
 
 uint rtrLoadU32(uint word)
@@ -142,7 +160,7 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
     rtrPlane(ro, rd, vec3(0.0, 1.0, 0.0), 1.0, vec3(0.58, 0.60, 0.54), hit);
     rtrSphere(ro, rd, vec3(-1.15, 0.0, 0.0), 1.0, vec3(0.83, 0.22, 0.18), vec3(0.0), hit);
     rtrSphere(ro, rd, vec3(1.18, -0.22, -0.45), 0.78, vec3(0.13, 0.48, 0.80), vec3(0.0), hit);
-    rtrSphere(ro, rd, vec3(0.05, 2.65, -1.25), 0.45, vec3(1.0), vec3(10.0, 8.0, 5.6), hit);
+    rtrSphere(ro, rd, RTR_LIGHT_CENTER, RTR_LIGHT_RADIUS, vec3(1.0), RTR_LIGHT_EMISSION, hit);
     rtrBox(ro, rd, vec3(-0.36, -1.0, 1.10), vec3(0.62, 0.15, 1.92), vec3(0.88, 0.67, 0.28), hit);
 
     return hit;
@@ -165,6 +183,11 @@ vec3 rtrCosineHemisphere(vec3 n, inout uint rng)
     return normalize(t * (cos(a) * r) + b * (sin(a) * r) + n * sqrt(max(0.0, 1.0 - u)));
 }
 
+float rtrLuminance(vec3 color)
+{
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
 float rtrShadow(vec3 p, vec3 lightPos)
 {
     vec3 toLight = lightPos - p;
@@ -175,48 +198,142 @@ float rtrShadow(vec3 p, vec3 lightPos)
     return 1.0;
 }
 
-vec3 rtrRadiance(vec3 ro, vec3 rd, inout uint rng)
+float rtrLightPdfArea()
 {
-    vec3 throughput = vec3(1.0);
-    vec3 color = vec3(0.0);
+    return 1.0 / (4.0 * RTR_PI * RTR_LIGHT_RADIUS * RTR_LIGHT_RADIUS);
+}
 
-    for (int bounce = 0; bounce < 2; bounce++) {
-        RTRHit hit = rtrTrace(ro, rd);
-        if (hit.t == RTR_INF) {
-            color += throughput * rtrSky(rd);
-            break;
-        }
+RTRLightSample rtrSampleLight(inout uint rng)
+{
+    float z = 1.0 - 2.0 * rtrRand(rng);
+    float a = 2.0 * RTR_PI * rtrRand(rng);
+    float r = sqrt(max(0.0, 1.0 - z * z));
 
-        vec3 p = ro + rd * hit.t;
-        color += throughput * hit.emission;
+    RTRLightSample lightSample;
+    lightSample.n = vec3(cos(a) * r, z, sin(a) * r);
+    lightSample.pos = RTR_LIGHT_CENTER + lightSample.n * RTR_LIGHT_RADIUS;
+    return lightSample;
+}
 
-        vec3 lightPos = vec3(-0.55 + rtrRand(rng) * 1.10,
-                             2.70 + rtrRand(rng) * 0.20,
-                             -1.70 + rtrRand(rng) * 1.10);
-        vec3 toLight = lightPos - p;
-        float lightDist2 = max(dot(toLight, toLight), 0.001);
-        vec3 l = normalize(toLight);
-        float ndotl = max(dot(hit.n, l), 0.0);
-        float shade = rtrShadow(p + hit.n * RTR_EPS * 2.0, lightPos);
-        color += throughput * hit.albedo * vec3(9.0, 7.2, 4.8) * ndotl * shade / lightDist2;
+vec3 rtrLightDensity(vec3 p, vec3 n, vec3 albedo, vec3 lightPos)
+{
+    vec3 lightN = normalize(lightPos - RTR_LIGHT_CENTER);
+    vec3 toLight = lightPos - p;
+    float lightDist2 = max(dot(toLight, toLight), 0.001);
+    vec3 l = toLight * inversesqrt(lightDist2);
+    float surfaceCos = max(dot(n, l), 0.0);
+    float lightCos = max(dot(lightN, -l), 0.0);
+    if (surfaceCos <= 0.0 || lightCos <= 0.0) return vec3(0.0);
 
-        throughput *= hit.albedo;
-        ro = p + hit.n * RTR_EPS * 2.0;
-        rd = rtrCosineHemisphere(hit.n, rng);
+    return albedo * RTR_LIGHT_EMISSION * (surfaceCos * lightCos / (RTR_PI * lightDist2));
+}
+
+vec3 rtrSampleDirectLighting(vec3 p, vec3 n, vec3 albedo, inout uint rng)
+{
+    RTRLightSample lightSample = rtrSampleLight(rng);
+    vec3 density = rtrLightDensity(p, n, albedo, lightSample.pos);
+    if (rtrLuminance(density) <= 0.0) return vec3(0.0);
+
+    float visible = rtrShadow(p + n * RTR_EPS * 2.0, lightSample.pos);
+    return density * visible / rtrLightPdfArea();
+}
+
+RTRReservoir rtrReservoirEmpty()
+{
+    RTRReservoir reservoir;
+    reservoir.lightPos = vec3(0.0);
+    reservoir.wSum = 0.0;
+    reservoir.W = 0.0;
+    reservoir.M = 0u;
+    reservoir.valid = false;
+    return reservoir;
+}
+
+void rtrReservoirUpdate(inout RTRReservoir reservoir, vec3 lightPos, float weight, uint m, inout uint rng)
+{
+    if (weight <= 0.0 || m == 0u) return;
+
+    reservoir.wSum += weight;
+    reservoir.M += m;
+    if (rtrRand(rng) * reservoir.wSum < weight) {
+        reservoir.lightPos = lightPos;
+        reservoir.valid = true;
+    }
+}
+
+void rtrReservoirAddInitialCandidates(inout RTRReservoir reservoir, vec3 p, vec3 n, vec3 albedo, inout uint rng)
+{
+    float pdfArea = rtrLightPdfArea();
+    for (uint i = 0u; i < RTR_RESTIR_INITIAL_SAMPLES; i++) {
+        RTRLightSample lightSample = rtrSampleLight(rng);
+        vec3 density = rtrLightDensity(p, n, albedo, lightSample.pos);
+        float target = rtrLuminance(density);
+        rtrReservoirUpdate(reservoir, lightSample.pos, target / pdfArea, 1u, rng);
+    }
+}
+
+void rtrReservoirCombineStored(inout RTRReservoir reservoir, uint base, vec3 p, vec3 n, vec3 albedo, inout uint rng)
+{
+    uint sourceM = min(rtrMem[base + 19u], RTR_RESTIR_MAX_SOURCE_M);
+    if (sourceM == 0u) return;
+
+    float sourceW = uintBitsToFloat(rtrMem[base + 18u]);
+    if (sourceW <= 0.0) return;
+
+    vec3 sourceLightPos = uintBitsToFloat(uvec3(rtrMem[base + 15u],
+                                                rtrMem[base + 16u],
+                                                rtrMem[base + 17u]));
+    vec3 density = rtrLightDensity(p, n, albedo, sourceLightPos);
+    float target = rtrLuminance(density);
+    rtrReservoirUpdate(reservoir, sourceLightPos, target * sourceW * float(sourceM), sourceM, rng);
+}
+
+void rtrReservoirFinalize(inout RTRReservoir reservoir, float selectedTarget)
+{
+    if (!reservoir.valid || reservoir.M == 0u || reservoir.wSum <= 0.0 || selectedTarget <= 0.0) {
+        reservoir = rtrReservoirEmpty();
+        return;
     }
 
-    return color;
+    reservoir.W = reservoir.wSum / (float(reservoir.M) * selectedTarget);
+    if (reservoir.W <= 0.0) reservoir = rtrReservoirEmpty();
+}
+
+vec3 rtrReservoirDirectLighting(RTRReservoir reservoir, vec3 p, vec3 n, vec3 albedo)
+{
+    if (!reservoir.valid || reservoir.W <= 0.0) return vec3(0.0);
+
+    vec3 density = rtrLightDensity(p, n, albedo, reservoir.lightPos);
+    if (rtrLuminance(density) <= 0.0) return vec3(0.0);
+
+    float visible = rtrShadow(p + n * RTR_EPS * 2.0, reservoir.lightPos);
+    return density * visible * reservoir.W;
+}
+
+vec3 rtrIndirectRadiance(RTRHit primary, vec3 ro, vec3 rd, inout uint rng)
+{
+    if (primary.t == RTR_INF || length(primary.emission) > 0.01) return vec3(0.0);
+
+    vec3 p = ro + rd * primary.t;
+    vec3 bounceRo = p + primary.n * RTR_EPS * 2.0;
+    vec3 bounceRd = rtrCosineHemisphere(primary.n, rng);
+    vec3 throughput = primary.albedo;
+    RTRHit hit = rtrTrace(bounceRo, bounceRd);
+    if (hit.t == RTR_INF) return throughput * rtrSky(bounceRd);
+
+    vec3 hitPos = bounceRo + bounceRd * hit.t;
+    vec3 color = hit.emission;
+    if (length(hit.emission) <= 0.01) {
+        color += rtrSampleDirectLighting(hitPos, hit.n, hit.albedo, rng);
+    }
+
+    return throughput * color;
 }
 
 vec3 rtrTonemap(vec3 color)
 {
     color = color / (color + vec3(1.0));
     return pow(color, vec3(1.0 / 2.2));
-}
-
-float rtrLuminance(vec3 color)
-{
-    return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
 void rtrCamera(float time, float mouseX, vec2 sz, out vec3 ro, out vec3 forward, out vec3 right, out vec3 up)
@@ -267,20 +384,20 @@ void main()
     bool hit = primary.t < RTR_INF;
     vec3 hitPos = hit ? ro + rd * primary.t : vec3(0.0);
     vec3 hitAlbedo = hit ? primary.albedo : vec3(0.0);
-
-    vec3 color = vec3(0.0);
-    for (int i = 0; i < 2; i++) {
-        color += rtrRadiance(ro, rd, rng);
-    }
-    color *= 0.5;
+    bool shadingHit = hit && length(primary.emission) <= 0.01;
 
     uint pixel = uint(p.y) * uint(sz.x) + uint(p.x);
     uint pageWords = uint(sz.x) * uint(sz.y) * RTR_HISTORY_WORDS_PER_PIXEL;
     uint historyBase = RTR_HISTORY_WORD + (frame & 1u) * pageWords + pixel * RTR_HISTORY_WORDS_PER_PIXEL;
+    RTRReservoir reservoir = rtrReservoirEmpty();
     bool useHistory = false;
-    vec3 historyColor = color;
+    vec3 historyColor = vec3(0.0);
     float prevHistoryLen = 0.0;
     float prevMoment2 = 0.0;
+
+    if (shadingHit) {
+        rtrReservoirAddInitialCandidates(reservoir, hitPos, primary.n, hitAlbedo, rng);
+    }
 
     if (frame > 0u && hit) {
         vec3 prevRo, prevForward, prevRight, prevUp;
@@ -314,6 +431,10 @@ void main()
                         dot(prevN, primary.n) < 0.90 ||
                         distance(prevAlbedo, hitAlbedo) > 0.08) continue;
 
+                    if (shadingHit) {
+                        rtrReservoirCombineStored(reservoir, prevBase, hitPos, primary.n, hitAlbedo, rng);
+                    }
+
                     vec2 d = vec2(c) - q;
                     float w = 1.0 / (1.0 + 2.0 * dot(d, d));
                     vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase], rtrMem[prevBase + 1u], rtrMem[prevBase + 2u]));
@@ -333,6 +454,23 @@ void main()
                 useHistory = true;
             }
         }
+    }
+
+    if (shadingHit) {
+        float selectedTarget = reservoir.valid ?
+            rtrLuminance(rtrLightDensity(hitPos, primary.n, hitAlbedo, reservoir.lightPos)) : 0.0;
+        rtrReservoirFinalize(reservoir, selectedTarget);
+    }
+
+    vec3 color = hit ? primary.emission : rtrSky(rd);
+    if (shadingHit) {
+        color += rtrReservoirDirectLighting(reservoir, hitPos, primary.n, hitAlbedo);
+
+        vec3 indirect = vec3(0.0);
+        for (int i = 0; i < 2; i++) {
+            indirect += rtrIndirectRadiance(primary, ro, rd, rng);
+        }
+        color += indirect * 0.5;
     }
 
     float currentLum = rtrLuminance(color);
@@ -359,6 +497,7 @@ void main()
     uvec3 packedPos = floatBitsToUint(hitPos);
     uvec3 packedN = floatBitsToUint(hit ? primary.n : vec3(0.0));
     uvec3 packedAlbedo = floatBitsToUint(hitAlbedo);
+    uvec3 packedLightPos = floatBitsToUint(reservoir.valid ? reservoir.lightPos : vec3(0.0));
     rtrMem[historyBase] = packedColor.x;
     rtrMem[historyBase + 1u] = packedColor.y;
     rtrMem[historyBase + 2u] = packedColor.z;
@@ -374,6 +513,11 @@ void main()
     rtrMem[historyBase + 12u] = packedAlbedo.x;
     rtrMem[historyBase + 13u] = packedAlbedo.y;
     rtrMem[historyBase + 14u] = packedAlbedo.z;
+    rtrMem[historyBase + 15u] = packedLightPos.x;
+    rtrMem[historyBase + 16u] = packedLightPos.y;
+    rtrMem[historyBase + 17u] = packedLightPos.z;
+    rtrMem[historyBase + 18u] = floatBitsToUint(reservoir.valid ? reservoir.W : 0.0);
+    rtrMem[historyBase + 19u] = reservoir.valid ? reservoir.M : 0u;
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }
