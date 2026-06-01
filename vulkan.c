@@ -198,7 +198,11 @@ static void rtrReportGpuTiming(void)
     }
 
     const double gpuMs = (double)ticks * (double)rtrTimestampPeriod / 1000000.0;
-    printf("frame %u gpu %.3f ms\n", rtrTimingFrameIndex, gpuMs);
+    printf("frame %u gpu %.3f ms %ux%u\n",
+           rtrTimingFrameIndex,
+           gpuMs,
+           rtrSwapExtent.width,
+           rtrSwapExtent.height);
     fflush(stdout);
     rtrTimingPending = 0u;
 }

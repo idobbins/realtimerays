@@ -29,9 +29,8 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     [rtrWindowHandle setAcceptsMouseMovedEvents:YES];
     [view setWantsLayer:YES];
     [(CAMetalLayer *)rtrSurfaceLayer setOpaque:YES];
-    const CGFloat scale = [rtrWindowHandle backingScaleFactor];
-    [(CAMetalLayer *)rtrSurfaceLayer setContentsScale:scale];
-    [(CAMetalLayer *)rtrSurfaceLayer setDrawableSize:CGSizeMake((CGFloat)width * scale, (CGFloat)height * scale)];
+    [(CAMetalLayer *)rtrSurfaceLayer setContentsScale:1.0];
+    [(CAMetalLayer *)rtrSurfaceLayer setDrawableSize:CGSizeMake((CGFloat)width, (CGFloat)height)];
     [view setLayer:(CAMetalLayer *)rtrSurfaceLayer];
     [rtrWindowHandle makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
