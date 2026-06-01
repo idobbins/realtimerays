@@ -1,8 +1,7 @@
 .DS_Store
 .cache/
 
+/target/
 /build/
-/compile_commands.json
 
-*.o
 *.dSYM/

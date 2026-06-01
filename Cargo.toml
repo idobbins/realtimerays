@@ -1,0 +1,13 @@
+[package]
+name = "realtimerays"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = "thin"
+codegen-units = 1
