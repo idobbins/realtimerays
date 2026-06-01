@@ -16,6 +16,7 @@
 #define RTR_TILE_SIZE 8u
 #define RTR_MEMORY_WORDS 16u
 #define RTR_MEMORY_MAGIC 0x30525452u
+#define RTR_TIMING_WINDOW 100u
 
 void rtrWindowMouse(float *x, float *y);
 
@@ -72,8 +73,11 @@ static uint32_t rtrTimingSupported = 0u;
 static uint32_t rtrTimingPending = 0u;
 static uint32_t rtrTimingImageIndex = 0u;
 static uint32_t rtrTimingFrameIndex = 0u;
+static uint32_t rtrTimingWindowFirstFrame = 0u;
+static uint32_t rtrTimingSampleCount = 0u;
 static uint32_t rtrTimestampValidBits = 0u;
 static float rtrTimestampPeriod = 1.0f;
+static double rtrTimingSamples[RTR_TIMING_WINDOW];
 static struct timespec rtrStartTime;
 
 static uint32_t rtrF32Word(float value)
@@ -174,6 +178,61 @@ static int rtrCreateTimingQueryPool(void)
     return 0;
 }
 
+static void rtrSortTimingSamples(double *samples, uint32_t count)
+{
+    for (uint32_t i = 1u; i < count; i++) {
+        double value = samples[i];
+        uint32_t j = i;
+        while (j > 0u && samples[j - 1u] > value) {
+            samples[j] = samples[j - 1u];
+            j--;
+        }
+        samples[j] = value;
+    }
+}
+
+static void rtrPushGpuTiming(double gpuMs)
+{
+    if (rtrTimingSampleCount == 0u) {
+        rtrTimingWindowFirstFrame = rtrTimingFrameIndex;
+    }
+
+    rtrTimingSamples[rtrTimingSampleCount++] = gpuMs;
+    if (rtrTimingSampleCount < RTR_TIMING_WINDOW) return;
+
+    double sorted[RTR_TIMING_WINDOW];
+    double sum = 0.0;
+    for (uint32_t i = 0u; i < RTR_TIMING_WINDOW; i++) {
+        sorted[i] = rtrTimingSamples[i];
+        sum += rtrTimingSamples[i];
+    }
+
+    rtrSortTimingSamples(sorted, RTR_TIMING_WINDOW);
+
+    const double avg = sum / (double)RTR_TIMING_WINDOW;
+    double variance = 0.0;
+    for (uint32_t i = 0u; i < RTR_TIMING_WINDOW; i++) {
+        const double delta = rtrTimingSamples[i] - avg;
+        variance += delta * delta;
+    }
+    variance /= (double)RTR_TIMING_WINDOW;
+
+    printf("gpu[%u] frames %u-%u %ux%u avg %.3f ms min %.3f p01 %.3f p99 %.3f max %.3f var %.6f ms^2\n",
+           RTR_TIMING_WINDOW,
+           rtrTimingWindowFirstFrame,
+           rtrTimingFrameIndex,
+           rtrSwapExtent.width,
+           rtrSwapExtent.height,
+           avg,
+           sorted[0],
+           sorted[0],
+           sorted[RTR_TIMING_WINDOW - 2u],
+           sorted[RTR_TIMING_WINDOW - 1u],
+           variance);
+    fflush(stdout);
+    rtrTimingSampleCount = 0u;
+}
+
 static void rtrReportGpuTiming(void)
 {
     if (!(rtrTimingSupported && rtrTimingPending)) return;
@@ -198,12 +257,7 @@ static void rtrReportGpuTiming(void)
     }
 
     const double gpuMs = (double)ticks * (double)rtrTimestampPeriod / 1000000.0;
-    printf("frame %u gpu %.3f ms %ux%u\n",
-           rtrTimingFrameIndex,
-           gpuMs,
-           rtrSwapExtent.width,
-           rtrSwapExtent.height);
-    fflush(stdout);
+    rtrPushGpuTiming(gpuMs);
     rtrTimingPending = 0u;
 }
 
