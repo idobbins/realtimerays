@@ -43,9 +43,18 @@ rule run
   description = RUN $bin
   pool = console
 
+rule xpost
+  command = sh tools/xpost-macos.sh $bin
+  description = XPOST video
+  pool = console
+
 rule compdb
   command = ninja -t compdb cc objc > $out
   description = COMPDB $out
+
+rule clean
+  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace.comp.spv $build_dir/trace_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/macos.o $bin compile_commands.json
+  description = CLEAN
 
 build $build_dir/.dir: mkdir
 build $build_dir/trace.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
@@ -58,6 +67,8 @@ build compile_commands.json: compdb build.ninja
 
 build build: phony $bin
 build run: run $bin
+build xpost: xpost $bin
 build compile-commands: phony compile_commands.json
+build clean: clean
 
 default $bin
