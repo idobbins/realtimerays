@@ -13,21 +13,31 @@ const uint RTR_MOUSE_X_WORD = 5u;
 const uint RTR_TIME_WORD = 7u;
 const uint RTR_PREV_TIME_WORD = 8u;
 const uint RTR_PREV_MOUSE_X_WORD = 9u;
-const uint RTR_HISTORY_WORD = 16u;
+const uint RTR_BVH_NODE_OFFSET_WORD = 11u;
+const uint RTR_BVH_NODE_COUNT_WORD = 12u;
+const uint RTR_TRIANGLE_OFFSET_WORD = 13u;
+const uint RTR_TRIANGLE_COUNT_WORD = 14u;
+const uint RTR_HISTORY_OFFSET_WORD = 15u;
 const uint RTR_HISTORY_WORDS_PER_PIXEL = 20u;
+const uint RTR_BVH_NODE_WORDS = 8u;
+const uint RTR_TRIANGLE_WORDS = 24u;
+const uint RTR_BVH_STACK_SIZE = 64u;
 
 const float RTR_PI = 3.14159265359;
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.001;
-const float RTR_FOCAL = 1.55;
+const float RTR_FOCAL = 1.35;
 const float RTR_FEEDBACK_MIN = 0.80;
 const float RTR_FEEDBACK_MAX = 0.96;
 const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
 const uint RTR_RESTIR_MAX_SOURCE_M = 64u;
-const vec3 RTR_LIGHT_CENTER = vec3(0.05, 2.65, -1.25);
-const float RTR_LIGHT_RADIUS = 0.45;
-const float RTR_LIGHT_INV_RADIUS = 1.0 / RTR_LIGHT_RADIUS;
-const vec3 RTR_LIGHT_EMISSION = vec3(10.0, 8.0, 5.6);
+const int RTR_INDIRECT_SAMPLES = 1;
+const vec3 RTR_LIGHT_CENTER = vec3(0.0, 6.0, -2.8);
+const vec3 RTR_LIGHT_U = vec3(2.8, 0.0, 0.0);
+const vec3 RTR_LIGHT_V = vec3(0.0, 0.0, 2.0);
+const vec3 RTR_LIGHT_NORMAL = vec3(0.0, -1.0, 0.0);
+const float RTR_LIGHT_AREA = 5.6;
+const vec3 RTR_LIGHT_EMISSION = vec3(11.0, 8.6, 5.6);
 const float RTR_EMISSION_EPS2 = 0.0001;
 const float RTR_ALBEDO_EPS2 = 0.0064;
 
@@ -83,73 +93,81 @@ vec3 rtrSky(vec3 rd)
     return mix(vec3(0.55, 0.60, 0.66), vec3(0.08, 0.13, 0.20), h);
 }
 
-bool rtrSphere(vec3 ro, vec3 rd, vec3 c, float r, vec3 albedo, vec3 emission, inout RTRHit hit)
+vec3 rtrLoadVec3(uint word)
 {
-    vec3 oc = ro - c;
-    float b = dot(oc, rd);
-    float q = dot(oc, oc) - r * r;
-    float d = b * b - q;
-    if (d < 0.0) return false;
-
-    float s = sqrt(d);
-    float t = -b - s;
-    if (t < RTR_EPS) t = -b + s;
-    if (t < RTR_EPS || t >= hit.t) return false;
-
-    hit.t = t;
-    hit.n = normalize(ro + rd * t - c);
-    hit.albedo = albedo;
-    hit.emission = emission;
-    return true;
+    return uintBitsToFloat(uvec3(rtrMem[word], rtrMem[word + 1u], rtrMem[word + 2u]));
 }
 
-bool rtrPlane(vec3 ro, vec3 rd, vec3 n, float d, vec3 albedo, inout RTRHit hit)
+float rtrAabbNear(vec3 ro, vec3 invRd, vec3 bmin, vec3 bmax, float maxT)
 {
-    float denom = dot(rd, n);
-    if (abs(denom) < 0.00001) return false;
-
-    float t = -(dot(ro, n) + d) / denom;
-    if (t < RTR_EPS || t >= hit.t) return false;
-
-    vec3 p = ro + rd * t;
-    vec2 cell = floor(p.xz);
-    float check = mod(cell.x + cell.y, 2.0);
-
-    hit.t = t;
-    hit.n = n;
-    hit.albedo = albedo * mix(0.76, 1.0, check);
-    hit.emission = vec3(0.0);
-    return true;
-}
-
-bool rtrBox(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, vec3 albedo, inout RTRHit hit)
-{
-    vec3 invRd = 1.0 / rd;
     vec3 t0 = (bmin - ro) * invRd;
     vec3 t1 = (bmax - ro) * invRd;
     vec3 lo = min(t0, t1);
     vec3 hi = max(t0, t1);
     float nearT = max(max(lo.x, lo.y), lo.z);
     float farT = min(min(hi.x, hi.y), hi.z);
-    if (farT < max(nearT, RTR_EPS) || nearT >= hit.t) return false;
+    return (farT >= max(nearT, RTR_EPS) && nearT < maxT) ? max(nearT, 0.0) : RTR_INF;
+}
 
-    vec3 p = ro + rd * nearT;
-    vec3 da = abs(p - bmin);
-    vec3 db = abs(p - bmax);
-    vec3 n = vec3(0.0);
-    float m = min(min(min(da.x, db.x), min(da.y, db.y)), min(da.z, db.z));
-    if (m == da.x) n = vec3(-1.0, 0.0, 0.0);
-    else if (m == db.x) n = vec3(1.0, 0.0, 0.0);
-    else if (m == da.y) n = vec3(0.0, -1.0, 0.0);
-    else if (m == db.y) n = vec3(0.0, 1.0, 0.0);
-    else if (m == da.z) n = vec3(0.0, 0.0, -1.0);
-    else n = vec3(0.0, 0.0, 1.0);
+bool rtrTriangle(uint triIndex, vec3 ro, vec3 rd, inout RTRHit hit)
+{
+    uint base = rtrLoadU32(RTR_TRIANGLE_OFFSET_WORD) + triIndex * RTR_TRIANGLE_WORDS;
+    vec3 v0 = rtrLoadVec3(base);
+    vec3 e1 = rtrLoadVec3(base + 3u);
+    vec3 e2 = rtrLoadVec3(base + 6u);
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < 0.0000001) return false;
 
-    hit.t = nearT;
+    float invDet = 1.0 / det;
+    vec3 tvec = ro - v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = dot(e2, qvec) * invDet;
+    if (t < RTR_EPS || t >= hit.t) return false;
+
+    vec3 n0 = rtrLoadVec3(base + 9u);
+    vec3 n1 = rtrLoadVec3(base + 12u);
+    vec3 n2 = rtrLoadVec3(base + 15u);
+    vec3 n = normalize(n0 * (1.0 - u - v) + n1 * u + n2 * v);
+    if (dot(n, rd) > 0.0) n = -n;
+
+    hit.t = t;
     hit.n = n;
-    hit.albedo = albedo;
-    hit.emission = vec3(0.0);
+    hit.albedo = rtrLoadVec3(base + 18u);
+    hit.emission = rtrLoadVec3(base + 21u);
     return true;
+}
+
+bool rtrTriangleAny(uint triIndex, vec3 ro, vec3 rd, float maxT)
+{
+    uint base = rtrLoadU32(RTR_TRIANGLE_OFFSET_WORD) + triIndex * RTR_TRIANGLE_WORDS;
+    vec3 v0 = rtrLoadVec3(base);
+    vec3 e1 = rtrLoadVec3(base + 3u);
+    vec3 e2 = rtrLoadVec3(base + 6u);
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < 0.0000001) return false;
+
+    float invDet = 1.0 / det;
+    vec3 tvec = ro - v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    float t = dot(e2, qvec) * invDet;
+    if (t < RTR_EPS || t >= maxT) return false;
+
+    vec3 emission = rtrLoadVec3(base + 21u);
+    return dot(emission, emission) <= RTR_EMISSION_EPS2;
 }
 
 RTRHit rtrTrace(vec3 ro, vec3 rd)
@@ -160,13 +178,74 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
     hit.albedo = vec3(0.0);
     hit.emission = vec3(0.0);
 
-    rtrPlane(ro, rd, vec3(0.0, 1.0, 0.0), 1.0, vec3(0.58, 0.60, 0.54), hit);
-    rtrSphere(ro, rd, vec3(-1.15, 0.0, 0.0), 1.0, vec3(0.83, 0.22, 0.18), vec3(0.0), hit);
-    rtrSphere(ro, rd, vec3(1.18, -0.22, -0.45), 0.78, vec3(0.13, 0.48, 0.80), vec3(0.0), hit);
-    rtrSphere(ro, rd, RTR_LIGHT_CENTER, RTR_LIGHT_RADIUS, vec3(1.0), RTR_LIGHT_EMISSION, hit);
-    rtrBox(ro, rd, vec3(-0.36, -1.0, 1.10), vec3(0.62, 0.15, 1.92), vec3(0.88, 0.67, 0.28), hit);
+    uint nodeCount = rtrLoadU32(RTR_BVH_NODE_COUNT_WORD);
+    if (nodeCount == 0u || rtrLoadU32(RTR_TRIANGLE_COUNT_WORD) == 0u) return hit;
+
+    vec3 invRd = 1.0 / rd;
+    uint nodeOffset = rtrLoadU32(RTR_BVH_NODE_OFFSET_WORD);
+    uint stack[RTR_BVH_STACK_SIZE];
+    uint stackSize = 1u;
+    stack[0] = 0u;
+
+    while (stackSize > 0u) {
+        uint nodeIndex = stack[--stackSize];
+        if (nodeIndex >= nodeCount) continue;
+
+        uint nodeBase = nodeOffset + nodeIndex * RTR_BVH_NODE_WORDS;
+        vec3 bmin = rtrLoadVec3(nodeBase);
+        uint leftFirst = rtrMem[nodeBase + 3u];
+        vec3 bmax = rtrLoadVec3(nodeBase + 4u);
+        uint rightOrCount = rtrMem[nodeBase + 7u];
+        if (rtrAabbNear(ro, invRd, bmin, bmax, hit.t) == RTR_INF) continue;
+
+        if ((rightOrCount & 0x80000000u) != 0u) {
+            uint triCount = rightOrCount & 0x7fffffffu;
+            for (uint i = 0u; i < triCount; i++) {
+                rtrTriangle(leftFirst + i, ro, rd, hit);
+            }
+        } else if (stackSize + 2u <= RTR_BVH_STACK_SIZE) {
+            stack[stackSize++] = rightOrCount;
+            stack[stackSize++] = leftFirst;
+        }
+    }
 
     return hit;
+}
+
+bool rtrTraceAny(vec3 ro, vec3 rd, float maxT)
+{
+    uint nodeCount = rtrLoadU32(RTR_BVH_NODE_COUNT_WORD);
+    if (nodeCount == 0u || rtrLoadU32(RTR_TRIANGLE_COUNT_WORD) == 0u) return false;
+
+    vec3 invRd = 1.0 / rd;
+    uint nodeOffset = rtrLoadU32(RTR_BVH_NODE_OFFSET_WORD);
+    uint stack[RTR_BVH_STACK_SIZE];
+    uint stackSize = 1u;
+    stack[0] = 0u;
+
+    while (stackSize > 0u) {
+        uint nodeIndex = stack[--stackSize];
+        if (nodeIndex >= nodeCount) continue;
+
+        uint nodeBase = nodeOffset + nodeIndex * RTR_BVH_NODE_WORDS;
+        vec3 bmin = rtrLoadVec3(nodeBase);
+        uint leftFirst = rtrMem[nodeBase + 3u];
+        vec3 bmax = rtrLoadVec3(nodeBase + 4u);
+        uint rightOrCount = rtrMem[nodeBase + 7u];
+        if (rtrAabbNear(ro, invRd, bmin, bmax, maxT) == RTR_INF) continue;
+
+        if ((rightOrCount & 0x80000000u) != 0u) {
+            uint triCount = rightOrCount & 0x7fffffffu;
+            for (uint i = 0u; i < triCount; i++) {
+                if (rtrTriangleAny(leftFirst + i, ro, rd, maxT)) return true;
+            }
+        } else if (stackSize + 2u <= RTR_BVH_STACK_SIZE) {
+            stack[stackSize++] = rightOrCount;
+            stack[stackSize++] = leftFirst;
+        }
+    }
+
+    return false;
 }
 
 vec3 rtrTangent(vec3 n)
@@ -203,36 +282,31 @@ float rtrShadow(vec3 p, vec3 lightPos)
     float invDist = inversesqrt(dist2);
     float maxT = dist2 * invDist;
     vec3 rd = toLight * invDist;
-    RTRHit h = rtrTrace(p + rd * RTR_EPS * 2.0, rd);
-    if (h.t < maxT - 0.02 && !rtrHasEmission(h.emission)) return 0.0;
-    return 1.0;
+    return rtrTraceAny(p + rd * RTR_EPS * 2.0, rd, maxT - 0.02) ? 0.0 : 1.0;
 }
 
 float rtrLightPdfArea()
 {
-    return 1.0 / (4.0 * RTR_PI * RTR_LIGHT_RADIUS * RTR_LIGHT_RADIUS);
+    return 1.0 / RTR_LIGHT_AREA;
 }
 
 RTRLightSample rtrSampleLight(inout uint rng)
 {
-    float z = 1.0 - 2.0 * rtrRand(rng);
-    float a = 2.0 * RTR_PI * rtrRand(rng);
-    float r = sqrt(max(0.0, 1.0 - z * z));
-
     RTRLightSample lightSample;
-    lightSample.n = vec3(cos(a) * r, z, sin(a) * r);
-    lightSample.pos = RTR_LIGHT_CENTER + lightSample.n * RTR_LIGHT_RADIUS;
+    lightSample.n = RTR_LIGHT_NORMAL;
+    lightSample.pos = RTR_LIGHT_CENTER +
+        RTR_LIGHT_U * (rtrRand(rng) - 0.5) +
+        RTR_LIGHT_V * (rtrRand(rng) - 0.5);
     return lightSample;
 }
 
 vec3 rtrLightDensity(vec3 p, vec3 n, vec3 albedo, vec3 lightPos)
 {
-    vec3 lightN = (lightPos - RTR_LIGHT_CENTER) * RTR_LIGHT_INV_RADIUS;
     vec3 toLight = lightPos - p;
     float lightDist2 = max(dot(toLight, toLight), 0.001);
     vec3 l = toLight * inversesqrt(lightDist2);
     float surfaceCos = max(dot(n, l), 0.0);
-    float lightCos = max(dot(lightN, -l), 0.0);
+    float lightCos = max(dot(RTR_LIGHT_NORMAL, -l), 0.0);
     if (surfaceCos <= 0.0 || lightCos <= 0.0) return vec3(0.0);
 
     return albedo * RTR_LIGHT_EMISSION * (surfaceCos * lightCos / (RTR_PI * lightDist2));
@@ -349,9 +423,9 @@ vec3 rtrTonemap(vec3 color)
 void rtrCamera(float time, float mouseX, vec2 sz, out vec3 ro, out vec3 forward, out vec3 right, out vec3 up)
 {
     float mouseAngle = mouseX >= 0.0 ? (mouseX / max(sz.x, 1.0) - 0.5) * 3.2 : 0.0;
-    float angle = 0.35 + time * 0.08 + mouseAngle;
-    ro = vec3(sin(angle) * 4.1, 1.55, cos(angle) * 4.1);
-    vec3 target = vec3(0.0, -0.12, 0.1);
+    float angle = 0.42 + time * 0.035 + mouseAngle;
+    ro = vec3(sin(angle) * 9.4, 4.2, cos(angle) * 9.4);
+    vec3 target = vec3(0.0, 0.95, 0.0);
     forward = normalize(target - ro);
     right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
     up = cross(right, forward);
@@ -398,7 +472,8 @@ void main()
 
     uint pixel = uint(p.y) * uint(sz.x) + uint(p.x);
     uint pageWords = uint(sz.x) * uint(sz.y) * RTR_HISTORY_WORDS_PER_PIXEL;
-    uint historyBase = RTR_HISTORY_WORD + (frame & 1u) * pageWords + pixel * RTR_HISTORY_WORDS_PER_PIXEL;
+    uint historyOffset = rtrLoadU32(RTR_HISTORY_OFFSET_WORD);
+    uint historyBase = historyOffset + (frame & 1u) * pageWords + pixel * RTR_HISTORY_WORDS_PER_PIXEL;
     RTRReservoir reservoir = rtrReservoirEmpty();
     bool useHistory = false;
     vec3 historyColor = vec3(0.0);
@@ -429,7 +504,7 @@ void main()
                     if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, sz))) continue;
 
                     uint prevPixel = uint(c.y) * uint(sz.x) + uint(c.x);
-                    uint prevBase = RTR_HISTORY_WORD + ((frame ^ 1u) & 1u) * pageWords + prevPixel * RTR_HISTORY_WORDS_PER_PIXEL;
+                    uint prevBase = historyOffset + ((frame ^ 1u) & 1u) * pageWords + prevPixel * RTR_HISTORY_WORDS_PER_PIXEL;
                     if (rtrMem[prevBase + 9u] == 0u) continue;
 
                     vec3 prevPos = uintBitsToFloat(uvec3(rtrMem[prevBase + 3u], rtrMem[prevBase + 4u], rtrMem[prevBase + 5u]));
@@ -478,10 +553,10 @@ void main()
         color += rtrReservoirDirectLighting(reservoir, hitPos, primary.n, hitAlbedo);
 
         vec3 indirect = vec3(0.0);
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < RTR_INDIRECT_SAMPLES; i++) {
             indirect += rtrIndirectRadiance(primary, ro, rd, rng);
         }
-        color += indirect * 0.5;
+        color += indirect / float(RTR_INDIRECT_SAMPLES);
     }
 
     float currentLum = rtrLuminance(color);

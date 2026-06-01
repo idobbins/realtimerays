@@ -2,12 +2,14 @@ mod macos;
 mod vk;
 mod vulkan;
 
+use realtimerays::scene;
+
 fn main() {
-    let code = unsafe { real_main() };
+    let code = unsafe { entry() };
     std::process::exit(code);
 }
 
-unsafe fn real_main() -> i32 {
+unsafe fn entry() -> i32 {
     macos::rtrInitWindow(1280, 720, b"realtimerays\0".as_ptr().cast());
     if vulkan::init(macos::rtrWindowSurface()).is_err() {
         return 1;

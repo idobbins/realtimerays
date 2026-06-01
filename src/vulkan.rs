@@ -1,6 +1,7 @@
 #![allow(static_mut_refs)]
 
 use crate::macos;
+use crate::scene;
 use crate::vk::{self, VkResult};
 use std::ffi::{c_char, c_int, c_void};
 use std::mem::{size_of, size_of_val};
@@ -9,7 +10,7 @@ include!(concat!(env!("OUT_DIR"), "/trace_comp_spv.rs"));
 
 const RTR_MAX_SWAP_IMAGES: usize = 3;
 const RTR_TILE_SIZE: u32 = 8;
-const RTR_MEMORY_HEADER_WORDS: u64 = 16;
+const RTR_MEMORY_HEADER_WORDS: u64 = 32;
 const RTR_HISTORY_WORDS_PER_PIXEL: u64 = 20;
 const RTR_HISTORY_PAGE_COUNT: u64 = 2;
 const RTR_MEMORY_MAGIC: u32 = 0x30525452;
@@ -26,6 +27,11 @@ const RTR_MEMORY_TIME_WORD: usize = 7;
 const RTR_MEMORY_PREV_TIME_WORD: usize = 8;
 const RTR_MEMORY_PREV_MOUSE_X_WORD: usize = 9;
 const RTR_MEMORY_PREV_MOUSE_Y_WORD: usize = 10;
+const RTR_MEMORY_BVH_NODE_OFFSET_WORD: usize = 11;
+const RTR_MEMORY_BVH_NODE_COUNT_WORD: usize = 12;
+const RTR_MEMORY_TRIANGLE_OFFSET_WORD: usize = 13;
+const RTR_MEMORY_TRIANGLE_COUNT_WORD: usize = 14;
+const RTR_MEMORY_HISTORY_OFFSET_WORD: usize = 15;
 
 const CLOCK_MONOTONIC: c_int = 6;
 
@@ -193,11 +199,14 @@ unsafe fn find_memory_type(type_bits: u32, flags: vk::MemoryPropertyFlags) -> u3
 }
 
 unsafe fn create_memory_buffer() -> VkResult<()> {
+    let scene = scene::build_packed_scene();
+    let scene_words = scene.words.len() as u64;
     let history_words = u64::from(RTR_SWAP_EXTENT.width)
         * u64::from(RTR_SWAP_EXTENT.height)
         * RTR_HISTORY_WORDS_PER_PIXEL
         * RTR_HISTORY_PAGE_COUNT;
-    let memory_words = RTR_MEMORY_HEADER_WORDS + history_words;
+    let history_offset = RTR_MEMORY_HEADER_WORDS + scene_words;
+    let memory_words = history_offset + history_words;
     let memory_size = memory_words * size_of::<u32>() as u64;
 
     let buffer_info = vk::BufferCreateInfo {
@@ -241,6 +250,18 @@ unsafe fn create_memory_buffer() -> VkResult<()> {
     *RTR_MEMORY_WORDS.add(RTR_MEMORY_MOUSE_Y_WORD) = (-1.0f32).to_bits();
     *RTR_MEMORY_WORDS.add(RTR_MEMORY_PREV_MOUSE_X_WORD) = (-1.0f32).to_bits();
     *RTR_MEMORY_WORDS.add(RTR_MEMORY_PREV_MOUSE_Y_WORD) = (-1.0f32).to_bits();
+    *RTR_MEMORY_WORDS.add(RTR_MEMORY_BVH_NODE_OFFSET_WORD) = RTR_MEMORY_HEADER_WORDS as u32;
+    *RTR_MEMORY_WORDS.add(RTR_MEMORY_BVH_NODE_COUNT_WORD) = scene.node_count;
+    *RTR_MEMORY_WORDS.add(RTR_MEMORY_TRIANGLE_OFFSET_WORD) = (RTR_MEMORY_HEADER_WORDS
+        + scene.node_count as u64 * scene::RTR_BVH_NODE_WORDS as u64)
+        as u32;
+    *RTR_MEMORY_WORDS.add(RTR_MEMORY_TRIANGLE_COUNT_WORD) = scene.triangle_count;
+    *RTR_MEMORY_WORDS.add(RTR_MEMORY_HISTORY_OFFSET_WORD) = history_offset as u32;
+    std::ptr::copy_nonoverlapping(
+        scene.words.as_ptr(),
+        RTR_MEMORY_WORDS.add(RTR_MEMORY_HEADER_WORDS as usize),
+        scene.words.len(),
+    );
 
     Ok(())
 }
