@@ -15,7 +15,7 @@
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
-#define RTR_MEMORY_HEADER_WORDS 16u
+#define RTR_MEMORY_HEADER_WORDS 24u
 #define RTR_SCENE_SPHERE_COUNT 1000u
 #define RTR_SCENE_SPHERE_WORDS 8u
 #define RTR_SCENE_BVH_NODE_COUNT (RTR_SCENE_SPHERE_COUNT * 2u - 1u)
@@ -27,6 +27,7 @@
 #define RTR_TIMING_WINDOW 100u
 
 void rtrWindowMouse(float *x, float *y);
+void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius);
 void rtrScene(uint32_t *words);
 
 enum {
@@ -39,7 +40,20 @@ enum {
     RTR_MEMORY_MOUSE_Y_WORD = 6,
     RTR_MEMORY_TIME_WORD = 7,
     RTR_MEMORY_SPHERE_COUNT_WORD = 8,
+    RTR_MEMORY_CAMERA_AUTO_WORD = 16,
+    RTR_MEMORY_CAMERA_YAW_WORD = 17,
+    RTR_MEMORY_CAMERA_PITCH_WORD = 18,
+    RTR_MEMORY_CAMERA_RADIUS_WORD = 19,
 };
+
+enum {
+    RTR_CAMERA_AUTO_DEFAULT = 1u,
+};
+
+#define RTR_CAMERA_DEFAULT_YAW 0.35f
+#define RTR_CAMERA_DEFAULT_PITCH 0.473f
+#define RTR_CAMERA_DEFAULT_RADIUS 4.0f
+#define RTR_CAMERA_AUTO_SPEED 0.08f
 
 static const char *const rtrInstanceExts[] = {
     VK_KHR_SURFACE_EXTENSION_NAME,
@@ -179,17 +193,27 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 2u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 3u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(-1.0f);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_AUTO_WORD] = RTR_CAMERA_AUTO_DEFAULT;
+    rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
     rtrScene(rtrMemoryWords);
 
     return 0;
 }
 
-static void rtrUpdateMemoryWith(float time, float mouseX, float mouseY)
+static void rtrUpdateMemoryWith(float time,
+                                float mouseX,
+                                float mouseY,
+                                uint32_t autoOrbit,
+                                float cameraYaw,
+                                float cameraPitch,
+                                float cameraRadius)
 {
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
@@ -197,14 +221,28 @@ static void rtrUpdateMemoryWith(float time, float mouseX, float mouseY)
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(mouseX);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(mouseY);
     rtrMemoryWords[RTR_MEMORY_TIME_WORD] = rtrF32Word(time);
+    const float activeCameraYaw =
+        autoOrbit ? cameraYaw + time * RTR_CAMERA_AUTO_SPEED : cameraYaw;
+
+    rtrMemoryWords[RTR_MEMORY_CAMERA_AUTO_WORD] = autoOrbit;
+    rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(activeCameraYaw);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(cameraPitch);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(cameraRadius);
 }
 
 static void rtrUpdateMemory(void)
 {
     float mouseX = -1.0f;
     float mouseY = -1.0f;
+    uint32_t autoOrbit = RTR_CAMERA_AUTO_DEFAULT;
+    float cameraYaw = RTR_CAMERA_DEFAULT_YAW;
+    float cameraPitch = RTR_CAMERA_DEFAULT_PITCH;
+    float cameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
+
     rtrWindowMouse(&mouseX, &mouseY);
-    rtrUpdateMemoryWith(rtrElapsedSeconds(), mouseX, mouseY);
+    rtrWindowCamera(&autoOrbit, &cameraYaw, &cameraPitch, &cameraRadius);
+    rtrUpdateMemoryWith(rtrElapsedSeconds(), mouseX, mouseY,
+                        autoOrbit, cameraYaw, cameraPitch, cameraRadius);
 }
 
 static int rtrCreateTimingQueryPool(void)
@@ -883,7 +921,11 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
 
     VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (uint32_t frame = 0u; frame < frames; frame++) {
-        rtrUpdateMemoryWith((float)frame / (float)fps, -1.0f, -1.0f);
+        rtrUpdateMemoryWith((float)frame / (float)fps, -1.0f, -1.0f,
+                            RTR_CAMERA_AUTO_DEFAULT,
+                            RTR_CAMERA_DEFAULT_YAW,
+                            RTR_CAMERA_DEFAULT_PITCH,
+                            RTR_CAMERA_DEFAULT_RADIUS);
         vkResetCommandBuffer(rtrCommandBuffers[0], 0u);
         rtrRecordExportFrame(rtrCommandBuffers[0], rtrSwapImages[0],
                              rtrExportStagingBuffer, oldLayout);

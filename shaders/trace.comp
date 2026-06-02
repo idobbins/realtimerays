@@ -9,17 +9,22 @@ layout(std430, binding = 1) readonly buffer RTRMemory {
 };
 
 const uint RTR_MOUSE_X_WORD = 5u;
+const uint RTR_MOUSE_Y_WORD = 6u;
 const uint RTR_TIME_WORD = 7u;
 const uint RTR_SPHERE_COUNT_WORD = 8u;
 const uint RTR_BOUNDS_MIN_WORD = 9u;
 const uint RTR_BOUNDS_MAX_WORD = 12u;
 const uint RTR_BVH_NODE_COUNT_WORD = 15u;
+const uint RTR_CAMERA_AUTO_WORD = 16u;
+const uint RTR_CAMERA_YAW_WORD = 17u;
+const uint RTR_CAMERA_PITCH_WORD = 18u;
+const uint RTR_CAMERA_RADIUS_WORD = 19u;
 
 const uint RTR_MAX_SPHERES = 1000u;
 const uint RTR_MAX_BVH_NODES = RTR_MAX_SPHERES * 2u - 1u;
 const uint RTR_WORKGROUP_SIZE = 64u;
 
-const uint RTR_SPHERE_GEOM_WORD = 16u;
+const uint RTR_SPHERE_GEOM_WORD = 24u;
 const uint RTR_SPHERE_MAT_WORD = RTR_SPHERE_GEOM_WORD + RTR_MAX_SPHERES * 4u;
 const uint RTR_BVH_NODE_WORD = RTR_SPHERE_MAT_WORD + RTR_MAX_SPHERES * 4u;
 const uint RTR_BVH_NODE_WORDS = 8u;
@@ -32,9 +37,10 @@ const int RTR_BVH_STACK_SIZE = 64;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.001;
-const float RTR_FOCAL = 1.55;
+const float RTR_FOCAL = 1.35;
 const float RTR_BOUNCE_ENERGY = 0.52;
 const float RTR_PLANE_Y = -1.0;
+const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.92, 0.0);
 
 const int RTR_HIT_NONE = -1;
 const int RTR_HIT_PLANE = -2;
@@ -122,20 +128,24 @@ vec3 rtrSky(vec3 rd)
     return mix(vec3(0.58, 0.62, 0.68), vec3(0.10, 0.15, 0.22), h);
 }
 
-void rtrCamera(float time,
-               float mouseX,
+void rtrCamera(float cameraYaw,
+               float cameraPitch,
+               float cameraRadius,
                vec2 sz,
                out vec3 ro,
                out vec3 forward,
                out vec3 right,
                out vec3 up)
 {
-    float mouseAngle = mouseX >= 0.0 ? (mouseX / max(sz.x, 1.0) - 0.5) * 3.2 : 0.0;
-    float angle = 0.35 + time * 0.08 + mouseAngle;
-    ro = vec3(sin(angle) * 4.0, 2.05, cos(angle) * 4.0);
+    float angle = cameraYaw;
+    float pitch = clamp(cameraPitch, 0.08, 1.15);
+    float radius = max(cameraRadius, 1.0);
+    float horizontalRadius = cos(pitch) * radius;
+    ro = RTR_CAMERA_TARGET +
+         vec3(sin(angle) * horizontalRadius, sin(pitch) * radius,
+              cos(angle) * horizontalRadius);
 
-    vec3 target = vec3(0.0);
-    forward = normalize(target - ro);
+    forward = normalize(RTR_CAMERA_TARGET - ro);
     right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
     up = cross(right, forward);
 }
@@ -476,15 +486,16 @@ void main()
         shSphereCount = min(rtrLoadU32(RTR_SPHERE_COUNT_WORD), RTR_MAX_SPHERES);
         shBVHNodeCount = min(rtrLoadU32(RTR_BVH_NODE_COUNT_WORD), RTR_MAX_BVH_NODES);
 
-        float time = rtrLoadF32(RTR_TIME_WORD);
-        float mouseX = rtrLoadF32(RTR_MOUSE_X_WORD);
+        float cameraYaw = rtrLoadF32(RTR_CAMERA_YAW_WORD);
+        float cameraPitch = rtrLoadF32(RTR_CAMERA_PITCH_WORD);
+        float cameraRadius = rtrLoadF32(RTR_CAMERA_RADIUS_WORD);
 
         vec3 ro;
         vec3 forward;
         vec3 right;
         vec3 up;
 
-        rtrCamera(time, mouseX, szf, ro, forward, right, up);
+        rtrCamera(cameraYaw, cameraPitch, cameraRadius, szf, ro, forward, right, up);
 
         float invH = 1.0 / max(szf.y, 1.0);
 

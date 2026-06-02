@@ -1,12 +1,60 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <stdint.h>
+#include <math.h>
+
+#define RTR_CAMERA_DEFAULT_YAW 0.35f
+#define RTR_CAMERA_DEFAULT_PITCH 0.473f
+#define RTR_CAMERA_DEFAULT_RADIUS 4.0f
+#define RTR_CAMERA_MIN_PITCH 0.08f
+#define RTR_CAMERA_MAX_PITCH 1.15f
+#define RTR_CAMERA_MIN_RADIUS 1.2f
+#define RTR_CAMERA_MAX_RADIUS 9.0f
+#define RTR_CAMERA_AUTO_SPEED 0.08f
 
 static NSWindow *rtrWindowHandle = nil;
 static void *rtrSurfaceLayer = NULL;
 static uint32_t rtrShouldQuit = 0u;
 static float rtrMouseX = -1.0f;
 static float rtrMouseY = -1.0f;
+static float rtrCameraYaw = RTR_CAMERA_DEFAULT_YAW;
+static float rtrCameraPitch = RTR_CAMERA_DEFAULT_PITCH;
+static float rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
+static float rtrAutoYawBase = RTR_CAMERA_DEFAULT_YAW;
+static uint32_t rtrAutoOrbit = 1u;
+static uint32_t rtrMouseDragging = 0u;
+static double rtrWindowStartTime = 0.0;
+
+static float rtrClamp(float value, float lo, float hi)
+{
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+static float rtrAutoOrbitYaw(void)
+{
+    return rtrAutoYawBase +
+           (float)(CACurrentMediaTime() - rtrWindowStartTime) * RTR_CAMERA_AUTO_SPEED;
+}
+
+static void rtrEnterManualOrbit(void)
+{
+    if (!rtrAutoOrbit) return;
+
+    rtrCameraYaw = rtrAutoOrbitYaw();
+    rtrAutoOrbit = 0u;
+}
+
+static void rtrUpdateMouseFromEvent(NSEvent *event)
+{
+    NSView *view = [rtrWindowHandle contentView];
+    NSPoint p = [view convertPoint:[event locationInWindow] fromView:nil];
+    const CGFloat scale = [rtrWindowHandle backingScaleFactor];
+
+    rtrMouseX = (float)(p.x * scale);
+    rtrMouseY = (float)(([view bounds].size.height - p.y) * scale);
+}
 
 int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
 {
@@ -40,6 +88,15 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     [rtrWindowHandle makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     rtrShouldQuit = 0u;
+    rtrMouseX = -1.0f;
+    rtrMouseY = -1.0f;
+    rtrCameraYaw = RTR_CAMERA_DEFAULT_YAW;
+    rtrCameraPitch = RTR_CAMERA_DEFAULT_PITCH;
+    rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
+    rtrAutoYawBase = RTR_CAMERA_DEFAULT_YAW;
+    rtrAutoOrbit = 1u;
+    rtrMouseDragging = 0u;
+    rtrWindowStartTime = CACurrentMediaTime();
     return 0;
 }
 
@@ -59,6 +116,14 @@ void rtrWindowMouse(float *x, float *y)
     if (y) *y = rtrMouseY;
 }
 
+void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius)
+{
+    if (autoOrbit) *autoOrbit = rtrAutoOrbit;
+    if (yaw) *yaw = rtrAutoOrbit ? rtrAutoYawBase : rtrCameraYaw;
+    if (pitch) *pitch = rtrCameraPitch;
+    if (radius) *radius = rtrCameraRadius;
+}
+
 int rtrPumpEventsOnce(void)
 {
     @autoreleasepool {
@@ -73,6 +138,8 @@ int rtrPumpEventsOnce(void)
             const NSEventType type = [event type];
             const uint32_t rtrIsEscape =
                 (uint32_t)(type == NSEventTypeKeyDown && [event keyCode] == 53);
+            const uint32_t rtrIsSpace =
+                (uint32_t)(type == NSEventTypeKeyDown && [event keyCode] == 49);
             if (type == NSEventTypeMouseMoved ||
                 type == NSEventTypeLeftMouseDown ||
                 type == NSEventTypeLeftMouseUp ||
@@ -83,14 +150,47 @@ int rtrPumpEventsOnce(void)
                 type == NSEventTypeOtherMouseDown ||
                 type == NSEventTypeOtherMouseUp ||
                 type == NSEventTypeOtherMouseDragged) {
-                NSView *view = [rtrWindowHandle contentView];
-                NSPoint p = [view convertPoint:[event locationInWindow] fromView:nil];
-                const CGFloat scale = [rtrWindowHandle backingScaleFactor];
-                rtrMouseX = (float)(p.x * scale);
-                rtrMouseY = (float)(([view bounds].size.height - p.y) * scale);
+                const float oldMouseX = rtrMouseX;
+                const float oldMouseY = rtrMouseY;
+
+                rtrUpdateMouseFromEvent(event);
+
+                if (type == NSEventTypeLeftMouseDown) {
+                    rtrEnterManualOrbit();
+                    rtrMouseDragging = 1u;
+                } else if (type == NSEventTypeLeftMouseUp) {
+                    rtrMouseDragging = 0u;
+                } else if (type == NSEventTypeLeftMouseDragged && rtrMouseDragging &&
+                           oldMouseX >= 0.0f && oldMouseY >= 0.0f) {
+                    const float dx = rtrMouseX - oldMouseX;
+                    const float dy = rtrMouseY - oldMouseY;
+
+                    rtrCameraYaw += dx * 0.006f;
+                    rtrCameraPitch = rtrClamp(rtrCameraPitch - dy * 0.004f,
+                                              RTR_CAMERA_MIN_PITCH,
+                                              RTR_CAMERA_MAX_PITCH);
+                }
+            } else if (type == NSEventTypeScrollWheel) {
+                rtrEnterManualOrbit();
+
+                const float dy = (float)[event scrollingDeltaY];
+                rtrCameraRadius = rtrClamp(rtrCameraRadius * expf(-dy * 0.045f),
+                                           RTR_CAMERA_MIN_RADIUS,
+                                           RTR_CAMERA_MAX_RADIUS);
+            }
+
+            if (rtrIsSpace && ![event isARepeat]) {
+                if (rtrAutoOrbit) {
+                    rtrEnterManualOrbit();
+                } else {
+                    rtrAutoYawBase = rtrCameraYaw -
+                        (float)(CACurrentMediaTime() - rtrWindowStartTime) *
+                        RTR_CAMERA_AUTO_SPEED;
+                    rtrAutoOrbit = 1u;
+                }
             }
             rtrShouldQuit |= rtrIsEscape;
-            if (!rtrIsEscape) [NSApp sendEvent:event];
+            if (!(rtrIsEscape || rtrIsSpace)) [NSApp sendEvent:event];
         }
 
         rtrShouldQuit |= (uint32_t)(![rtrWindowHandle isVisible]);
