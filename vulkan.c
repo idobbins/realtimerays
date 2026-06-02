@@ -50,6 +50,27 @@ static const char *const rtrDeviceExts[] = {
     VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
 };
 
+enum {
+    RTR_DESCRIPTOR_IMAGE,
+    RTR_DESCRIPTOR_MEMORY,
+    RTR_DESCRIPTOR_COUNT,
+};
+
+static const VkDescriptorSetLayoutBinding rtrDescriptorBindings[RTR_DESCRIPTOR_COUNT] = {
+    {
+        .binding = RTR_DESCRIPTOR_IMAGE,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1u,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    },
+    {
+        .binding = RTR_DESCRIPTOR_MEMORY,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1u,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    },
+};
+
 static VkInstance rtrInstance = VK_NULL_HANDLE;
 static VkSurfaceKHR rtrSurface = VK_NULL_HANDLE;
 static VkPhysicalDevice rtrPhysicalDevice = VK_NULL_HANDLE;
@@ -72,7 +93,12 @@ static VkFence rtrInFlightFence = VK_NULL_HANDLE;
 static VkQueryPool rtrTimingQueryPool = VK_NULL_HANDLE;
 static VkBuffer rtrMemoryBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory rtrMemoryBufferMemory = VK_NULL_HANDLE;
+static VkDeviceMemory rtrExportImageMemory = VK_NULL_HANDLE;
+static VkBuffer rtrExportStagingBuffer = VK_NULL_HANDLE;
+static VkDeviceMemory rtrExportStagingMemory = VK_NULL_HANDLE;
+static VkDeviceSize rtrExportImageBytes = 0u;
 static uint32_t *rtrMemoryWords = NULL;
+static void *rtrExportStagingPixels = NULL;
 static uint32_t rtrFrameIndex = 0u;
 static uint32_t rtrTimingSupported = 0u;
 static uint32_t rtrTimingPending = 0u;
@@ -288,7 +314,9 @@ static void rtrReportGpuTiming(void)
 
 int rtrVulkanInit(void *windowSurface)
 {
+    const uint32_t windowed = (uint32_t)(windowSurface != NULL);
     clock_gettime(CLOCK_MONOTONIC, &rtrStartTime);
+    rtrFrameIndex = 0u;
 
     vkCreateInstance(&(VkInstanceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -306,10 +334,14 @@ int rtrVulkanInit(void *windowSurface)
         .ppEnabledExtensionNames = rtrInstanceExts,
     }, NULL, &rtrInstance);
 
-    vkCreateMetalSurfaceEXT(rtrInstance, &(VkMetalSurfaceCreateInfoEXT){
-        .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
-        .pLayer = windowSurface,
-    }, NULL, &rtrSurface);
+    if (windowed) {
+        vkCreateMetalSurfaceEXT(rtrInstance, &(VkMetalSurfaceCreateInfoEXT){
+            .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
+            .pLayer = windowSurface,
+        }, NULL, &rtrSurface);
+    } else if (rtrSwapExtent.width == 0u || rtrSwapExtent.height == 0u) {
+        return 1;
+    }
 
     uint32_t deviceCount = 1u;
     vkEnumeratePhysicalDevices(rtrInstance, &deviceCount, &rtrPhysicalDevice);
@@ -323,7 +355,8 @@ int rtrVulkanInit(void *windowSurface)
     rtrTimestampPeriod = deviceProps.limits.timestampPeriod;
     rtrTimestampValidBits = queueFamilyProps.timestampValidBits;
     rtrTimingSupported =
-        (uint32_t)(deviceProps.limits.timestampComputeAndGraphics &&
+        (uint32_t)(windowed &&
+                   deviceProps.limits.timestampComputeAndGraphics &&
                    rtrTimestampValidBits > 0u &&
                    rtrTimestampPeriod > 0.0f);
 
@@ -344,87 +377,124 @@ int rtrVulkanInit(void *windowSurface)
 
     vkGetDeviceQueue(rtrDevice, 0u, 0u, &rtrQueue);
 
-    VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(rtrPhysicalDevice, rtrSurface, &caps);
-    rtrSwapExtent = caps.currentExtent;
-    uint32_t swapchainMinImageCount = RTR_MAX_SWAP_IMAGES;
-    if (swapchainMinImageCount < caps.minImageCount) swapchainMinImageCount = caps.minImageCount;
-    if ((caps.maxImageCount != 0u) && (swapchainMinImageCount > caps.maxImageCount)) {
-        swapchainMinImageCount = caps.maxImageCount;
+    uint32_t imageCount = 1u;
+    VkFormat imageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    if (windowed) {
+        VkSurfaceCapabilitiesKHR caps;
+        vkGetPhysicalDeviceSurfaceCapabilitiesKHR(rtrPhysicalDevice, rtrSurface, &caps);
+        rtrSwapExtent = caps.currentExtent;
+        uint32_t swapchainMinImageCount = RTR_MAX_SWAP_IMAGES;
+        if (swapchainMinImageCount < caps.minImageCount) swapchainMinImageCount = caps.minImageCount;
+        if ((caps.maxImageCount != 0u) && (swapchainMinImageCount > caps.maxImageCount)) {
+            swapchainMinImageCount = caps.maxImageCount;
+        }
+
+        vkCreateSwapchainKHR(rtrDevice, &(VkSwapchainCreateInfoKHR){
+            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+            .surface = rtrSurface,
+            .minImageCount = swapchainMinImageCount,
+            .imageFormat = VK_FORMAT_B8G8R8A8_UNORM,
+            .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            .imageExtent = rtrSwapExtent,
+            .imageArrayLayers = 1u,
+            .imageUsage = VK_IMAGE_USAGE_STORAGE_BIT,
+            .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .preTransform = caps.currentTransform,
+            .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+            .presentMode = VK_PRESENT_MODE_FIFO_KHR,
+            .clipped = VK_TRUE,
+        }, NULL, &rtrSwapchain);
+
+        vkGetSwapchainImagesKHR(rtrDevice, rtrSwapchain, &imageCount, NULL);
+        if ((imageCount < 2u) || (imageCount > RTR_MAX_SWAP_IMAGES)) return 1;
+        vkGetSwapchainImagesKHR(rtrDevice, rtrSwapchain, &imageCount, rtrSwapImages);
+        imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    } else {
+        rtrExportImageBytes =
+            (VkDeviceSize)rtrSwapExtent.width *
+            (VkDeviceSize)rtrSwapExtent.height *
+            (VkDeviceSize)4u;
+
+        vkCreateImage(rtrDevice, &(VkImageCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = imageFormat,
+            .extent = {rtrSwapExtent.width, rtrSwapExtent.height, 1u},
+            .mipLevels = 1u,
+            .arrayLayers = 1u,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        }, NULL, &rtrSwapImages[0]);
+
+        VkMemoryRequirements imageReq;
+        vkGetImageMemoryRequirements(rtrDevice, rtrSwapImages[0], &imageReq);
+        uint32_t imageMemoryType = rtrFindMemoryType(
+            imageReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkAllocateMemory(rtrDevice, &(VkMemoryAllocateInfo){
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = imageReq.size,
+            .memoryTypeIndex = imageMemoryType,
+        }, NULL, &rtrExportImageMemory);
+        vkBindImageMemory(rtrDevice, rtrSwapImages[0], rtrExportImageMemory, 0u);
+
+        vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = rtrExportImageBytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        }, NULL, &rtrExportStagingBuffer);
+
+        VkMemoryRequirements stagingReq;
+        vkGetBufferMemoryRequirements(rtrDevice, rtrExportStagingBuffer, &stagingReq);
+        uint32_t stagingMemoryType = rtrFindMemoryType(
+            stagingReq.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(rtrDevice, &(VkMemoryAllocateInfo){
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = stagingReq.size,
+            .memoryTypeIndex = stagingMemoryType,
+        }, NULL, &rtrExportStagingMemory);
+        vkBindBufferMemory(rtrDevice, rtrExportStagingBuffer, rtrExportStagingMemory, 0u);
+        vkMapMemory(rtrDevice, rtrExportStagingMemory, 0u, rtrExportImageBytes, 0u,
+                    &rtrExportStagingPixels);
     }
-
-    vkCreateSwapchainKHR(rtrDevice, &(VkSwapchainCreateInfoKHR){
-        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface = rtrSurface,
-        .minImageCount = swapchainMinImageCount,
-        .imageFormat = VK_FORMAT_B8G8R8A8_UNORM,
-        .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-        .imageExtent = rtrSwapExtent,
-        .imageArrayLayers = 1u,
-        .imageUsage = VK_IMAGE_USAGE_STORAGE_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .preTransform = caps.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode = VK_PRESENT_MODE_FIFO_KHR,
-        .clipped = VK_TRUE,
-    }, NULL, &rtrSwapchain);
-
-    uint32_t swapImageCount = 0u;
-    vkGetSwapchainImagesKHR(rtrDevice, rtrSwapchain, &swapImageCount, NULL);
-    if ((swapImageCount < 2u) || (swapImageCount > RTR_MAX_SWAP_IMAGES)) return 1;
-    vkGetSwapchainImagesKHR(rtrDevice, rtrSwapchain, &swapImageCount, rtrSwapImages);
 
     if (rtrCreateMemoryBuffer()) return 1;
     if (rtrCreateTimingQueryPool()) return 1;
 
-    const VkDescriptorSetLayoutBinding bindings[] = {
-        {
-            .binding = 0u,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .descriptorCount = 1u,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        },
-        {
-            .binding = 1u,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1u,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        },
-    };
-
     vkCreateDescriptorSetLayout(rtrDevice, &(VkDescriptorSetLayoutCreateInfo){
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2u,
-        .pBindings = bindings,
+        .bindingCount = RTR_DESCRIPTOR_COUNT,
+        .pBindings = rtrDescriptorBindings,
     }, NULL, &rtrDescriptorSetLayout);
 
-    const VkDescriptorPoolSize poolSizes[] = {
-        {
-            .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .descriptorCount = RTR_MAX_SWAP_IMAGES,
-        },
-        {
-            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = RTR_MAX_SWAP_IMAGES,
-        },
-    };
+    VkDescriptorPoolSize poolSizes[RTR_DESCRIPTOR_COUNT];
+    for (uint32_t binding = 0u; binding < RTR_DESCRIPTOR_COUNT; binding++) {
+        poolSizes[binding] = (VkDescriptorPoolSize){
+            .type = rtrDescriptorBindings[binding].descriptorType,
+            .descriptorCount = imageCount,
+        };
+    }
 
     vkCreateDescriptorPool(rtrDevice, &(VkDescriptorPoolCreateInfo){
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = RTR_MAX_SWAP_IMAGES,
-        .poolSizeCount = 2u,
+        .maxSets = imageCount,
+        .poolSizeCount = RTR_DESCRIPTOR_COUNT,
         .pPoolSizes = poolSizes,
     }, NULL, &rtrDescriptorPool);
 
-    VkDescriptorSetLayout setLayouts[RTR_MAX_SWAP_IMAGES] = {
-        rtrDescriptorSetLayout,
-        rtrDescriptorSetLayout,
-        rtrDescriptorSetLayout,
-    };
+    VkDescriptorSetLayout setLayouts[RTR_MAX_SWAP_IMAGES];
+    for (uint32_t i = 0u; i < imageCount; i++) {
+        setLayouts[i] = rtrDescriptorSetLayout;
+    }
+
     vkAllocateDescriptorSets(rtrDevice, &(VkDescriptorSetAllocateInfo){
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = rtrDescriptorPool,
-        .descriptorSetCount = RTR_MAX_SWAP_IMAGES,
+        .descriptorSetCount = imageCount,
         .pSetLayouts = setLayouts,
     }, rtrDescriptorSets);
 
@@ -457,6 +527,7 @@ int rtrVulkanInit(void *windowSurface)
 
     vkCreateCommandPool(rtrDevice, &(VkCommandPoolCreateInfo){
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = windowed ? 0u : VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = 0u,
     }, NULL, &rtrCommandPool);
 
@@ -464,7 +535,7 @@ int rtrVulkanInit(void *windowSurface)
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = rtrCommandPool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = swapImageCount,
+        .commandBufferCount = imageCount,
     }, rtrCommandBuffers);
 
     VkImageSubresourceRange imageRange = {
@@ -473,13 +544,13 @@ int rtrVulkanInit(void *windowSurface)
         .layerCount = 1u,
     };
 
-    for (uint32_t i = 0u; i < swapImageCount; i++)
+    for (uint32_t i = 0u; i < imageCount; i++)
     {
         vkCreateImageView(rtrDevice, &(VkImageViewCreateInfo){
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = rtrSwapImages[i],
             .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = VK_FORMAT_B8G8R8A8_UNORM,
+            .format = imageFormat,
             .subresourceRange = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                 .levelCount = 1u,
@@ -487,32 +558,30 @@ int rtrVulkanInit(void *windowSurface)
             },
         }, NULL, &rtrSwapImageViews[i]);
 
-        const VkWriteDescriptorSet writes[] = {
-            {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = rtrDescriptorSets[i],
-                .dstBinding = 0u,
-                .descriptorCount = 1u,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo = &(VkDescriptorImageInfo){
-                    .imageView = rtrSwapImageViews[i],
-                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                },
-            },
-            {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = rtrDescriptorSets[i],
-                .dstBinding = 1u,
-                .descriptorCount = 1u,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &(VkDescriptorBufferInfo){
-                    .buffer = rtrMemoryBuffer,
-                    .offset = 0u,
-                    .range = VK_WHOLE_SIZE,
-                },
-            },
+        const VkDescriptorImageInfo imageInfo = {
+            .imageView = rtrSwapImageViews[i],
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
-        vkUpdateDescriptorSets(rtrDevice, 2u, writes, 0u, NULL);
+        const VkDescriptorBufferInfo bufferInfo = {
+            .buffer = rtrMemoryBuffer,
+            .offset = 0u,
+            .range = VK_WHOLE_SIZE,
+        };
+        VkWriteDescriptorSet writes[RTR_DESCRIPTOR_COUNT];
+        for (uint32_t binding = 0u; binding < RTR_DESCRIPTOR_COUNT; binding++) {
+            writes[binding] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = rtrDescriptorSets[i],
+                .dstBinding = rtrDescriptorBindings[binding].binding,
+                .descriptorCount = 1u,
+                .descriptorType = rtrDescriptorBindings[binding].descriptorType,
+            };
+        }
+        writes[RTR_DESCRIPTOR_IMAGE].pImageInfo = &imageInfo;
+        writes[RTR_DESCRIPTOR_MEMORY].pBufferInfo = &bufferInfo;
+        vkUpdateDescriptorSets(rtrDevice, RTR_DESCRIPTOR_COUNT, writes, 0u, NULL);
+
+        if (!windowed) continue;
 
         vkBeginCommandBuffer(rtrCommandBuffers[i], &(VkCommandBufferBeginInfo){
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -588,18 +657,24 @@ int rtrVulkanInit(void *windowSurface)
         vkEndCommandBuffer(rtrCommandBuffers[i]);
     }
 
-    vkCreateSemaphore(rtrDevice, &(VkSemaphoreCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-    }, NULL, &rtrImageAvailableSemaphore);
+    if (windowed) {
+        vkCreateSemaphore(rtrDevice, &(VkSemaphoreCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        }, NULL, &rtrImageAvailableSemaphore);
 
-    vkCreateSemaphore(rtrDevice, &(VkSemaphoreCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-    }, NULL, &rtrRenderFinishedSemaphore);
+        vkCreateSemaphore(rtrDevice, &(VkSemaphoreCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        }, NULL, &rtrRenderFinishedSemaphore);
 
-    vkCreateFence(rtrDevice, &(VkFenceCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-    }, NULL, &rtrInFlightFence);
+        vkCreateFence(rtrDevice, &(VkFenceCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+        }, NULL, &rtrInFlightFence);
+    } else {
+        vkCreateFence(rtrDevice, &(VkFenceCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        }, NULL, &rtrInFlightFence);
+    }
 
     return 0;
 }
@@ -735,239 +810,26 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
 
 int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t frames, uint32_t fps)
 {
-    clock_gettime(CLOCK_MONOTONIC, &rtrStartTime);
     rtrSwapExtent = (VkExtent2D){width, height};
-    rtrFrameIndex = 0u;
-
-    vkCreateInstance(&(VkInstanceCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .flags = rtrInstanceFlags,
-        .pApplicationInfo = &(VkApplicationInfo){
-            .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            .pApplicationName = "realtimerays",
-            .applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
-            .pEngineName = "realtimerays",
-            .engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
-            .apiVersion = VK_API_VERSION_1_3,
-        },
-        .enabledExtensionCount =
-            (uint32_t)(sizeof(rtrInstanceExts) / sizeof(*rtrInstanceExts)),
-        .ppEnabledExtensionNames = rtrInstanceExts,
-    }, NULL, &rtrInstance);
-
-    uint32_t deviceCount = 1u;
-    vkEnumeratePhysicalDevices(rtrInstance, &deviceCount, &rtrPhysicalDevice);
-
-    float priority = 1.0f;
-    vkCreateDevice(rtrPhysicalDevice, &(VkDeviceCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1u,
-        .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            .queueFamilyIndex = 0u,
-            .queueCount = 1u,
-            .pQueuePriorities = &priority,
-        },
-        .enabledExtensionCount =
-            (uint32_t)(sizeof(rtrDeviceExts) / sizeof(*rtrDeviceExts)),
-        .ppEnabledExtensionNames = rtrDeviceExts,
-    }, NULL, &rtrDevice);
-
-    vkGetDeviceQueue(rtrDevice, 0u, 0u, &rtrQueue);
-    rtrCreateMemoryBuffer();
-
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory imageMemory = VK_NULL_HANDLE;
-    VkImageView imageView = VK_NULL_HANDLE;
-    const VkDeviceSize imageBytes =
-        (VkDeviceSize)width * (VkDeviceSize)height * (VkDeviceSize)4u;
-
-    vkCreateImage(rtrDevice, &(VkImageCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .extent = {width, height, 1u},
-        .mipLevels = 1u,
-        .arrayLayers = 1u,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    }, NULL, &image);
-
-    VkMemoryRequirements imageReq;
-    vkGetImageMemoryRequirements(rtrDevice, image, &imageReq);
-    uint32_t imageMemoryType = rtrFindMemoryType(
-        imageReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vkAllocateMemory(rtrDevice, &(VkMemoryAllocateInfo){
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = imageReq.size,
-        .memoryTypeIndex = imageMemoryType,
-    }, NULL, &imageMemory);
-    vkBindImageMemory(rtrDevice, image, imageMemory, 0u);
-
-    vkCreateImageView(rtrDevice, &(VkImageViewCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1u,
-            .layerCount = 1u,
-        },
-    }, NULL, &imageView);
-
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    void *stagingPixels = NULL;
-    vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = imageBytes,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    }, NULL, &stagingBuffer);
-
-    VkMemoryRequirements stagingReq;
-    vkGetBufferMemoryRequirements(rtrDevice, stagingBuffer, &stagingReq);
-    uint32_t stagingMemoryType = rtrFindMemoryType(
-        stagingReq.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(rtrDevice, &(VkMemoryAllocateInfo){
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = stagingReq.size,
-        .memoryTypeIndex = stagingMemoryType,
-    }, NULL, &stagingMemory);
-    vkBindBufferMemory(rtrDevice, stagingBuffer, stagingMemory, 0u);
-    vkMapMemory(rtrDevice, stagingMemory, 0u, imageBytes, 0u, &stagingPixels);
-
-    const VkDescriptorSetLayoutBinding bindings[] = {
-        {
-            .binding = 0u,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .descriptorCount = 1u,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        },
-        {
-            .binding = 1u,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1u,
-            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        },
-    };
-
-    vkCreateDescriptorSetLayout(rtrDevice, &(VkDescriptorSetLayoutCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2u,
-        .pBindings = bindings,
-    }, NULL, &rtrDescriptorSetLayout);
-
-    const VkDescriptorPoolSize poolSizes[] = {
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1u},
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1u},
-    };
-    vkCreateDescriptorPool(rtrDevice, &(VkDescriptorPoolCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 1u,
-        .poolSizeCount = 2u,
-        .pPoolSizes = poolSizes,
-    }, NULL, &rtrDescriptorPool);
-
-    vkAllocateDescriptorSets(rtrDevice, &(VkDescriptorSetAllocateInfo){
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = rtrDescriptorPool,
-        .descriptorSetCount = 1u,
-        .pSetLayouts = &rtrDescriptorSetLayout,
-    }, rtrDescriptorSets);
-
-    const VkWriteDescriptorSet writes[] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = rtrDescriptorSets[0],
-            .dstBinding = 0u,
-            .descriptorCount = 1u,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo = &(VkDescriptorImageInfo){
-                .imageView = imageView,
-                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            },
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = rtrDescriptorSets[0],
-            .dstBinding = 1u,
-            .descriptorCount = 1u,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &(VkDescriptorBufferInfo){
-                .buffer = rtrMemoryBuffer,
-                .offset = 0u,
-                .range = VK_WHOLE_SIZE,
-            },
-        },
-    };
-    vkUpdateDescriptorSets(rtrDevice, 2u, writes, 0u, NULL);
-
-    vkCreatePipelineLayout(rtrDevice, &(VkPipelineLayoutCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1u,
-        .pSetLayouts = &rtrDescriptorSetLayout,
-    }, NULL, &rtrPipelineLayout);
-
-    VkShaderModule shaderModule = VK_NULL_HANDLE;
-    vkCreateShaderModule(rtrDevice, &(VkShaderModuleCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = traceCompSpv_len,
-        .pCode = (const uint32_t *)(const void *)traceCompSpv,
-    }, NULL, &shaderModule);
-
-    vkCreateComputePipelines(rtrDevice, VK_NULL_HANDLE, 1u,
-                             &(VkComputePipelineCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shaderModule,
-            .pName = "main",
-        },
-        .layout = rtrPipelineLayout,
-        .basePipelineIndex = -1,
-    }, NULL, &rtrPipeline);
-
-    vkCreateCommandPool(rtrDevice, &(VkCommandPoolCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex = 0u,
-    }, NULL, &rtrCommandPool);
-
-    vkAllocateCommandBuffers(rtrDevice, &(VkCommandBufferAllocateInfo){
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = rtrCommandPool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1u,
-    }, rtrCommandBuffers);
-
-    VkFence fence = VK_NULL_HANDLE;
-    vkCreateFence(rtrDevice, &(VkFenceCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-    }, NULL, &fence);
+    if (rtrVulkanInit(NULL)) return 1;
 
     VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (uint32_t frame = 0u; frame < frames; frame++) {
         rtrUpdateMemoryWith((float)frame / (float)fps, -1.0f, -1.0f);
         vkResetCommandBuffer(rtrCommandBuffers[0], 0u);
-        rtrRecordExportFrame(rtrCommandBuffers[0], image, stagingBuffer, oldLayout);
+        rtrRecordExportFrame(rtrCommandBuffers[0], rtrSwapImages[0],
+                             rtrExportStagingBuffer, oldLayout);
         oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
         vkQueueSubmit(rtrQueue, 1u, &(VkSubmitInfo){
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .commandBufferCount = 1u,
             .pCommandBuffers = &rtrCommandBuffers[0],
-        }, fence);
-        vkWaitForFences(rtrDevice, 1u, &fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(rtrDevice, 1u, &fence);
+        }, rtrInFlightFence);
+        vkWaitForFences(rtrDevice, 1u, &rtrInFlightFence, VK_TRUE, UINT64_MAX);
+        vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
 
-        fwrite(stagingPixels, 1u, (size_t)imageBytes, out);
+        fwrite(rtrExportStagingPixels, 1u, (size_t)rtrExportImageBytes, out);
         rtrFrameIndex++;
     }
 

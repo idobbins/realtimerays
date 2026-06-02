@@ -15,6 +15,17 @@ const uint RTR_PREV_TIME_WORD = 8u;
 const uint RTR_PREV_MOUSE_X_WORD = 9u;
 const uint RTR_HISTORY_WORD = 16u;
 const uint RTR_HISTORY_WORDS_PER_PIXEL = 20u;
+const uint RTR_HISTORY_COLOR_WORD = 0u;
+const uint RTR_HISTORY_POS_WORD = 3u;
+const uint RTR_HISTORY_NORMAL_WORD = 6u;
+const uint RTR_HISTORY_HIT_WORD = 9u;
+const uint RTR_HISTORY_LEN_WORD = 10u;
+const uint RTR_HISTORY_MOMENT2_WORD = 11u;
+const uint RTR_HISTORY_ALBEDO_WORD = 12u;
+const uint RTR_HISTORY_LIGHT_POS_WORD = 15u;
+const uint RTR_HISTORY_LIGHT_W_WORD = 18u;
+const uint RTR_HISTORY_LIGHT_M_WORD = 19u;
+const int RTR_HISTORY_VEC3_FIELD_COUNT = 5;
 
 const float RTR_PI = 3.14159265359;
 const float RTR_INF = 1.0e20;
@@ -309,15 +320,15 @@ void rtrReservoirAddInitialCandidates(inout RTRReservoir reservoir, vec3 p, vec3
 
 void rtrReservoirCombineStored(inout RTRReservoir reservoir, uint base, vec3 p, vec3 n, vec3 albedo, inout uint rng)
 {
-    uint sourceM = min(rtrMem[base + 19u], RTR_RESTIR_MAX_SOURCE_M);
+    uint sourceM = min(rtrMem[base + RTR_HISTORY_LIGHT_M_WORD], RTR_RESTIR_MAX_SOURCE_M);
     if (sourceM == 0u) return;
 
-    float sourceW = uintBitsToFloat(rtrMem[base + 18u]);
+    float sourceW = uintBitsToFloat(rtrMem[base + RTR_HISTORY_LIGHT_W_WORD]);
     if (sourceW <= 0.0) return;
 
-    vec3 sourceLightPos = uintBitsToFloat(uvec3(rtrMem[base + 15u],
-                                                rtrMem[base + 16u],
-                                                rtrMem[base + 17u]));
+    vec3 sourceLightPos = uintBitsToFloat(uvec3(rtrMem[base + RTR_HISTORY_LIGHT_POS_WORD],
+                                                rtrMem[base + RTR_HISTORY_LIGHT_POS_WORD + 1u],
+                                                rtrMem[base + RTR_HISTORY_LIGHT_POS_WORD + 2u]));
     vec3 density = rtrLightDensity(p, n, albedo, sourceLightPos);
     float target = rtrLuminance(density);
     rtrReservoirUpdate(reservoir, sourceLightPos, target * sourceW * float(sourceM), sourceM, rng);
@@ -453,11 +464,17 @@ void main()
 
                     uint prevPixel = uint(c.y) * uint(sz.x) + uint(c.x);
                     uint prevBase = RTR_HISTORY_WORD + ((frame ^ 1u) & 1u) * pageWords + prevPixel * RTR_HISTORY_WORDS_PER_PIXEL;
-                    if (rtrMem[prevBase + 9u] == 0u) continue;
+                    if (rtrMem[prevBase + RTR_HISTORY_HIT_WORD] == 0u) continue;
 
-                    vec3 prevPos = uintBitsToFloat(uvec3(rtrMem[prevBase + 3u], rtrMem[prevBase + 4u], rtrMem[prevBase + 5u]));
-                    vec3 prevN = uintBitsToFloat(uvec3(rtrMem[prevBase + 6u], rtrMem[prevBase + 7u], rtrMem[prevBase + 8u]));
-                    vec3 prevAlbedo = uintBitsToFloat(uvec3(rtrMem[prevBase + 12u], rtrMem[prevBase + 13u], rtrMem[prevBase + 14u]));
+                    vec3 prevPos = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_POS_WORD],
+                                                         rtrMem[prevBase + RTR_HISTORY_POS_WORD + 1u],
+                                                         rtrMem[prevBase + RTR_HISTORY_POS_WORD + 2u]));
+                    vec3 prevN = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD],
+                                                       rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 1u],
+                                                       rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 2u]));
+                    vec3 prevAlbedo = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD],
+                                                            rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 1u],
+                                                            rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 2u]));
                     float planeDelta = abs(dot(hitPos - prevPos, primary.n));
                     float maxPlaneDelta = max(0.025, primary.t * 0.012);
                     vec3 albedoDelta = prevAlbedo - hitAlbedo;
@@ -471,9 +488,11 @@ void main()
 
                     vec2 d = vec2(c) - q;
                     float w = 1.0 / (1.0 + 2.0 * dot(d, d));
-                    vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase], rtrMem[prevBase + 1u], rtrMem[prevBase + 2u]));
-                    float prevLen = uintBitsToFloat(rtrMem[prevBase + 10u]);
-                    float prevM2 = uintBitsToFloat(rtrMem[prevBase + 11u]);
+                    vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_COLOR_WORD],
+                                                           rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 1u],
+                                                           rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 2u]));
+                    float prevLen = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_LEN_WORD]);
+                    float prevM2 = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_MOMENT2_WORD]);
                     colorSum += prevColor * w;
                     lenSum += prevLen * w;
                     moment2Sum += prevM2 * w;
@@ -537,26 +556,30 @@ void main()
     uvec3 packedN = floatBitsToUint(hit ? primary.n : vec3(0.0));
     uvec3 packedAlbedo = floatBitsToUint(hitAlbedo);
     uvec3 packedLightPos = floatBitsToUint(reservoir.valid ? reservoir.lightPos : vec3(0.0));
-    rtrMem[historyBase] = packedColor.x;
-    rtrMem[historyBase + 1u] = packedColor.y;
-    rtrMem[historyBase + 2u] = packedColor.z;
-    rtrMem[historyBase + 3u] = packedPos.x;
-    rtrMem[historyBase + 4u] = packedPos.y;
-    rtrMem[historyBase + 5u] = packedPos.z;
-    rtrMem[historyBase + 6u] = packedN.x;
-    rtrMem[historyBase + 7u] = packedN.y;
-    rtrMem[historyBase + 8u] = packedN.z;
-    rtrMem[historyBase + 9u] = hit ? 1u : 0u;
-    rtrMem[historyBase + 10u] = floatBitsToUint(historyLen);
-    rtrMem[historyBase + 11u] = floatBitsToUint(moment2);
-    rtrMem[historyBase + 12u] = packedAlbedo.x;
-    rtrMem[historyBase + 13u] = packedAlbedo.y;
-    rtrMem[historyBase + 14u] = packedAlbedo.z;
-    rtrMem[historyBase + 15u] = packedLightPos.x;
-    rtrMem[historyBase + 16u] = packedLightPos.y;
-    rtrMem[historyBase + 17u] = packedLightPos.z;
-    rtrMem[historyBase + 18u] = floatBitsToUint(reservoir.valid ? reservoir.W : 0.0);
-    rtrMem[historyBase + 19u] = reservoir.valid ? reservoir.M : 0u;
+    uvec3 packedHistoryVecs[RTR_HISTORY_VEC3_FIELD_COUNT] = uvec3[](
+        packedColor,
+        packedPos,
+        packedN,
+        packedAlbedo,
+        packedLightPos);
+    const uint historyVecWords[RTR_HISTORY_VEC3_FIELD_COUNT] = uint[](
+        RTR_HISTORY_COLOR_WORD,
+        RTR_HISTORY_POS_WORD,
+        RTR_HISTORY_NORMAL_WORD,
+        RTR_HISTORY_ALBEDO_WORD,
+        RTR_HISTORY_LIGHT_POS_WORD);
+    for (int field = 0; field < RTR_HISTORY_VEC3_FIELD_COUNT; field++) {
+        uint dst = historyBase + historyVecWords[field];
+        uvec3 value = packedHistoryVecs[field];
+        rtrMem[dst] = value.x;
+        rtrMem[dst + 1u] = value.y;
+        rtrMem[dst + 2u] = value.z;
+    }
+    rtrMem[historyBase + RTR_HISTORY_HIT_WORD] = hit ? 1u : 0u;
+    rtrMem[historyBase + RTR_HISTORY_LEN_WORD] = floatBitsToUint(historyLen);
+    rtrMem[historyBase + RTR_HISTORY_MOMENT2_WORD] = floatBitsToUint(moment2);
+    rtrMem[historyBase + RTR_HISTORY_LIGHT_W_WORD] = floatBitsToUint(reservoir.valid ? reservoir.W : 0.0);
+    rtrMem[historyBase + RTR_HISTORY_LIGHT_M_WORD] = reservoir.valid ? reservoir.M : 0u;
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }
