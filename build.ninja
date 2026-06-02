@@ -65,10 +65,10 @@ build $build_dir/macos.o: objc macos.m || $build_dir/.dir
 build $bin: link $build_dir/main.o $build_dir/vulkan.o $build_dir/macos.o
 build compile_commands.json: compdb build.ninja
 
-build build: phony $bin
-build run: run $bin
+build build: phony $bin compile_commands.json
+build run: run $bin || compile_commands.json
 build xpost: xpost $bin
 build compile-commands: phony compile_commands.json
 build clean: clean
 
-default $bin
+default run
