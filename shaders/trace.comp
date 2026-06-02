@@ -26,9 +26,14 @@ const uint RTR_BVH_NODE_WORDS = 8u;
 const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
 const int RTR_BVH_STACK_SIZE = 64;
 
+#ifndef RTR_RAY_BOUNCES
+#define RTR_RAY_BOUNCES 3
+#endif
+
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.001;
 const float RTR_FOCAL = 1.55;
+const float RTR_BOUNCE_ENERGY = 0.52;
 const float RTR_PLANE_Y = -1.0;
 
 const int RTR_HIT_NONE = -1;
@@ -352,16 +357,14 @@ float rtrShadow(vec3 p, vec3 n, vec3 l, float maxT, int skipId)
     return 1.0;
 }
 
-vec3 rtrShade(RTRHit hit, vec3 ro, vec3 rd)
+void rtrSurface(RTRHit hit,
+                vec3 p,
+                vec3 rd,
+                out vec3 n,
+                out vec3 albedo,
+                out int skipId)
 {
-    if (hit.id == RTR_HIT_NONE)
-        return rtrSky(rd);
-
-    vec3 p = ro + rd * hit.t;
-
-    vec3 n;
-    vec3 albedo;
-    int skipId = RTR_HIT_NONE;
+    skipId = RTR_HIT_NONE;
 
     if (hit.id == RTR_HIT_PLANE) {
         n = vec3(0.0, 1.0, 0.0);
@@ -380,7 +383,15 @@ vec3 rtrShade(RTRHit hit, vec3 ro, vec3 rd)
         skipId = hit.id;
     }
 
-    vec3 toLight = RTR_LIGHT_POS - p;
+    if (dot(n, rd) > 0.0)
+        n = -n;
+}
+
+vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, int skipId)
+{
+    vec3 offsetP = p + n * (RTR_EPS * 4.0);
+
+    vec3 toLight = RTR_LIGHT_POS - offsetP;
     float lightDist2 = max(dot(toLight, toLight), 0.001);
     float invLightDist = inversesqrt(lightDist2);
     vec3 l = toLight * invLightDist;
@@ -389,13 +400,64 @@ vec3 rtrShade(RTRHit hit, vec3 ro, vec3 rd)
     float shadow = 0.0;
     if (ndl > 0.0) {
         float lightDist = lightDist2 * invLightDist;
-        shadow = rtrShadow(p, n, l, lightDist, skipId);
+        shadow = rtrShadow(offsetP, n, l, lightDist, skipId);
     }
 
     vec3 direct = albedo * RTR_LIGHT_COLOR * (ndl * shadow / lightDist2);
     vec3 ambient = albedo * 0.035;
 
     return direct + ambient;
+}
+
+float rtrHash13(vec3 p)
+{
+    p = fract(p * vec3(0.1031, 0.11369, 0.13787));
+    p += dot(p, p.yzx + 19.19);
+    return fract((p.x + p.y) * p.z);
+}
+
+vec3 rtrBounceDirection(vec3 n, vec3 rd, vec3 p, int bounce)
+{
+    vec3 reflected = reflect(rd, n);
+    vec3 helper = abs(n.y) < 0.97 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(helper, n));
+    vec3 bitangent = cross(n, tangent);
+    float angle = rtrHash13(p + vec3(float(bounce) * 17.0, 3.1, 11.7)) * 6.2831853;
+    vec3 diffuse = normalize(n + 0.72 * (cos(angle) * tangent + sin(angle) * bitangent));
+
+    return normalize(mix(diffuse, reflected, 0.34));
+}
+
+vec3 rtrRadiance(vec3 ro, vec3 rd)
+{
+    vec3 color = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (int bounce = 0; bounce < RTR_RAY_BOUNCES; bounce++) {
+        RTRHit hit = rtrTrace(ro, rd);
+
+        if (hit.id == RTR_HIT_NONE) {
+            color += throughput * rtrSky(rd);
+            break;
+        }
+
+        vec3 p = ro + rd * hit.t;
+        vec3 n;
+        vec3 albedo;
+        int skipId;
+
+        rtrSurface(hit, p, rd, n, albedo, skipId);
+        color += throughput * rtrDirectLight(p, n, albedo, skipId);
+
+        throughput *= albedo * RTR_BOUNCE_ENERGY;
+        if (max(max(throughput.x, throughput.y), throughput.z) < 0.01)
+            break;
+
+        ro = p + n * (RTR_EPS * 8.0);
+        rd = rtrBounceDirection(n, rd, p, bounce);
+    }
+
+    return color;
 }
 
 vec3 rtrTonemap(vec3 color)
@@ -444,8 +506,7 @@ void main()
     vec3 ray = shRayBase + shRayDx * float(p.x) + shRayDy * float(p.y);
     vec3 rd = ray * inversesqrt(dot(ray, ray));
 
-    RTRHit hit = rtrTrace(shRo, rd);
-    vec3 color = rtrShade(hit, shRo, rd);
+    vec3 color = rtrRadiance(shRo, rd);
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }
