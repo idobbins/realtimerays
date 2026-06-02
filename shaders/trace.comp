@@ -13,12 +13,18 @@ const uint RTR_TIME_WORD = 7u;
 const uint RTR_SPHERE_COUNT_WORD = 8u;
 const uint RTR_BOUNDS_MIN_WORD = 9u;
 const uint RTR_BOUNDS_MAX_WORD = 12u;
+const uint RTR_BVH_NODE_COUNT_WORD = 15u;
 
-const uint RTR_MAX_SPHERES = 100u;
+const uint RTR_MAX_SPHERES = 1000u;
+const uint RTR_MAX_BVH_NODES = RTR_MAX_SPHERES * 2u - 1u;
 const uint RTR_WORKGROUP_SIZE = 64u;
 
 const uint RTR_SPHERE_GEOM_WORD = 16u;
 const uint RTR_SPHERE_MAT_WORD = RTR_SPHERE_GEOM_WORD + RTR_MAX_SPHERES * 4u;
+const uint RTR_BVH_NODE_WORD = RTR_SPHERE_MAT_WORD + RTR_MAX_SPHERES * 4u;
+const uint RTR_BVH_NODE_WORDS = 8u;
+const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
+const int RTR_BVH_STACK_SIZE = 64;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.001;
@@ -31,8 +37,8 @@ const int RTR_HIT_PLANE = -2;
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
 
-shared vec4 shSphereGeom[100];
 shared uint shSphereCount;
+shared uint shBVHNodeCount;
 
 shared vec3 shRo;
 shared vec3 shBoundsMin;
@@ -85,6 +91,26 @@ vec4 rtrLoadSphereMat(uint i)
     return rtrLoadVec4(RTR_SPHERE_MAT_WORD + i * 4u);
 }
 
+vec3 rtrLoadBVHMin(uint i)
+{
+    return rtrLoadVec3(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS);
+}
+
+uint rtrLoadBVHLeftFirst(uint i)
+{
+    return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 3u);
+}
+
+vec3 rtrLoadBVHMax(uint i)
+{
+    return rtrLoadVec3(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 4u);
+}
+
+uint rtrLoadBVHCountRight(uint i)
+{
+    return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 7u);
+}
+
 vec3 rtrSky(vec3 rd)
 {
     float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
@@ -109,23 +135,33 @@ void rtrCamera(float time,
     up = cross(right, forward);
 }
 
-bool rtrBoxHit(vec3 ro, vec3 rd, float maxT)
+bool rtrBoxHitBounds(vec3 ro,
+                     vec3 invRd,
+                     vec3 boundsMin,
+                     vec3 boundsMax,
+                     float maxT,
+                     out float nearT)
 {
-    vec3 invRd = 1.0 / rd;
-    vec3 t0 = (shBoundsMin - ro) * invRd;
-    vec3 t1 = (shBoundsMax - ro) * invRd;
+    vec3 t0 = (boundsMin - ro) * invRd;
+    vec3 t1 = (boundsMax - ro) * invRd;
     vec3 lo = min(t0, t1);
     vec3 hi = max(t0, t1);
 
-    float nearT = max(max(lo.x, lo.y), max(lo.z, RTR_EPS));
+    nearT = max(max(lo.x, lo.y), max(lo.z, RTR_EPS));
     float farT = min(min(hi.x, hi.y), min(hi.z, maxT));
 
     return nearT <= farT;
 }
 
+bool rtrSceneBoxHit(vec3 ro, vec3 invRd, float maxT)
+{
+    float nearT;
+    return rtrBoxHitBounds(ro, invRd, shBoundsMin, shBoundsMax, maxT, nearT);
+}
+
 void rtrTraceSphere(vec3 ro, vec3 rd, uint i, inout float bestT, inout int bestId)
 {
-    vec4 s = shSphereGeom[int(i)];
+    vec4 s = rtrLoadSphereGeom(i);
 
     vec3 oc = ro - s.xyz;
     float r = s.w;
@@ -151,11 +187,30 @@ void rtrTraceSphere(vec3 ro, vec3 rd, uint i, inout float bestT, inout int bestI
     }
 }
 
+bool rtrSphereOccludes(vec3 ro, vec3 l, float maxT, uint i)
+{
+    vec4 s = rtrLoadSphereGeom(i);
+    vec3 oc = ro - s.xyz;
+    float r = s.w;
+
+    float b = dot(oc, l);
+    float centerT = -b;
+
+    if (centerT + r < RTR_EPS || centerT - r > maxT)
+        return false;
+
+    float t = clamp(centerT, RTR_EPS, maxT);
+    float dist2 = dot(oc, oc) + t * (2.0 * b + t);
+
+    return dist2 <= r * r;
+}
+
 RTRHit rtrTrace(vec3 ro, vec3 rd)
 {
     RTRHit hit;
     hit.t = RTR_INF;
     hit.id = RTR_HIT_NONE;
+    vec3 invRd = 1.0 / rd;
 
     if (rd.y < -0.00001) {
         float t = (RTR_PLANE_Y - ro.y) / rd.y;
@@ -165,11 +220,61 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
         }
     }
 
-    if (!rtrBoxHit(ro, rd, hit.t))
+    if (shBVHNodeCount == 0u || !rtrSceneBoxHit(ro, invRd, hit.t))
         return hit;
 
-    for (uint i = 0u; i < shSphereCount; ++i) {
-        rtrTraceSphere(ro, rd, i, hit.t, hit.id);
+    uint stack[RTR_BVH_STACK_SIZE];
+    int stackCount = 0;
+    uint nodeIndex = 0u;
+
+    for (;;) {
+        uint leftFirst = rtrLoadBVHLeftFirst(nodeIndex);
+        uint countRight = rtrLoadBVHCountRight(nodeIndex);
+
+        if ((countRight & RTR_BVH_INTERNAL_FLAG) != 0u) {
+            uint left = leftFirst;
+            uint right = countRight & ~RTR_BVH_INTERNAL_FLAG;
+
+            float leftNear = RTR_INF;
+            float rightNear = RTR_INF;
+            bool leftHit = left < shBVHNodeCount &&
+                rtrBoxHitBounds(ro, invRd, rtrLoadBVHMin(left), rtrLoadBVHMax(left),
+                                hit.t, leftNear);
+            bool rightHit = right < shBVHNodeCount &&
+                rtrBoxHitBounds(ro, invRd, rtrLoadBVHMin(right), rtrLoadBVHMax(right),
+                                hit.t, rightNear);
+
+            if (leftHit && rightHit) {
+                if (leftNear <= rightNear) {
+                    if (stackCount < RTR_BVH_STACK_SIZE) stack[stackCount++] = right;
+                    nodeIndex = left;
+                } else {
+                    if (stackCount < RTR_BVH_STACK_SIZE) stack[stackCount++] = left;
+                    nodeIndex = right;
+                }
+                continue;
+            }
+
+            if (leftHit) {
+                nodeIndex = left;
+                continue;
+            }
+
+            if (rightHit) {
+                nodeIndex = right;
+                continue;
+            }
+        } else {
+            for (uint i = 0u; i < countRight; i++) {
+                uint sphereId = leftFirst + i;
+                if (sphereId < shSphereCount)
+                    rtrTraceSphere(ro, rd, sphereId, hit.t, hit.id);
+            }
+        }
+
+        if (stackCount == 0)
+            break;
+        nodeIndex = stack[--stackCount];
     }
 
     return hit;
@@ -183,28 +288,65 @@ float rtrShadow(vec3 p, vec3 n, vec3 l, float maxT, int skipId)
     if (maxT <= RTR_EPS)
         return 1.0;
 
-    if (!rtrBoxHit(ro, l, maxT))
+    vec3 invL = 1.0 / l;
+
+    if (shBVHNodeCount == 0u || !rtrSceneBoxHit(ro, invL, maxT))
         return 1.0;
 
-    for (uint i = 0u; i < shSphereCount; ++i) {
-        if (int(i) == skipId)
-            continue;
+    uint stack[RTR_BVH_STACK_SIZE];
+    int stackCount = 0;
+    uint nodeIndex = 0u;
 
-        vec4 s = shSphereGeom[int(i)];
-        vec3 oc = ro - s.xyz;
-        float r = s.w;
+    for (;;) {
+        uint leftFirst = rtrLoadBVHLeftFirst(nodeIndex);
+        uint countRight = rtrLoadBVHCountRight(nodeIndex);
 
-        float b = dot(oc, l);
-        float centerT = -b;
+        if ((countRight & RTR_BVH_INTERNAL_FLAG) != 0u) {
+            uint left = leftFirst;
+            uint right = countRight & ~RTR_BVH_INTERNAL_FLAG;
 
-        if (centerT + r < RTR_EPS || centerT - r > maxT)
-            continue;
+            float leftNear = RTR_INF;
+            float rightNear = RTR_INF;
+            bool leftHit = left < shBVHNodeCount &&
+                rtrBoxHitBounds(ro, invL, rtrLoadBVHMin(left), rtrLoadBVHMax(left),
+                                maxT, leftNear);
+            bool rightHit = right < shBVHNodeCount &&
+                rtrBoxHitBounds(ro, invL, rtrLoadBVHMin(right), rtrLoadBVHMax(right),
+                                maxT, rightNear);
 
-        float t = clamp(centerT, RTR_EPS, maxT);
-        float dist2 = dot(oc, oc) + t * (2.0 * b + t);
+            if (leftHit && rightHit) {
+                if (leftNear <= rightNear) {
+                    if (stackCount < RTR_BVH_STACK_SIZE) stack[stackCount++] = right;
+                    nodeIndex = left;
+                } else {
+                    if (stackCount < RTR_BVH_STACK_SIZE) stack[stackCount++] = left;
+                    nodeIndex = right;
+                }
+                continue;
+            }
 
-        if (dist2 <= r * r)
-            return 0.0;
+            if (leftHit) {
+                nodeIndex = left;
+                continue;
+            }
+
+            if (rightHit) {
+                nodeIndex = right;
+                continue;
+            }
+        } else {
+            for (uint i = 0u; i < countRight; i++) {
+                uint sphereId = leftFirst + i;
+                if (sphereId < shSphereCount && int(sphereId) != skipId &&
+                    rtrSphereOccludes(ro, l, maxT, sphereId)) {
+                    return 0.0;
+                }
+            }
+        }
+
+        if (stackCount == 0)
+            break;
+        nodeIndex = stack[--stackCount];
     }
 
     return 1.0;
@@ -230,7 +372,7 @@ vec3 rtrShade(RTRHit hit, vec3 ro, vec3 rd)
         albedo = vec3(0.52, 0.54, 0.49) * mix(0.78, 1.0, check);
     } else {
         uint id = uint(hit.id);
-        vec4 g = shSphereGeom[int(id)];
+        vec4 g = rtrLoadSphereGeom(id);
         vec4 m = rtrLoadSphereMat(id);
 
         n = (p - g.xyz) * m.w;
@@ -270,6 +412,7 @@ void main()
 
     if (gl_LocalInvocationIndex == 0u) {
         shSphereCount = min(rtrLoadU32(RTR_SPHERE_COUNT_WORD), RTR_MAX_SPHERES);
+        shBVHNodeCount = min(rtrLoadU32(RTR_BVH_NODE_COUNT_WORD), RTR_MAX_BVH_NODES);
 
         float time = rtrLoadF32(RTR_TIME_WORD);
         float mouseX = rtrLoadF32(RTR_MOUSE_X_WORD);
@@ -291,12 +434,6 @@ void main()
                     up * ((szf.y - 1.0) * invH);
         shRayDx = right * (2.0 * invH);
         shRayDy = up * (-2.0 * invH);
-    }
-
-    barrier();
-
-    for (uint i = gl_LocalInvocationIndex; i < shSphereCount; i += RTR_WORKGROUP_SIZE) {
-        shSphereGeom[int(i)] = rtrLoadSphereGeom(i);
     }
 
     barrier();

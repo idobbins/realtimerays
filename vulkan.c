@@ -16,9 +16,13 @@
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
 #define RTR_MEMORY_HEADER_WORDS 16u
-#define RTR_SCENE_SPHERE_COUNT 100u
+#define RTR_SCENE_SPHERE_COUNT 1000u
 #define RTR_SCENE_SPHERE_WORDS 8u
-#define RTR_SCENE_WORDS (RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS)
+#define RTR_SCENE_BVH_NODE_COUNT (RTR_SCENE_SPHERE_COUNT * 2u - 1u)
+#define RTR_SCENE_BVH_NODE_WORDS 8u
+#define RTR_SCENE_WORDS \
+    (RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS + \
+     RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS)
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
@@ -110,6 +114,7 @@ static uint32_t rtrTimingSampleCount = 0u;
 static uint32_t rtrTimestampValidBits = 0u;
 static float rtrTimestampPeriod = 1.0f;
 static double rtrTimingSamples[RTR_TIMING_WINDOW];
+static FILE *rtrTimingOut = NULL;
 static struct timespec rtrStartTime;
 
 static uint32_t rtrF32Word(float value)
@@ -174,7 +179,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 1u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 2u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
@@ -230,6 +235,84 @@ static void rtrSortTimingSamples(double *samples, uint32_t count)
     }
 }
 
+static uint32_t rtrTimingPercentileIndex(uint32_t count, uint32_t percentile)
+{
+    uint32_t rank = (count * percentile) / 100u;
+    if (rank == 0u) rank = 1u;
+    if (rank > count) rank = count;
+    return rank - 1u;
+}
+
+static void rtrReportGpuTimingWindow(uint32_t count)
+{
+    if (count == 0u) return;
+
+    double sorted[RTR_TIMING_WINDOW];
+    double sum = 0.0;
+    for (uint32_t i = 0u; i < count; i++) {
+        sorted[i] = rtrTimingSamples[i];
+        sum += rtrTimingSamples[i];
+    }
+
+    rtrSortTimingSamples(sorted, count);
+
+    const double avg = sum / (double)count;
+    const double median = (count & 1u) ?
+        sorted[count / 2u] :
+        (sorted[count / 2u - 1u] + sorted[count / 2u]) * 0.5;
+    const double p01 = sorted[rtrTimingPercentileIndex(count, 1u)];
+    const double p95 = sorted[rtrTimingPercentileIndex(count, 95u)];
+    const double p99 = sorted[rtrTimingPercentileIndex(count, 99u)];
+
+    double variance = 0.0;
+    for (uint32_t i = 0u; i < count; i++) {
+        const double delta = rtrTimingSamples[i] - avg;
+        variance += delta * delta;
+    }
+    variance /= (double)count;
+    const double stddev = sqrt(variance);
+    const double cvPercent = avg > 0.0 ? (stddev / avg) * 100.0 : 0.0;
+
+    double jitterStddev = 0.0;
+    if (count > 1u) {
+        double jitterSum = 0.0;
+        for (uint32_t i = 1u; i < count; i++) {
+            jitterSum += rtrTimingSamples[i] - rtrTimingSamples[i - 1u];
+        }
+
+        const uint32_t jitterCount = count - 1u;
+        const double jitterAvg = jitterSum / (double)jitterCount;
+        double jitterVariance = 0.0;
+        for (uint32_t i = 1u; i < count; i++) {
+            const double delta =
+                (rtrTimingSamples[i] - rtrTimingSamples[i - 1u]) - jitterAvg;
+            jitterVariance += delta * delta;
+        }
+        jitterVariance /= (double)jitterCount;
+        jitterStddev = sqrt(jitterVariance);
+    }
+
+    FILE *out = rtrTimingOut ? rtrTimingOut : stdout;
+    fprintf(out,
+            "gpu[%u] frames %u-%u %ux%u avg %.3f ms med %.3f ms min %.3f p01 %.3f p95 %.3f p99 %.3f max %.3f stddev %.3f ms cv %.1f%% jitter %.3f ms\n",
+            count,
+            rtrTimingWindowFirstFrame,
+            rtrTimingFrameIndex,
+            rtrSwapExtent.width,
+            rtrSwapExtent.height,
+            avg,
+            median,
+            sorted[0],
+            p01,
+            p95,
+            p99,
+            sorted[count - 1u],
+            stddev,
+            cvPercent,
+            jitterStddev);
+    fflush(out);
+}
+
 static void rtrPushGpuTiming(double gpuMs)
 {
     if (rtrTimingSampleCount == 0u) {
@@ -239,61 +322,15 @@ static void rtrPushGpuTiming(double gpuMs)
     rtrTimingSamples[rtrTimingSampleCount++] = gpuMs;
     if (rtrTimingSampleCount < RTR_TIMING_WINDOW) return;
 
-    double sorted[RTR_TIMING_WINDOW];
-    double sum = 0.0;
-    for (uint32_t i = 0u; i < RTR_TIMING_WINDOW; i++) {
-        sorted[i] = rtrTimingSamples[i];
-        sum += rtrTimingSamples[i];
-    }
+    rtrReportGpuTimingWindow(rtrTimingSampleCount);
+    rtrTimingSampleCount = 0u;
+}
 
-    rtrSortTimingSamples(sorted, RTR_TIMING_WINDOW);
+static void rtrFlushGpuTiming(void)
+{
+    if (rtrTimingSampleCount == 0u) return;
 
-    const double avg = sum / (double)RTR_TIMING_WINDOW;
-    const double median =
-        (sorted[RTR_TIMING_WINDOW / 2u - 1u] + sorted[RTR_TIMING_WINDOW / 2u]) * 0.5;
-    const double p95 = sorted[(RTR_TIMING_WINDOW * 95u) / 100u - 1u];
-
-    double variance = 0.0;
-    for (uint32_t i = 0u; i < RTR_TIMING_WINDOW; i++) {
-        const double delta = rtrTimingSamples[i] - avg;
-        variance += delta * delta;
-    }
-    variance /= (double)RTR_TIMING_WINDOW;
-    const double stddev = sqrt(variance);
-    const double cvPercent = avg > 0.0 ? (stddev / avg) * 100.0 : 0.0;
-
-    double jitterSum = 0.0;
-    for (uint32_t i = 1u; i < RTR_TIMING_WINDOW; i++) {
-        jitterSum += rtrTimingSamples[i] - rtrTimingSamples[i - 1u];
-    }
-
-    const uint32_t jitterCount = RTR_TIMING_WINDOW - 1u;
-    const double jitterAvg = jitterSum / (double)jitterCount;
-    double jitterVariance = 0.0;
-    for (uint32_t i = 1u; i < RTR_TIMING_WINDOW; i++) {
-        const double delta = (rtrTimingSamples[i] - rtrTimingSamples[i - 1u]) - jitterAvg;
-        jitterVariance += delta * delta;
-    }
-    jitterVariance /= (double)jitterCount;
-    const double jitterStddev = sqrt(jitterVariance);
-
-    printf("gpu[%u] frames %u-%u %ux%u avg %.3f ms med %.3f ms min %.3f p01 %.3f p95 %.3f p99 %.3f max %.3f stddev %.3f ms cv %.1f%% jitter %.3f ms\n",
-           RTR_TIMING_WINDOW,
-           rtrTimingWindowFirstFrame,
-           rtrTimingFrameIndex,
-           rtrSwapExtent.width,
-           rtrSwapExtent.height,
-           avg,
-           median,
-           sorted[0],
-           sorted[0],
-           p95,
-           sorted[RTR_TIMING_WINDOW - 2u],
-           sorted[RTR_TIMING_WINDOW - 1u],
-           stddev,
-           cvPercent,
-           jitterStddev);
-    fflush(stdout);
+    rtrReportGpuTimingWindow(rtrTimingSampleCount);
     rtrTimingSampleCount = 0u;
 }
 
@@ -328,6 +365,7 @@ static void rtrReportGpuTiming(void)
 int rtrVulkanInit(void *windowSurface)
 {
     const uint32_t windowed = (uint32_t)(windowSurface != NULL);
+    rtrTimingOut = windowed ? stdout : stderr;
     clock_gettime(CLOCK_MONOTONIC, &rtrStartTime);
     rtrFrameIndex = 0u;
 
@@ -368,8 +406,7 @@ int rtrVulkanInit(void *windowSurface)
     rtrTimestampPeriod = deviceProps.limits.timestampPeriod;
     rtrTimestampValidBits = queueFamilyProps.timestampValidBits;
     rtrTimingSupported =
-        (uint32_t)(windowed &&
-                   deviceProps.limits.timestampComputeAndGraphics &&
+        (uint32_t)(deviceProps.limits.timestampComputeAndGraphics &&
                    rtrTimestampValidBits > 0u &&
                    rtrTimestampPeriod > 0.0f);
 
@@ -747,6 +784,10 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     });
 
+    if (rtrTimingSupported) {
+        vkCmdResetQueryPool(commandBuffer, rtrTimingQueryPool, 0u, 2u);
+    }
+
     vkCmdPipelineBarrier(commandBuffer,
                          oldLayout == VK_IMAGE_LAYOUT_UNDEFINED ?
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT :
@@ -763,6 +804,13 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
         .image = image,
         .subresourceRange = imageRange,
     });
+
+    if (rtrTimingSupported) {
+        vkCmdWriteTimestamp(commandBuffer,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            rtrTimingQueryPool,
+                            0u);
+    }
 
     vkCmdPipelineBarrier(commandBuffer,
                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -785,6 +833,13 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
                   (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE,
                   (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE,
                   1u);
+
+    if (rtrTimingSupported) {
+        vkCmdWriteTimestamp(commandBuffer,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            rtrTimingQueryPool,
+                            1u);
+    }
 
     vkCmdPipelineBarrier(commandBuffer,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -839,12 +894,20 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
             .commandBufferCount = 1u,
             .pCommandBuffers = &rtrCommandBuffers[0],
         }, rtrInFlightFence);
+        if (rtrTimingSupported) {
+            rtrTimingPending = 1u;
+            rtrTimingImageIndex = 0u;
+            rtrTimingFrameIndex = frame;
+        }
         vkWaitForFences(rtrDevice, 1u, &rtrInFlightFence, VK_TRUE, UINT64_MAX);
+        rtrReportGpuTiming();
         vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
 
         fwrite(rtrExportStagingPixels, 1u, (size_t)rtrExportImageBytes, out);
         rtrFrameIndex++;
     }
+
+    rtrFlushGpuTiming();
 
     return 0;
 }
