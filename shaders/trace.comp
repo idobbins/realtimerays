@@ -33,6 +33,10 @@ const float RTR_EPS = 0.001;
 const float RTR_FOCAL = 1.55;
 const float RTR_FEEDBACK_MIN = 0.80;
 const float RTR_FEEDBACK_MAX = 0.96;
+const float RTR_HISTORY_MOTION_TIGHTEN_PX = 4.0;
+const float RTR_HISTORY_MOTION_REFRESH_PX = 8.0;
+const float RTR_HISTORY_MOTION_REJECT_PX = 48.0;
+const float RTR_HISTORY_MOTION_FEEDBACK = 0.45;
 const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
 const uint RTR_RESTIR_MAX_SOURCE_M = 64u;
 const uint RTR_SPARSE_RATE = 4u;
@@ -440,6 +444,7 @@ void main()
     vec3 historyColor = vec3(0.0);
     float prevHistoryLen = 0.0;
     float prevMoment2 = 0.0;
+    float historyMotionPx = 0.0;
     uint tile = (uint(p.x) >> 3u) ^ ((uint(p.y) >> 3u) * 1664525u);
     bool refreshSlot = ((rtrHash(tile) + frame) & (RTR_SPARSE_RATE - 1u)) == 0u;
 
@@ -451,65 +456,75 @@ void main()
 
         vec2 q;
         if (rtrReproject(hitPos, prevRo, prevForward, prevRight, prevUp, szf, q)) {
-            ivec2 q0 = ivec2(round(q));
-            vec3 colorSum = vec3(0.0);
-            float lenSum = 0.0;
-            float moment2Sum = 0.0;
-            float weightSum = 0.0;
+            historyMotionPx = length(vec2(p) - q);
+            if (historyMotionPx < RTR_HISTORY_MOTION_REJECT_PX) {
+                ivec2 q0 = ivec2(round(q));
+                vec3 colorSum = vec3(0.0);
+                float lenSum = 0.0;
+                float moment2Sum = 0.0;
+                float weightSum = 0.0;
+                bool tightHistorySearch = historyMotionPx > RTR_HISTORY_MOTION_TIGHTEN_PX;
 
-            for (int y = -1; y <= 1; y++) {
-                for (int x = -1; x <= 1; x++) {
-                    ivec2 c = q0 + ivec2(x, y);
-                    if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, sz))) continue;
+                for (int y = -1; y <= 1; y++) {
+                    for (int x = -1; x <= 1; x++) {
+                        if (tightHistorySearch && (x != 0 || y != 0)) continue;
 
-                    uint prevPixel = uint(c.y) * uint(sz.x) + uint(c.x);
-                    uint prevBase = RTR_HISTORY_WORD + ((frame ^ 1u) & 1u) * pageWords + prevPixel * RTR_HISTORY_WORDS_PER_PIXEL;
-                    if (rtrMem[prevBase + RTR_HISTORY_HIT_WORD] == 0u) continue;
+                        ivec2 c = q0 + ivec2(x, y);
+                        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, sz))) continue;
 
-                    vec3 prevPos = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_POS_WORD],
-                                                         rtrMem[prevBase + RTR_HISTORY_POS_WORD + 1u],
-                                                         rtrMem[prevBase + RTR_HISTORY_POS_WORD + 2u]));
-                    vec3 prevN = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD],
-                                                       rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 1u],
-                                                       rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 2u]));
-                    vec3 prevAlbedo = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD],
-                                                            rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 1u],
-                                                            rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 2u]));
-                    float planeDelta = abs(dot(hitPos - prevPos, primary.n));
-                    float maxPlaneDelta = max(0.025, primary.t * 0.012);
-                    vec3 albedoDelta = prevAlbedo - hitAlbedo;
-                    if (planeDelta > maxPlaneDelta ||
-                        dot(prevN, primary.n) < 0.90 ||
-                        dot(albedoDelta, albedoDelta) > RTR_ALBEDO_EPS2) continue;
+                        uint prevPixel = uint(c.y) * uint(sz.x) + uint(c.x);
+                        uint prevBase = RTR_HISTORY_WORD + ((frame ^ 1u) & 1u) * pageWords + prevPixel * RTR_HISTORY_WORDS_PER_PIXEL;
+                        if (rtrMem[prevBase + RTR_HISTORY_HIT_WORD] == 0u) continue;
 
-                    if (shadingHit && refreshSlot) {
-                        rtrReservoirCombineStored(reservoir, prevBase, hitPos, primary.n, hitAlbedo, rng);
+                        vec3 prevPos = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_POS_WORD],
+                                                             rtrMem[prevBase + RTR_HISTORY_POS_WORD + 1u],
+                                                             rtrMem[prevBase + RTR_HISTORY_POS_WORD + 2u]));
+                        vec3 prevN = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD],
+                                                           rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 1u],
+                                                           rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 2u]));
+                        vec3 prevAlbedo = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD],
+                                                                rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 1u],
+                                                                rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 2u]));
+                        vec3 posDelta = hitPos - prevPos;
+                        float planeDelta = abs(dot(posDelta, primary.n));
+                        float maxPlaneDelta = max(0.025, primary.t * 0.012);
+                        float maxWorldDelta = max(0.05, primary.t * 0.02);
+                        vec3 albedoDelta = prevAlbedo - hitAlbedo;
+                        if (planeDelta > maxPlaneDelta ||
+                            dot(posDelta, posDelta) > maxWorldDelta * maxWorldDelta ||
+                            dot(prevN, primary.n) < 0.90 ||
+                            dot(albedoDelta, albedoDelta) > RTR_ALBEDO_EPS2) continue;
+
+                        if (shadingHit && refreshSlot) {
+                            rtrReservoirCombineStored(reservoir, prevBase, hitPos, primary.n, hitAlbedo, rng);
+                        }
+
+                        vec2 d = vec2(c) - q;
+                        float w = 1.0 / (1.0 + 2.0 * dot(d, d));
+                        vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_COLOR_WORD],
+                                                               rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 1u],
+                                                               rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 2u]));
+                        float prevLen = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_LEN_WORD]);
+                        float prevM2 = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_MOMENT2_WORD]);
+                        colorSum += prevColor * w;
+                        lenSum += prevLen * w;
+                        moment2Sum += prevM2 * w;
+                        weightSum += w;
                     }
-
-                    vec2 d = vec2(c) - q;
-                    float w = 1.0 / (1.0 + 2.0 * dot(d, d));
-                    vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_COLOR_WORD],
-                                                           rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 1u],
-                                                           rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 2u]));
-                    float prevLen = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_LEN_WORD]);
-                    float prevM2 = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_MOMENT2_WORD]);
-                    colorSum += prevColor * w;
-                    lenSum += prevLen * w;
-                    moment2Sum += prevM2 * w;
-                    weightSum += w;
                 }
-            }
 
-            if (weightSum > 0.01) {
-                historyColor = colorSum / weightSum;
-                prevHistoryLen = lenSum / weightSum;
-                prevMoment2 = moment2Sum / weightSum;
-                useHistory = true;
+                if (weightSum > 0.01) {
+                    historyColor = colorSum / weightSum;
+                    prevHistoryLen = lenSum / weightSum;
+                    prevMoment2 = moment2Sum / weightSum;
+                    useHistory = true;
+                }
             }
         }
     }
 
-    bool refresh = !useHistory || refreshSlot;
+    bool motionRefresh = useHistory && historyMotionPx > RTR_HISTORY_MOTION_REFRESH_PX;
+    bool refresh = !useHistory || refreshSlot || motionRefresh;
     if (shadingHit && refresh) {
         rtrReservoirAddInitialCandidates(reservoir, hitPos, primary.n, hitAlbedo, rng);
 
@@ -547,6 +562,8 @@ void main()
         float unbiasedDiff = abs(currentLum - historyLum) / max(currentLum, max(historyLum, 0.2));
         float unbiasedWeight = max(0.0, 1.0 - unbiasedDiff);
         float feedback = mix(RTR_FEEDBACK_MIN, RTR_FEEDBACK_MAX, unbiasedWeight * unbiasedWeight);
+        float motionBlend = smoothstep(0.0, RTR_HISTORY_MOTION_REFRESH_PX, historyMotionPx);
+        feedback = mix(feedback, min(feedback, RTR_HISTORY_MOTION_FEEDBACK), motionBlend);
         alpha = 1.0 - feedback;
     }
     color = useHistory ? mix(historyColor, color, alpha) : color;
