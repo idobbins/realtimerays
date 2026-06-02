@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #ifndef RTR_BVH_LEAF_SIZE
 #define RTR_BVH_LEAF_SIZE 8u
@@ -11,6 +12,13 @@
 #endif
 
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
+#define RTR_SCENE_PI 3.14159265358979323846f
+#define RTR_SCENE_GROUND_Y -1.0f
+#define RTR_SCENE_DISK_RADIUS 3.55f
+#define RTR_SCENE_MIN_SPHERE_RADIUS 0.032f
+#define RTR_SCENE_MAX_SPHERE_RADIUS 0.070f
+#define RTR_SCENE_SPHERE_CLEARANCE 0.004f
+#define RTR_SCENE_PLACE_ATTEMPTS 100000u
 
 enum {
     RTR_SCENE_COUNT_WORD = 8,
@@ -19,8 +27,6 @@ enum {
     RTR_SCENE_BVH_NODE_COUNT_WORD = 15,
     RTR_SCENE_GEOM_WORD = 16,
     RTR_SCENE_SPHERE_COUNT = 1000,
-    RTR_SCENE_GRID_X = 40,
-    RTR_SCENE_GRID_Z = 25,
     RTR_SCENE_SPHERE_WORDS = 4,
     RTR_SCENE_MAT_WORD = RTR_SCENE_GEOM_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
     RTR_SCENE_BVH_WORD = RTR_SCENE_MAT_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
@@ -48,6 +54,78 @@ typedef struct RTRSplit {
 } RTRSplit;
 
 static uint32_t rtrSortAxis = 0u;
+
+static float rtrHash01(uint32_t value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+
+    return (float)(value & 0x00ffffffu) / 16777215.0f;
+}
+
+static int rtrCompareSphereByRadiusDesc(const void *lhs, const void *rhs)
+{
+    const RTRSphere *a = (const RTRSphere *)lhs;
+    const RTRSphere *b = (const RTRSphere *)rhs;
+
+    if (a->geom[3] > b->geom[3]) return -1;
+    if (a->geom[3] < b->geom[3]) return 1;
+    return 0;
+}
+
+static uint32_t rtrOverlapsPlacedSphere(const RTRSphere *spheres,
+                                        uint32_t count,
+                                        float x,
+                                        float z,
+                                        float r)
+{
+    for (uint32_t i = 0u; i < count; i++) {
+        const float dx = x - spheres[i].geom[0];
+        const float dz = z - spheres[i].geom[2];
+        const float minDist = r + spheres[i].geom[3] + RTR_SCENE_SPHERE_CLEARANCE;
+
+        if (dx * dx + dz * dz < minDist * minDist)
+            return 1u;
+    }
+
+    return 0u;
+}
+
+static void rtrPlaceSphere(RTRSphere *spheres, uint32_t index)
+{
+    const float r = spheres[index].geom[3];
+    const float diskRadius = RTR_SCENE_DISK_RADIUS - r;
+    float x = 0.0f;
+    float z = 0.0f;
+    uint32_t placed = 0u;
+
+    for (uint32_t attempt = 0u; attempt < RTR_SCENE_PLACE_ATTEMPTS; attempt++) {
+        const uint32_t seed = index * 747796405u + attempt * 2891336453u + 0x9e3779b9u;
+        const float radial = sqrtf(rtrHash01(seed ^ 0x85ebca6bu)) * diskRadius;
+        const float angle = 2.0f * RTR_SCENE_PI * rtrHash01(seed ^ 0xc2b2ae35u);
+
+        x = cosf(angle) * radial;
+        z = sinf(angle) * radial;
+
+        if (!rtrOverlapsPlacedSphere(spheres, index, x, z, r)) {
+            placed = 1u;
+            break;
+        }
+    }
+
+    if (!placed) {
+        const float angle = 2.0f * RTR_SCENE_PI * rtrHash01(index * 2246822519u);
+        x = cosf(angle) * diskRadius;
+        z = sinf(angle) * diskRadius;
+    }
+
+    spheres[index].geom[0] = x;
+    spheres[index].geom[1] = RTR_SCENE_GROUND_Y + r;
+    spheres[index].geom[2] = z;
+}
 
 static void rtrBoundsReset(float boundsMin[3], float boundsMax[3])
 {
@@ -288,26 +366,31 @@ void rtrScene(uint32_t *words)
     RTRBVHNode nodes[RTR_SCENE_BVH_MAX_NODES];
     uint32_t nodeCount = 0u;
 
-    for (uint32_t z = 0u; z < RTR_SCENE_GRID_Z; z++) {
-        for (uint32_t x = 0u; x < RTR_SCENE_GRID_X; x++) {
-            const uint32_t i = z * RTR_SCENE_GRID_X + x;
-            const float fx = ((float)x - ((float)RTR_SCENE_GRID_X - 1.0f) * 0.5f) * 0.105f;
-            const float fz = ((float)z - ((float)RTR_SCENE_GRID_Z - 1.0f) * 0.5f) * 0.16f;
-            const float r = 0.025f + (float)((x * 3u + z * 5u) % 5u) * 0.006f;
-            const float u = (float)x / ((float)RTR_SCENE_GRID_X - 1.0f);
-            const float v = (float)z / ((float)RTR_SCENE_GRID_Z - 1.0f);
-            const float w = (float)((x + z) % 10u) / 9.0f;
+    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
+        const float h = rtrHash01(i * 747796405u + 0x165667b1u);
+        const float r =
+            RTR_SCENE_MIN_SPHERE_RADIUS +
+            (RTR_SCENE_MAX_SPHERE_RADIUS - RTR_SCENE_MIN_SPHERE_RADIUS) * h;
 
-            spheres[i] = (RTRSphere){
-                .geom = {fx, -1.0f + r, fz, r},
-                .mat = {
-                    0.24f + 0.56f * u,
-                    0.25f + 0.38f * w,
-                    0.34f + 0.42f * v,
-                    1.0f / r,
-                },
-            };
-        }
+        spheres[i] = (RTRSphere){
+            .geom = {0.0f, RTR_SCENE_GROUND_Y + r, 0.0f, r},
+        };
+    }
+
+    qsort(spheres, RTR_SCENE_SPHERE_COUNT, sizeof(spheres[0]), rtrCompareSphereByRadiusDesc);
+
+    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
+        rtrPlaceSphere(spheres, i);
+
+        const float u = spheres[i].geom[0] / (RTR_SCENE_DISK_RADIUS * 2.0f) + 0.5f;
+        const float v = spheres[i].geom[2] / (RTR_SCENE_DISK_RADIUS * 2.0f) + 0.5f;
+        const float w = rtrHash01(i * 2246822519u + 3266489917u);
+        const float r = spheres[i].geom[3];
+
+        spheres[i].mat[0] = 0.24f + 0.52f * u;
+        spheres[i].mat[1] = 0.24f + 0.42f * w;
+        spheres[i].mat[2] = 0.34f + 0.36f * v;
+        spheres[i].mat[3] = 1.0f / r;
     }
 
     rtrBuildBVH(spheres, nodes, &nodeCount, 0u, RTR_SCENE_SPHERE_COUNT);
