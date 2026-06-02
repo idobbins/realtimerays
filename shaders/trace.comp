@@ -28,11 +28,18 @@ const uint RTR_SPHERE_GEOM_WORD = 24u;
 const uint RTR_SPHERE_MAT_WORD = RTR_SPHERE_GEOM_WORD + RTR_MAX_SPHERES * 4u;
 const uint RTR_BVH_NODE_WORD = RTR_SPHERE_MAT_WORD + RTR_MAX_SPHERES * 4u;
 const uint RTR_BVH_NODE_WORDS = 8u;
+const uint RTR_BLUE_NOISE_SIZE = 64u;
+const uint RTR_BLUE_NOISE_WORD =
+    RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
 const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
 const int RTR_BVH_STACK_SIZE = 64;
 
 #ifndef RTR_RAY_BOUNCES
 #define RTR_RAY_BOUNCES 3
+#endif
+
+#ifndef RTR_SAMPLES_PER_PIXEL
+#define RTR_SAMPLES_PER_PIXEL 2
 #endif
 
 const float RTR_INF = 1.0e20;
@@ -120,6 +127,31 @@ vec3 rtrLoadBVHMax(uint i)
 uint rtrLoadBVHCountRight(uint i)
 {
     return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 7u);
+}
+
+uint rtrHashU32(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+
+    return value;
+}
+
+vec2 rtrLoadBlueNoise(uvec2 coord, uint seed, int bounce)
+{
+    uint h = rtrHashU32(seed ^ uint(bounce) * 0x9e3779b9u);
+    uvec2 p = coord + uvec2(h, h >> 16u) +
+        uvec2(uint(bounce) * 17u, uint(bounce) * 31u);
+    p &= uvec2(RTR_BLUE_NOISE_SIZE - 1u);
+
+    uint word = rtrLoadU32(RTR_BLUE_NOISE_WORD + p.y * RTR_BLUE_NOISE_SIZE + p.x);
+    vec2 noise = vec2(uvec2(word & 0xffffu, word >> 16u)) * (1.0 / 65536.0);
+    vec2 offset = vec2(uvec2(h & 0xffffu, h >> 16u)) * (1.0 / 65536.0);
+
+    return fract(noise + offset);
 }
 
 vec3 rtrSky(vec3 rd)
@@ -419,26 +451,44 @@ vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, int skipId)
     return direct + ambient;
 }
 
-float rtrHash13(vec3 p)
+uvec2 rtrSurfaceNoiseCoord(RTRHit hit, vec3 p, vec3 n)
 {
-    p = fract(p * vec3(0.1031, 0.11369, 0.13787));
-    p += dot(p, p.yzx + 19.19);
-    return fract((p.x + p.y) * p.z);
+    if (hit.id == RTR_HIT_PLANE) {
+        ivec2 cell = ivec2(floor(p.xz * 1.5));
+        return uvec2(cell);
+    }
+
+    uint h = rtrHashU32(uint(hit.id) * 0x9e3779b9u + 0x7f4a7c15u);
+    return uvec2(h, h >> 16u);
 }
 
-vec3 rtrBounceDirection(vec3 n, vec3 rd, vec3 p, int bounce)
+uint rtrSurfaceNoiseSeed(RTRHit hit, uint sampleIndex)
+{
+    uint sampleSalt = sampleIndex * 0xa511e9b3u;
+
+    if (hit.id == RTR_HIT_PLANE)
+        return 0x51ed270bu ^ sampleSalt;
+
+    return (uint(hit.id) + 1u) ^ sampleSalt;
+}
+
+vec3 rtrBounceDirection(vec3 n, vec3 rd, uvec2 noiseCoord, uint noiseSeed, int bounce)
 {
     vec3 reflected = reflect(rd, n);
     vec3 helper = abs(n.y) < 0.97 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 tangent = normalize(cross(helper, n));
     vec3 bitangent = cross(n, tangent);
-    float angle = rtrHash13(p + vec3(float(bounce) * 17.0, 3.1, 11.7)) * 6.2831853;
-    vec3 diffuse = normalize(n + 0.72 * (cos(angle) * tangent + sin(angle) * bitangent));
+    vec2 noise = rtrLoadBlueNoise(noiseCoord, noiseSeed, bounce);
+    float angle = noise.x * 6.2831853;
+    float radius = sqrt(noise.y);
+    vec3 diffuse = normalize(tangent * (cos(angle) * radius) +
+                             bitangent * (sin(angle) * radius) +
+                             n * sqrt(max(1.0 - noise.y, 0.0)));
 
     return normalize(mix(diffuse, reflected, 0.34));
 }
 
-vec3 rtrRadiance(vec3 ro, vec3 rd)
+vec3 rtrRadiance(vec3 ro, vec3 rd, uint sampleIndex)
 {
     vec3 color = vec3(0.0);
     vec3 throughput = vec3(1.0);
@@ -464,7 +514,10 @@ vec3 rtrRadiance(vec3 ro, vec3 rd)
             break;
 
         ro = p + n * (RTR_EPS * 8.0);
-        rd = rtrBounceDirection(n, rd, p, bounce);
+        rd = rtrBounceDirection(n, rd,
+                                rtrSurfaceNoiseCoord(hit, p, n),
+                                rtrSurfaceNoiseSeed(hit, sampleIndex),
+                                bounce);
     }
 
     return color;
@@ -517,7 +570,10 @@ void main()
     vec3 ray = shRayBase + shRayDx * float(p.x) + shRayDy * float(p.y);
     vec3 rd = ray * inversesqrt(dot(ray, ray));
 
-    vec3 color = rtrRadiance(shRo, rd);
+    vec3 color = vec3(0.0);
+    for (int sampleIndex = 0; sampleIndex < RTR_SAMPLES_PER_PIXEL; sampleIndex++)
+        color += rtrRadiance(shRo, rd, uint(sampleIndex));
+    color *= 1.0 / float(RTR_SAMPLES_PER_PIXEL);
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }

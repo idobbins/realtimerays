@@ -19,6 +19,9 @@
 #define RTR_SCENE_MAX_SPHERE_RADIUS 0.080f
 #define RTR_SCENE_SPHERE_CLEARANCE 0.004f
 #define RTR_SCENE_PLACE_ATTEMPTS 100000u
+#define RTR_SCENE_BLUE_NOISE_SIZE 64u
+#define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
+#define RTR_SCENE_BLUE_NOISE_CANDIDATES 64u
 
 enum {
     RTR_SCENE_COUNT_WORD = 8,
@@ -32,6 +35,8 @@ enum {
     RTR_SCENE_BVH_WORD = RTR_SCENE_MAT_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
     RTR_SCENE_BVH_NODE_WORDS = 8,
     RTR_SCENE_BVH_MAX_NODES = RTR_SCENE_SPHERE_COUNT * 2 - 1,
+    RTR_SCENE_BLUE_NOISE_WORD = RTR_SCENE_BVH_WORD +
+        RTR_SCENE_BVH_MAX_NODES * RTR_SCENE_BVH_NODE_WORDS,
 };
 
 typedef struct RTRSphere {
@@ -55,7 +60,7 @@ typedef struct RTRSplit {
 
 static uint32_t rtrSortAxis = 0u;
 
-static float rtrHash01(uint32_t value)
+static uint32_t rtrHashU32(uint32_t value)
 {
     value ^= value >> 16u;
     value *= 0x7feb352du;
@@ -63,7 +68,12 @@ static float rtrHash01(uint32_t value)
     value *= 0x846ca68bu;
     value ^= value >> 16u;
 
-    return (float)(value & 0x00ffffffu) / 16777215.0f;
+    return value;
+}
+
+static float rtrHash01(uint32_t value)
+{
+    return (float)(rtrHashU32(value) & 0x00ffffffu) / 16777215.0f;
 }
 
 static int rtrCompareSphereByRadiusDesc(const void *lhs, const void *rhs)
@@ -125,6 +135,91 @@ static void rtrPlaceSphere(RTRSphere *spheres, uint32_t index)
     spheres[index].geom[0] = x;
     spheres[index].geom[1] = RTR_SCENE_GROUND_Y + r;
     spheres[index].geom[2] = z;
+}
+
+static uint32_t rtrToroidalDistance2(uint32_t a, uint32_t b)
+{
+    const uint32_t ax = a & (RTR_SCENE_BLUE_NOISE_SIZE - 1u);
+    const uint32_t ay = a >> 6u;
+    const uint32_t bx = b & (RTR_SCENE_BLUE_NOISE_SIZE - 1u);
+    const uint32_t by = b >> 6u;
+    uint32_t dx = ax > bx ? ax - bx : bx - ax;
+    uint32_t dy = ay > by ? ay - by : by - ay;
+
+    if (dx > RTR_SCENE_BLUE_NOISE_SIZE / 2u) dx = RTR_SCENE_BLUE_NOISE_SIZE - dx;
+    if (dy > RTR_SCENE_BLUE_NOISE_SIZE / 2u) dy = RTR_SCENE_BLUE_NOISE_SIZE - dy;
+
+    return dx * dx + dy * dy;
+}
+
+static void rtrUpdateBlueNoiseDistances(float *distances, uint32_t chosen)
+{
+    for (uint32_t i = 0u; i < RTR_SCENE_BLUE_NOISE_TEXELS; i++) {
+        const float dist = (float)rtrToroidalDistance2(i, chosen);
+        if (dist < distances[i]) distances[i] = dist;
+    }
+}
+
+static void rtrGenerateBlueNoiseChannel(uint16_t *values, uint32_t seed)
+{
+    float distances[RTR_SCENE_BLUE_NOISE_TEXELS];
+    uint8_t used[RTR_SCENE_BLUE_NOISE_TEXELS];
+
+    for (uint32_t i = 0u; i < RTR_SCENE_BLUE_NOISE_TEXELS; i++) {
+        distances[i] = 1.0e20f;
+        used[i] = 0u;
+        values[i] = 0u;
+    }
+
+    for (uint32_t rank = 0u; rank < RTR_SCENE_BLUE_NOISE_TEXELS; rank++) {
+        uint32_t best = 0xffffffffu;
+        float bestScore = -1.0f;
+
+        for (uint32_t candidate = 0u;
+             candidate < RTR_SCENE_BLUE_NOISE_CANDIDATES;
+             candidate++) {
+            const uint32_t index =
+                rtrHashU32(seed ^ rank * 0x9e3779b9u ^ candidate * 0x85ebca6bu) &
+                (RTR_SCENE_BLUE_NOISE_TEXELS - 1u);
+            if (used[index]) continue;
+
+            const float jitter =
+                rtrHash01(seed ^ rank * 0xc2b2ae35u ^ candidate * 0x27d4eb2du);
+            const float score = distances[index] + jitter * 0.001f;
+            if (score > bestScore) {
+                bestScore = score;
+                best = index;
+            }
+        }
+
+        if (best == 0xffffffffu) {
+            for (uint32_t i = 0u; i < RTR_SCENE_BLUE_NOISE_TEXELS; i++) {
+                if (used[i]) continue;
+                if (distances[i] > bestScore) {
+                    bestScore = distances[i];
+                    best = i;
+                }
+            }
+        }
+
+        used[best] = 1u;
+        values[best] = (uint16_t)((rank * 65535u) / (RTR_SCENE_BLUE_NOISE_TEXELS - 1u));
+        rtrUpdateBlueNoiseDistances(distances, best);
+    }
+}
+
+static void rtrStoreBlueNoise(uint32_t *words)
+{
+    uint16_t channel0[RTR_SCENE_BLUE_NOISE_TEXELS];
+    uint16_t channel1[RTR_SCENE_BLUE_NOISE_TEXELS];
+
+    rtrGenerateBlueNoiseChannel(channel0, 0x13a5f00du);
+    rtrGenerateBlueNoiseChannel(channel1, 0xbad5eedu);
+
+    for (uint32_t i = 0u; i < RTR_SCENE_BLUE_NOISE_TEXELS; i++) {
+        words[RTR_SCENE_BLUE_NOISE_WORD + i] =
+            (uint32_t)channel0[i] | ((uint32_t)channel1[i] << 16u);
+    }
 }
 
 static void rtrBoundsReset(float boundsMin[3], float boundsMax[3])
@@ -409,4 +504,6 @@ void rtrScene(uint32_t *words)
     for (uint32_t i = 0u; i < nodeCount; i++) {
         rtrStoreBVHNode(words, i, nodes + i);
     }
+
+    rtrStoreBlueNoise(words);
 }
