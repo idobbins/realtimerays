@@ -1,7 +1,13 @@
 .DS_Store
 .cache/
 
-/target/
+# Build outputs
 /build/
+/target/
+/compile_commands.json
+/.ninja_deps
+/.ninja_log
 
+# Native build byproducts
+*.o
 *.dSYM/

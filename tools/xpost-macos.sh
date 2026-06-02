@@ -13,8 +13,8 @@ fi
 
 seconds="${XPOST_SECONDS:-30}"
 fps="${XPOST_FPS:-30}"
-width="${XPOST_WIDTH:-1280}"
-height="${XPOST_HEIGHT:-720}"
+width="${XPOST_WIDTH:-1920}"
+height="${XPOST_HEIGHT:-1080}"
 frames="${XPOST_FRAMES:-$((seconds * fps))}"
 
 if (( width % 2 != 0 || height % 2 != 0 )); then
@@ -28,9 +28,9 @@ if (( $# > 0 )); then
         bin="$old_pwd/$bin"
     fi
 else
-    bin="$repo_dir/target/release/realtimerays"
+    bin="$repo_dir/build/realtimerays"
     if [[ "${XPOST_BUILD:-1}" != "0" || ! -x "$bin" ]]; then
-        cargo build --release
+        ninja
     fi
 fi
 
@@ -39,7 +39,7 @@ if [[ ! -x "$bin" ]]; then
     exit 126
 fi
 
-out_dir="${XPOST_DIR:-target/xpost}"
+out_dir="${XPOST_DIR:-build/xpost}"
 mkdir -p "$out_dir"
 stem="$out_dir/realtimerays-$(date +%Y%m%d-%H%M%S)"
 mp4_out="${XPOST_OUT:-$stem.mp4}"
