@@ -31,6 +31,7 @@ const float RTR_FEEDBACK_MIN = 0.80;
 const float RTR_FEEDBACK_MAX = 0.96;
 const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
 const uint RTR_RESTIR_MAX_SOURCE_M = 64u;
+const uint RTR_SPARSE_RATE = 4u;
 const int RTR_INDIRECT_SAMPLES = 1;
 const vec3 RTR_LIGHT_CENTER = vec3(0.0, 6.0, -2.8);
 const vec3 RTR_LIGHT_U = vec3(2.8, 0.0, 0.0);
@@ -479,10 +480,8 @@ void main()
     vec3 historyColor = vec3(0.0);
     float prevHistoryLen = 0.0;
     float prevMoment2 = 0.0;
-
-    if (shadingHit) {
-        rtrReservoirAddInitialCandidates(reservoir, hitPos, primary.n, hitAlbedo, rng);
-    }
+    uint tile = (uint(p.x) >> 3u) ^ ((uint(p.y) >> 3u) * 1664525u);
+    bool refreshSlot = ((rtrHash(tile) + frame) & (RTR_SPARSE_RATE - 1u)) == 0u;
 
     if (frame > 0u && hit) {
         vec3 prevRo, prevForward, prevRight, prevUp;
@@ -517,7 +516,7 @@ void main()
                         dot(prevN, primary.n) < 0.90 ||
                         dot(albedoDelta, albedoDelta) > RTR_ALBEDO_EPS2) continue;
 
-                    if (shadingHit) {
+                    if (shadingHit && refreshSlot) {
                         rtrReservoirCombineStored(reservoir, prevBase, hitPos, primary.n, hitAlbedo, rng);
                     }
 
@@ -542,14 +541,19 @@ void main()
         }
     }
 
-    if (shadingHit) {
+    bool refresh = !useHistory || refreshSlot;
+    if (shadingHit && refresh) {
+        rtrReservoirAddInitialCandidates(reservoir, hitPos, primary.n, hitAlbedo, rng);
+
         float selectedTarget = reservoir.valid ?
             rtrLuminance(rtrLightDensity(hitPos, primary.n, hitAlbedo, reservoir.lightPos)) : 0.0;
         rtrReservoirFinalize(reservoir, selectedTarget);
     }
 
     vec3 color = hit ? primary.emission : rtrSky(rd);
-    if (shadingHit) {
+    if (!refresh) {
+        color = historyColor;
+    } else if (shadingHit) {
         color += rtrReservoirDirectLighting(reservoir, hitPos, primary.n, hitAlbedo);
 
         vec3 indirect = vec3(0.0);

@@ -14,7 +14,12 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp finishLaunching];
 
-    rtrWindowHandle = [[NSWindow alloc] initWithContentRect:NSMakeRect(0.0, 0.0, (CGFloat)width, (CGFloat)height)
+    NSScreen *screen = [NSScreen mainScreen];
+    const CGFloat scale = screen ? [screen backingScaleFactor] : 1.0;
+    const CGFloat pointWidth = (CGFloat)width / scale;
+    const CGFloat pointHeight = (CGFloat)height / scale;
+
+    rtrWindowHandle = [[NSWindow alloc] initWithContentRect:NSMakeRect(0.0, 0.0, pointWidth, pointHeight)
                                                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
                                                     backing:NSBackingStoreBuffered
                                                       defer:NO];
@@ -29,7 +34,7 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     [rtrWindowHandle setAcceptsMouseMovedEvents:YES];
     [view setWantsLayer:YES];
     [(CAMetalLayer *)rtrSurfaceLayer setOpaque:YES];
-    [(CAMetalLayer *)rtrSurfaceLayer setContentsScale:1.0];
+    [(CAMetalLayer *)rtrSurfaceLayer setContentsScale:scale];
     [(CAMetalLayer *)rtrSurfaceLayer setDrawableSize:CGSizeMake((CGFloat)width, (CGFloat)height)];
     [view setLayer:(CAMetalLayer *)rtrSurfaceLayer];
     [rtrWindowHandle makeKeyAndOrderFront:nil];

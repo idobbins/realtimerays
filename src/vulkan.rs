@@ -453,6 +453,10 @@ pub unsafe fn init(window_surface: *mut c_void) -> VkResult<()> {
     let caps = surface_loader()
         .get_physical_device_surface_capabilities(RTR_PHYSICAL_DEVICE, RTR_SURFACE)?;
     RTR_SWAP_EXTENT = caps.current_extent;
+    eprintln!(
+        "realtimerays: swapchain extent {}x{}",
+        RTR_SWAP_EXTENT.width, RTR_SWAP_EXTENT.height
+    );
     let mut min_image_count = RTR_MAX_SWAP_IMAGES as u32;
     if min_image_count < caps.min_image_count {
         min_image_count = caps.min_image_count;
