@@ -39,7 +39,6 @@ const float RTR_HISTORY_MOTION_REJECT_PX = 48.0;
 const float RTR_HISTORY_MOTION_FEEDBACK = 0.45;
 const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
 const uint RTR_RESTIR_MAX_SOURCE_M = 64u;
-const uint RTR_SPARSE_RATE = 4u;
 const int RTR_INDIRECT_SAMPLES = 1;
 const vec3 RTR_LIGHT_CENTER = vec3(0.05, 2.65, -1.25);
 const vec3 RTR_LIGHT_U = vec3(1.2, 0.0, 0.0);
@@ -445,8 +444,6 @@ void main()
     float prevHistoryLen = 0.0;
     float prevMoment2 = 0.0;
     float historyMotionPx = 0.0;
-    uint tile = (uint(p.x) >> 3u) ^ ((uint(p.y) >> 3u) * 1664525u);
-    bool refreshSlot = ((rtrHash(tile) + frame) & (RTR_SPARSE_RATE - 1u)) == 0u;
 
     if (frame > 0u && hit) {
         vec3 prevRo, prevForward, prevRight, prevUp;
@@ -495,10 +492,6 @@ void main()
                             dot(prevN, primary.n) < 0.90 ||
                             dot(albedoDelta, albedoDelta) > RTR_ALBEDO_EPS2) continue;
 
-                        if (shadingHit && refreshSlot) {
-                            rtrReservoirCombineStored(reservoir, prevBase, hitPos, primary.n, hitAlbedo, rng);
-                        }
-
                         vec2 d = vec2(c) - q;
                         float w = 1.0 / (1.0 + 2.0 * dot(d, d));
                         vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_COLOR_WORD],
@@ -523,9 +516,7 @@ void main()
         }
     }
 
-    bool motionRefresh = useHistory && historyMotionPx > RTR_HISTORY_MOTION_REFRESH_PX;
-    bool refresh = !useHistory || refreshSlot || motionRefresh;
-    if (shadingHit && refresh) {
+    if (shadingHit) {
         rtrReservoirAddInitialCandidates(reservoir, hitPos, primary.n, hitAlbedo, rng);
 
         float selectedTarget = reservoir.valid ?
@@ -534,9 +525,7 @@ void main()
     }
 
     vec3 color = hit ? primary.emission : rtrSky(rd);
-    if (!refresh) {
-        color = historyColor;
-    } else if (shadingHit) {
+    if (shadingHit) {
         color += rtrReservoirDirectLighting(reservoir, hitPos, primary.n, hitAlbedo);
 
         vec3 indirect = vec3(0.0);
