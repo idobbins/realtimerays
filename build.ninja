@@ -53,7 +53,7 @@ rule compdb
   description = COMPDB $out
 
 rule clean
-  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace.comp.spv $build_dir/trace_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/macos.o $bin compile_commands.json
+  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace.comp.spv $build_dir/trace_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $bin compile_commands.json
   description = CLEAN
 
 build $build_dir/.dir: mkdir
@@ -61,8 +61,9 @@ build $build_dir/trace.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
 build $build_dir/trace_comp_spv.h: xxd $build_dir/trace.comp.spv || $build_dir/.dir
 build $build_dir/main.o: cc main.c || $build_dir/.dir
 build $build_dir/vulkan.o: cc vulkan.c | $build_dir/trace_comp_spv.h || $build_dir/.dir
+build $build_dir/scene.o: cc scene.c || $build_dir/.dir
 build $build_dir/macos.o: objc macos.m || $build_dir/.dir
-build $bin: link $build_dir/main.o $build_dir/vulkan.o $build_dir/macos.o
+build $bin: link $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o
 build compile_commands.json: compdb build.ninja
 
 build build: phony $bin compile_commands.json

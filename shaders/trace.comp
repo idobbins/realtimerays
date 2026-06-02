@@ -4,69 +4,27 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
 
-layout(std430, binding = 1) buffer RTRMemory {
+layout(std430, binding = 1) readonly buffer RTRMemory {
     uint rtrMem[];
 };
 
-const uint RTR_FRAME_WORD = 4u;
 const uint RTR_MOUSE_X_WORD = 5u;
 const uint RTR_TIME_WORD = 7u;
-const uint RTR_PREV_TIME_WORD = 8u;
-const uint RTR_PREV_MOUSE_X_WORD = 9u;
-const uint RTR_HISTORY_WORD = 16u;
-const uint RTR_HISTORY_WORDS_PER_PIXEL = 20u;
-const uint RTR_HISTORY_COLOR_WORD = 0u;
-const uint RTR_HISTORY_POS_WORD = 3u;
-const uint RTR_HISTORY_NORMAL_WORD = 6u;
-const uint RTR_HISTORY_HIT_WORD = 9u;
-const uint RTR_HISTORY_LEN_WORD = 10u;
-const uint RTR_HISTORY_MOMENT2_WORD = 11u;
-const uint RTR_HISTORY_ALBEDO_WORD = 12u;
-const uint RTR_HISTORY_LIGHT_POS_WORD = 15u;
-const uint RTR_HISTORY_LIGHT_W_WORD = 18u;
-const uint RTR_HISTORY_LIGHT_M_WORD = 19u;
-const int RTR_HISTORY_VEC3_FIELD_COUNT = 5;
+const uint RTR_SPHERE_COUNT_WORD = 8u;
+const uint RTR_SPHERE_WORD = 16u;
+const uint RTR_SPHERE_WORDS = 8u;
+const uint RTR_MAX_SPHERES = 100u;
 
-const float RTR_PI = 3.14159265359;
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.001;
 const float RTR_FOCAL = 1.55;
-const float RTR_FEEDBACK_MIN = 0.80;
-const float RTR_FEEDBACK_MAX = 0.96;
-const float RTR_HISTORY_MOTION_TIGHTEN_PX = 4.0;
-const float RTR_HISTORY_MOTION_REFRESH_PX = 8.0;
-const float RTR_HISTORY_MOTION_REJECT_PX = 48.0;
-const float RTR_HISTORY_MOTION_FEEDBACK = 0.45;
-const uint RTR_RESTIR_INITIAL_SAMPLES = 4u;
-const uint RTR_RESTIR_MAX_SOURCE_M = 64u;
-const int RTR_INDIRECT_SAMPLES = 1;
-const vec3 RTR_LIGHT_CENTER = vec3(0.05, 2.65, -1.25);
-const vec3 RTR_LIGHT_U = vec3(1.2, 0.0, 0.0);
-const vec3 RTR_LIGHT_V = vec3(0.0, 0.0, 0.9);
-const vec3 RTR_LIGHT_NORMAL = vec3(0.0, -1.0, 0.0);
-const float RTR_LIGHT_AREA = 1.08;
-const vec3 RTR_LIGHT_EMISSION = vec3(11.0, 8.6, 5.6);
-const float RTR_EMISSION_EPS2 = 0.0001;
-const float RTR_ALBEDO_EPS2 = 0.0064;
+const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
+const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
 
 struct RTRHit {
     float t;
     vec3 n;
     vec3 albedo;
-    vec3 emission;
-};
-
-struct RTRLightSample {
-    vec3 pos;
-    vec3 n;
-};
-
-struct RTRReservoir {
-    vec3 lightPos;
-    float wSum;
-    float W;
-    uint M;
-    bool valid;
 };
 
 uint rtrLoadU32(uint word)
@@ -79,30 +37,22 @@ float rtrLoadF32(uint word)
     return uintBitsToFloat(rtrLoadU32(word));
 }
 
-uint rtrHash(uint x)
+vec3 rtrLoadVec3(uint word)
 {
-    x ^= x >> 16u;
-    x *= 0x7feb352du;
-    x ^= x >> 15u;
-    x *= 0x846ca68bu;
-    x ^= x >> 16u;
-    return x;
-}
-
-float rtrRand(inout uint s)
-{
-    s = rtrHash(s);
-    return float(s) / 4294967295.0;
+    return uintBitsToFloat(uvec3(rtrMem[word], rtrMem[word + 1u], rtrMem[word + 2u]));
 }
 
 vec3 rtrSky(vec3 rd)
 {
     float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3(0.55, 0.60, 0.66), vec3(0.08, 0.13, 0.20), h);
+    return mix(vec3(0.58, 0.62, 0.68), vec3(0.10, 0.15, 0.22), h);
 }
 
-bool rtrSphere(vec3 ro, vec3 rd, vec3 c, float r, vec3 albedo, vec3 emission, inout RTRHit hit)
+bool rtrSphere(vec3 ro, vec3 rd, uint i, inout RTRHit hit)
 {
+    uint base = RTR_SPHERE_WORD + i * RTR_SPHERE_WORDS;
+    vec3 c = rtrLoadVec3(base);
+    float r = rtrLoadF32(base + 3u);
     vec3 oc = ro - c;
     float b = dot(oc, rd);
     float q = dot(oc, oc) - r * r;
@@ -116,8 +66,7 @@ bool rtrSphere(vec3 ro, vec3 rd, vec3 c, float r, vec3 albedo, vec3 emission, in
 
     hit.t = t;
     hit.n = normalize(ro + rd * t - c);
-    hit.albedo = albedo;
-    hit.emission = emission;
+    hit.albedo = rtrLoadVec3(base + 4u);
     return true;
 }
 
@@ -135,62 +84,7 @@ bool rtrPlane(vec3 ro, vec3 rd, vec3 n, float d, vec3 albedo, inout RTRHit hit)
 
     hit.t = t;
     hit.n = n;
-    hit.albedo = albedo * mix(0.76, 1.0, check);
-    hit.emission = vec3(0.0);
-    return true;
-}
-
-bool rtrBox(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, vec3 albedo, inout RTRHit hit)
-{
-    vec3 invRd = 1.0 / rd;
-    vec3 t0 = (bmin - ro) * invRd;
-    vec3 t1 = (bmax - ro) * invRd;
-    vec3 lo = min(t0, t1);
-    vec3 hi = max(t0, t1);
-    float nearT = max(max(lo.x, lo.y), lo.z);
-    float farT = min(min(hi.x, hi.y), hi.z);
-    if (farT < max(nearT, RTR_EPS) || nearT >= hit.t) return false;
-
-    vec3 p = ro + rd * nearT;
-    vec3 da = abs(p - bmin);
-    vec3 db = abs(p - bmax);
-    vec3 n = vec3(0.0);
-    float m = min(min(min(da.x, db.x), min(da.y, db.y)), min(da.z, db.z));
-    if (m == da.x) n = vec3(-1.0, 0.0, 0.0);
-    else if (m == db.x) n = vec3(1.0, 0.0, 0.0);
-    else if (m == da.y) n = vec3(0.0, -1.0, 0.0);
-    else if (m == db.y) n = vec3(0.0, 1.0, 0.0);
-    else if (m == da.z) n = vec3(0.0, 0.0, -1.0);
-    else n = vec3(0.0, 0.0, 1.0);
-
-    hit.t = nearT;
-    hit.n = n;
-    hit.albedo = albedo;
-    hit.emission = vec3(0.0);
-    return true;
-}
-
-bool rtrRectLight(vec3 ro, vec3 rd, inout RTRHit hit)
-{
-    float denom = dot(rd, RTR_LIGHT_NORMAL);
-    if (abs(denom) < 0.00001) return false;
-
-    float t = dot(RTR_LIGHT_CENTER - ro, RTR_LIGHT_NORMAL) / denom;
-    if (t < RTR_EPS || t >= hit.t) return false;
-
-    vec3 p = ro + rd * t;
-    vec3 rel = p - RTR_LIGHT_CENTER;
-    vec3 uAxis = normalize(RTR_LIGHT_U);
-    vec3 vAxis = normalize(RTR_LIGHT_V);
-    if (abs(dot(rel, uAxis)) > length(RTR_LIGHT_U) * 0.5 ||
-        abs(dot(rel, vAxis)) > length(RTR_LIGHT_V) * 0.5) {
-        return false;
-    }
-
-    hit.t = t;
-    hit.n = dot(RTR_LIGHT_NORMAL, rd) > 0.0 ? -RTR_LIGHT_NORMAL : RTR_LIGHT_NORMAL;
-    hit.albedo = vec3(1.0);
-    hit.emission = RTR_LIGHT_EMISSION;
+    hit.albedo = albedo * mix(0.78, 1.0, check);
     return true;
 }
 
@@ -200,183 +94,39 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
     hit.t = RTR_INF;
     hit.n = vec3(0.0, 1.0, 0.0);
     hit.albedo = vec3(0.0);
-    hit.emission = vec3(0.0);
 
-    rtrPlane(ro, rd, vec3(0.0, 1.0, 0.0), 1.0, vec3(0.58, 0.60, 0.54), hit);
-    rtrSphere(ro, rd, vec3(-1.15, 0.0, 0.0), 1.0, vec3(0.83, 0.22, 0.18), vec3(0.0), hit);
-    rtrSphere(ro, rd, vec3(1.18, -0.22, -0.45), 0.78, vec3(0.13, 0.48, 0.80), vec3(0.0), hit);
-    rtrRectLight(ro, rd, hit);
-    rtrBox(ro, rd, vec3(-0.36, -1.0, 1.10), vec3(0.62, 0.15, 1.92), vec3(0.88, 0.67, 0.28), hit);
+    rtrPlane(ro, rd, vec3(0.0, 1.0, 0.0), 1.0, vec3(0.52, 0.54, 0.49), hit);
+
+    uint sphereCount = min(rtrLoadU32(RTR_SPHERE_COUNT_WORD), RTR_MAX_SPHERES);
+    for (uint i = 0u; i < RTR_MAX_SPHERES; i++) {
+        if (i >= sphereCount) break;
+        rtrSphere(ro, rd, i, hit);
+    }
 
     return hit;
 }
 
-vec3 rtrTangent(vec3 n)
+float rtrShadow(vec3 p, vec3 n, vec3 l, float lightDist)
 {
-    if (abs(n.y) < 0.99) return normalize(cross(n, vec3(0.0, 1.0, 0.0)));
-    return normalize(cross(n, vec3(1.0, 0.0, 0.0)));
+    RTRHit hit = rtrTrace(p + n * RTR_EPS * 4.0, l);
+    return hit.t < lightDist - 0.02 ? 0.0 : 1.0;
 }
 
-vec3 rtrCosineHemisphere(vec3 n, inout uint rng)
+vec3 rtrShade(RTRHit hit, vec3 ro, vec3 rd)
 {
-    float u = rtrRand(rng);
-    float v = rtrRand(rng);
-    float r = sqrt(u);
-    float a = 2.0 * RTR_PI * v;
-    vec3 t = rtrTangent(n);
-    vec3 b = cross(n, t);
-    return t * (cos(a) * r) + b * (sin(a) * r) + n * sqrt(max(0.0, 1.0 - u));
-}
+    if (hit.t == RTR_INF) return rtrSky(rd);
 
-float rtrLuminance(vec3 color)
-{
-    return dot(color, vec3(0.2126, 0.7152, 0.0722));
-}
-
-bool rtrHasEmission(vec3 emission)
-{
-    return dot(emission, emission) > RTR_EMISSION_EPS2;
-}
-
-float rtrShadow(vec3 p, vec3 lightPos)
-{
-    vec3 toLight = lightPos - p;
-    float dist2 = dot(toLight, toLight);
-    float invDist = inversesqrt(dist2);
-    float maxT = dist2 * invDist;
-    vec3 rd = toLight * invDist;
-    RTRHit h = rtrTrace(p + rd * RTR_EPS * 2.0, rd);
-    if (h.t < maxT - 0.02 && !rtrHasEmission(h.emission)) return 0.0;
-    return 1.0;
-}
-
-float rtrLightPdfArea()
-{
-    return 1.0 / RTR_LIGHT_AREA;
-}
-
-RTRLightSample rtrSampleLight(inout uint rng)
-{
-    RTRLightSample lightSample;
-    lightSample.n = RTR_LIGHT_NORMAL;
-    lightSample.pos = RTR_LIGHT_CENTER +
-        RTR_LIGHT_U * (rtrRand(rng) - 0.5) +
-        RTR_LIGHT_V * (rtrRand(rng) - 0.5);
-    return lightSample;
-}
-
-vec3 rtrLightDensity(vec3 p, vec3 n, vec3 albedo, vec3 lightPos)
-{
-    vec3 toLight = lightPos - p;
+    vec3 p = ro + rd * hit.t;
+    vec3 toLight = RTR_LIGHT_POS - p;
     float lightDist2 = max(dot(toLight, toLight), 0.001);
-    vec3 l = toLight * inversesqrt(lightDist2);
-    float surfaceCos = max(dot(n, l), 0.0);
-    float lightCos = max(dot(RTR_LIGHT_NORMAL, -l), 0.0);
-    if (surfaceCos <= 0.0 || lightCos <= 0.0) return vec3(0.0);
+    float lightDist = sqrt(lightDist2);
+    vec3 l = toLight / lightDist;
+    float ndl = max(dot(hit.n, l), 0.0);
+    float shadow = ndl > 0.0 ? rtrShadow(p, hit.n, l, lightDist) : 0.0;
+    vec3 direct = hit.albedo * RTR_LIGHT_COLOR * (ndl * shadow / lightDist2);
+    vec3 ambient = hit.albedo * 0.035;
 
-    return albedo * RTR_LIGHT_EMISSION * (surfaceCos * lightCos / (RTR_PI * lightDist2));
-}
-
-vec3 rtrSampleDirectLighting(vec3 p, vec3 n, vec3 albedo, inout uint rng)
-{
-    RTRLightSample lightSample = rtrSampleLight(rng);
-    vec3 density = rtrLightDensity(p, n, albedo, lightSample.pos);
-    if (rtrLuminance(density) <= 0.0) return vec3(0.0);
-
-    float visible = rtrShadow(p + n * RTR_EPS * 2.0, lightSample.pos);
-    return density * visible / rtrLightPdfArea();
-}
-
-RTRReservoir rtrReservoirEmpty()
-{
-    RTRReservoir reservoir;
-    reservoir.lightPos = vec3(0.0);
-    reservoir.wSum = 0.0;
-    reservoir.W = 0.0;
-    reservoir.M = 0u;
-    reservoir.valid = false;
-    return reservoir;
-}
-
-void rtrReservoirUpdate(inout RTRReservoir reservoir, vec3 lightPos, float weight, uint m, inout uint rng)
-{
-    if (weight <= 0.0 || m == 0u) return;
-
-    reservoir.wSum += weight;
-    reservoir.M += m;
-    if (rtrRand(rng) * reservoir.wSum < weight) {
-        reservoir.lightPos = lightPos;
-        reservoir.valid = true;
-    }
-}
-
-void rtrReservoirAddInitialCandidates(inout RTRReservoir reservoir, vec3 p, vec3 n, vec3 albedo, inout uint rng)
-{
-    float pdfArea = rtrLightPdfArea();
-    for (uint i = 0u; i < RTR_RESTIR_INITIAL_SAMPLES; i++) {
-        RTRLightSample lightSample = rtrSampleLight(rng);
-        vec3 density = rtrLightDensity(p, n, albedo, lightSample.pos);
-        float target = rtrLuminance(density);
-        rtrReservoirUpdate(reservoir, lightSample.pos, target / pdfArea, 1u, rng);
-    }
-}
-
-void rtrReservoirCombineStored(inout RTRReservoir reservoir, uint base, vec3 p, vec3 n, vec3 albedo, inout uint rng)
-{
-    uint sourceM = min(rtrMem[base + RTR_HISTORY_LIGHT_M_WORD], RTR_RESTIR_MAX_SOURCE_M);
-    if (sourceM == 0u) return;
-
-    float sourceW = uintBitsToFloat(rtrMem[base + RTR_HISTORY_LIGHT_W_WORD]);
-    if (sourceW <= 0.0) return;
-
-    vec3 sourceLightPos = uintBitsToFloat(uvec3(rtrMem[base + RTR_HISTORY_LIGHT_POS_WORD],
-                                                rtrMem[base + RTR_HISTORY_LIGHT_POS_WORD + 1u],
-                                                rtrMem[base + RTR_HISTORY_LIGHT_POS_WORD + 2u]));
-    vec3 density = rtrLightDensity(p, n, albedo, sourceLightPos);
-    float target = rtrLuminance(density);
-    rtrReservoirUpdate(reservoir, sourceLightPos, target * sourceW * float(sourceM), sourceM, rng);
-}
-
-void rtrReservoirFinalize(inout RTRReservoir reservoir, float selectedTarget)
-{
-    if (!reservoir.valid || reservoir.M == 0u || reservoir.wSum <= 0.0 || selectedTarget <= 0.0) {
-        reservoir = rtrReservoirEmpty();
-        return;
-    }
-
-    reservoir.W = reservoir.wSum / (float(reservoir.M) * selectedTarget);
-    if (reservoir.W <= 0.0) reservoir = rtrReservoirEmpty();
-}
-
-vec3 rtrReservoirDirectLighting(RTRReservoir reservoir, vec3 p, vec3 n, vec3 albedo)
-{
-    if (!reservoir.valid || reservoir.W <= 0.0) return vec3(0.0);
-
-    vec3 density = rtrLightDensity(p, n, albedo, reservoir.lightPos);
-    if (rtrLuminance(density) <= 0.0) return vec3(0.0);
-
-    float visible = rtrShadow(p + n * RTR_EPS * 2.0, reservoir.lightPos);
-    return density * visible * reservoir.W;
-}
-
-vec3 rtrIndirectRadiance(RTRHit primary, vec3 ro, vec3 rd, inout uint rng)
-{
-    if (primary.t == RTR_INF || rtrHasEmission(primary.emission)) return vec3(0.0);
-
-    vec3 p = ro + rd * primary.t;
-    vec3 bounceRo = p + primary.n * RTR_EPS * 2.0;
-    vec3 bounceRd = rtrCosineHemisphere(primary.n, rng);
-    vec3 throughput = primary.albedo;
-    RTRHit hit = rtrTrace(bounceRo, bounceRd);
-    if (hit.t == RTR_INF) return throughput * rtrSky(bounceRd);
-
-    vec3 hitPos = bounceRo + bounceRd * hit.t;
-    vec3 color = hit.emission;
-    if (!rtrHasEmission(hit.emission)) {
-        color += rtrSampleDirectLighting(hitPos, hit.n, hit.albedo, rng);
-    }
-
-    return throughput * color;
+    return direct + ambient;
 }
 
 vec3 rtrTonemap(vec3 color)
@@ -396,196 +146,26 @@ void rtrCamera(float time, float mouseX, vec2 sz, out vec3 ro, out vec3 forward,
     up = cross(right, forward);
 }
 
-bool rtrReproject(vec3 pos, vec3 ro, vec3 forward, vec3 right, vec3 up, vec2 sz, out vec2 q)
-{
-    vec3 rel = pos - ro;
-    float z = dot(rel, forward);
-    if (z <= RTR_EPS) return false;
-
-    vec2 screen = vec2(dot(rel, right), dot(rel, up)) * (RTR_FOCAL / z);
-    vec2 uv = vec2(screen.x / (sz.x / sz.y) * 0.5 + 0.5, (1.0 - screen.y) * 0.5);
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) return false;
-
-    q = uv * sz - 0.5;
-    return true;
-}
-
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = imageSize(rtrOutImage);
     if (any(greaterThanEqual(p, sz))) return;
-    vec2 szf = vec2(sz);
 
-    float time = rtrLoadF32(RTR_TIME_WORD);
-    uint frame = rtrLoadU32(RTR_FRAME_WORD);
-    uint rng = rtrHash(uint(p.x) * 1973u ^ uint(p.y) * 9277u ^ frame * 26699u);
+    vec2 szf = vec2(sz);
     vec2 uv = (vec2(p) + 0.5) / szf;
     vec2 screen = uv * 2.0 - 1.0;
     screen.x *= float(sz.x) / float(sz.y);
     screen.y = -screen.y;
 
+    float time = rtrLoadF32(RTR_TIME_WORD);
     float mouseX = rtrLoadF32(RTR_MOUSE_X_WORD);
     vec3 ro, forward, right, up;
     rtrCamera(time, mouseX, szf, ro, forward, right, up);
+
     vec3 rd = normalize(forward * RTR_FOCAL + right * screen.x + up * screen.y);
-    RTRHit primary = rtrTrace(ro, rd);
-    bool hit = primary.t < RTR_INF;
-    vec3 hitPos = hit ? ro + rd * primary.t : vec3(0.0);
-    vec3 hitAlbedo = hit ? primary.albedo : vec3(0.0);
-    bool shadingHit = hit && !rtrHasEmission(primary.emission);
-
-    uint pixel = uint(p.y) * uint(sz.x) + uint(p.x);
-    uint pageWords = uint(sz.x) * uint(sz.y) * RTR_HISTORY_WORDS_PER_PIXEL;
-    uint historyBase = RTR_HISTORY_WORD + (frame & 1u) * pageWords + pixel * RTR_HISTORY_WORDS_PER_PIXEL;
-    RTRReservoir reservoir = rtrReservoirEmpty();
-    bool useHistory = false;
-    vec3 historyColor = vec3(0.0);
-    float prevHistoryLen = 0.0;
-    float prevMoment2 = 0.0;
-    float historyMotionPx = 0.0;
-
-    if (frame > 0u && hit) {
-        vec3 prevRo, prevForward, prevRight, prevUp;
-        float prevTime = rtrLoadF32(RTR_PREV_TIME_WORD);
-        float prevMouseX = rtrLoadF32(RTR_PREV_MOUSE_X_WORD);
-        rtrCamera(prevTime, prevMouseX, szf, prevRo, prevForward, prevRight, prevUp);
-
-        vec2 q;
-        if (rtrReproject(hitPos, prevRo, prevForward, prevRight, prevUp, szf, q)) {
-            historyMotionPx = length(vec2(p) - q);
-            if (historyMotionPx < RTR_HISTORY_MOTION_REJECT_PX) {
-                ivec2 q0 = ivec2(round(q));
-                vec3 colorSum = vec3(0.0);
-                float lenSum = 0.0;
-                float moment2Sum = 0.0;
-                float weightSum = 0.0;
-                bool tightHistorySearch = historyMotionPx > RTR_HISTORY_MOTION_TIGHTEN_PX;
-
-                for (int y = -1; y <= 1; y++) {
-                    for (int x = -1; x <= 1; x++) {
-                        if (tightHistorySearch && (x != 0 || y != 0)) continue;
-
-                        ivec2 c = q0 + ivec2(x, y);
-                        if (any(lessThan(c, ivec2(0))) || any(greaterThanEqual(c, sz))) continue;
-
-                        uint prevPixel = uint(c.y) * uint(sz.x) + uint(c.x);
-                        uint prevBase = RTR_HISTORY_WORD + ((frame ^ 1u) & 1u) * pageWords + prevPixel * RTR_HISTORY_WORDS_PER_PIXEL;
-                        if (rtrMem[prevBase + RTR_HISTORY_HIT_WORD] == 0u) continue;
-
-                        vec3 prevPos = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_POS_WORD],
-                                                             rtrMem[prevBase + RTR_HISTORY_POS_WORD + 1u],
-                                                             rtrMem[prevBase + RTR_HISTORY_POS_WORD + 2u]));
-                        vec3 prevN = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD],
-                                                           rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 1u],
-                                                           rtrMem[prevBase + RTR_HISTORY_NORMAL_WORD + 2u]));
-                        vec3 prevAlbedo = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD],
-                                                                rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 1u],
-                                                                rtrMem[prevBase + RTR_HISTORY_ALBEDO_WORD + 2u]));
-                        vec3 posDelta = hitPos - prevPos;
-                        float planeDelta = abs(dot(posDelta, primary.n));
-                        float maxPlaneDelta = max(0.025, primary.t * 0.012);
-                        float maxWorldDelta = max(0.05, primary.t * 0.02);
-                        vec3 albedoDelta = prevAlbedo - hitAlbedo;
-                        if (planeDelta > maxPlaneDelta ||
-                            dot(posDelta, posDelta) > maxWorldDelta * maxWorldDelta ||
-                            dot(prevN, primary.n) < 0.90 ||
-                            dot(albedoDelta, albedoDelta) > RTR_ALBEDO_EPS2) continue;
-
-                        vec2 d = vec2(c) - q;
-                        float w = 1.0 / (1.0 + 2.0 * dot(d, d));
-                        vec3 prevColor = uintBitsToFloat(uvec3(rtrMem[prevBase + RTR_HISTORY_COLOR_WORD],
-                                                               rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 1u],
-                                                               rtrMem[prevBase + RTR_HISTORY_COLOR_WORD + 2u]));
-                        float prevLen = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_LEN_WORD]);
-                        float prevM2 = uintBitsToFloat(rtrMem[prevBase + RTR_HISTORY_MOMENT2_WORD]);
-                        colorSum += prevColor * w;
-                        lenSum += prevLen * w;
-                        moment2Sum += prevM2 * w;
-                        weightSum += w;
-                    }
-                }
-
-                if (weightSum > 0.01) {
-                    historyColor = colorSum / weightSum;
-                    prevHistoryLen = lenSum / weightSum;
-                    prevMoment2 = moment2Sum / weightSum;
-                    useHistory = true;
-                }
-            }
-        }
-    }
-
-    if (shadingHit) {
-        rtrReservoirAddInitialCandidates(reservoir, hitPos, primary.n, hitAlbedo, rng);
-
-        float selectedTarget = reservoir.valid ?
-            rtrLuminance(rtrLightDensity(hitPos, primary.n, hitAlbedo, reservoir.lightPos)) : 0.0;
-        rtrReservoirFinalize(reservoir, selectedTarget);
-    }
-
-    vec3 color = hit ? primary.emission : rtrSky(rd);
-    if (shadingHit) {
-        color += rtrReservoirDirectLighting(reservoir, hitPos, primary.n, hitAlbedo);
-
-        vec3 indirect = vec3(0.0);
-        for (int i = 0; i < RTR_INDIRECT_SAMPLES; i++) {
-            indirect += rtrIndirectRadiance(primary, ro, rd, rng);
-        }
-        color += indirect / float(RTR_INDIRECT_SAMPLES);
-    }
-
-    float currentLum = rtrLuminance(color);
-    if (useHistory && currentLum > 0.0) {
-        float historyLum = rtrLuminance(historyColor);
-        float sigma = sqrt(max(0.0, prevMoment2 - historyLum * historyLum));
-        float maxLum = historyLum + max(1.0, 4.0 * sigma);
-        color *= min(1.0, maxLum / currentLum);
-        currentLum = rtrLuminance(color);
-    }
-
-    float historyLen = useHistory ? min(prevHistoryLen + 1.0, 255.0) : 1.0;
-    float alpha = 1.0;
-    if (useHistory) {
-        float historyLum = rtrLuminance(historyColor);
-        float unbiasedDiff = abs(currentLum - historyLum) / max(currentLum, max(historyLum, 0.2));
-        float unbiasedWeight = max(0.0, 1.0 - unbiasedDiff);
-        float feedback = mix(RTR_FEEDBACK_MIN, RTR_FEEDBACK_MAX, unbiasedWeight * unbiasedWeight);
-        float motionBlend = smoothstep(0.0, RTR_HISTORY_MOTION_REFRESH_PX, historyMotionPx);
-        feedback = mix(feedback, min(feedback, RTR_HISTORY_MOTION_FEEDBACK), motionBlend);
-        alpha = 1.0 - feedback;
-    }
-    color = useHistory ? mix(historyColor, color, alpha) : color;
-    float moment2 = useHistory ? mix(prevMoment2, currentLum * currentLum, alpha) : currentLum * currentLum;
-    uvec3 packedColor = floatBitsToUint(color);
-    uvec3 packedPos = floatBitsToUint(hitPos);
-    uvec3 packedN = floatBitsToUint(hit ? primary.n : vec3(0.0));
-    uvec3 packedAlbedo = floatBitsToUint(hitAlbedo);
-    uvec3 packedLightPos = floatBitsToUint(reservoir.valid ? reservoir.lightPos : vec3(0.0));
-    uvec3 packedHistoryVecs[RTR_HISTORY_VEC3_FIELD_COUNT] = uvec3[](
-        packedColor,
-        packedPos,
-        packedN,
-        packedAlbedo,
-        packedLightPos);
-    const uint historyVecWords[RTR_HISTORY_VEC3_FIELD_COUNT] = uint[](
-        RTR_HISTORY_COLOR_WORD,
-        RTR_HISTORY_POS_WORD,
-        RTR_HISTORY_NORMAL_WORD,
-        RTR_HISTORY_ALBEDO_WORD,
-        RTR_HISTORY_LIGHT_POS_WORD);
-    for (int field = 0; field < RTR_HISTORY_VEC3_FIELD_COUNT; field++) {
-        uint dst = historyBase + historyVecWords[field];
-        uvec3 value = packedHistoryVecs[field];
-        rtrMem[dst] = value.x;
-        rtrMem[dst + 1u] = value.y;
-        rtrMem[dst + 2u] = value.z;
-    }
-    rtrMem[historyBase + RTR_HISTORY_HIT_WORD] = hit ? 1u : 0u;
-    rtrMem[historyBase + RTR_HISTORY_LEN_WORD] = floatBitsToUint(historyLen);
-    rtrMem[historyBase + RTR_HISTORY_MOMENT2_WORD] = floatBitsToUint(moment2);
-    rtrMem[historyBase + RTR_HISTORY_LIGHT_W_WORD] = floatBitsToUint(reservoir.valid ? reservoir.W : 0.0);
-    rtrMem[historyBase + RTR_HISTORY_LIGHT_M_WORD] = reservoir.valid ? reservoir.M : 0u;
+    RTRHit hit = rtrTrace(ro, rd);
+    vec3 color = rtrShade(hit, ro, rd);
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }

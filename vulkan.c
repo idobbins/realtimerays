@@ -15,12 +15,14 @@
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
 #define RTR_MEMORY_HEADER_WORDS 16u
-#define RTR_HISTORY_WORDS_PER_PIXEL 20u
-#define RTR_HISTORY_PAGE_COUNT 2u
+#define RTR_SCENE_SPHERE_COUNT 100u
+#define RTR_SCENE_SPHERE_WORDS 8u
+#define RTR_SCENE_WORDS (RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS)
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
 void rtrWindowMouse(float *x, float *y);
+void rtrScene(uint32_t *words);
 
 enum {
     RTR_MEMORY_MAGIC_WORD = 0,
@@ -31,9 +33,7 @@ enum {
     RTR_MEMORY_MOUSE_X_WORD = 5,
     RTR_MEMORY_MOUSE_Y_WORD = 6,
     RTR_MEMORY_TIME_WORD = 7,
-    RTR_MEMORY_PREV_TIME_WORD = 8,
-    RTR_MEMORY_PREV_MOUSE_X_WORD = 9,
-    RTR_MEMORY_PREV_MOUSE_Y_WORD = 10,
+    RTR_MEMORY_SPHERE_COUNT_WORD = 8,
 };
 
 static const char *const rtrInstanceExts[] = {
@@ -144,13 +144,8 @@ static float rtrElapsedSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
-    const VkDeviceSize historyWords =
-        (VkDeviceSize)rtrSwapExtent.width *
-        (VkDeviceSize)rtrSwapExtent.height *
-        (VkDeviceSize)RTR_HISTORY_WORDS_PER_PIXEL *
-        (VkDeviceSize)RTR_HISTORY_PAGE_COUNT;
     const VkDeviceSize rtrMemorySize =
-        ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS + historyWords) *
+        ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS + (VkDeviceSize)RTR_SCENE_WORDS) *
         (VkDeviceSize)sizeof(uint32_t);
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -183,27 +178,19 @@ static int rtrCreateMemoryBuffer(void)
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(-1.0f);
-    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_X_WORD] = rtrF32Word(-1.0f);
-    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_Y_WORD] = rtrF32Word(-1.0f);
+    rtrScene(rtrMemoryWords);
 
     return 0;
 }
 
 static void rtrUpdateMemoryWith(float time, float mouseX, float mouseY)
 {
-    const uint32_t prevTimeWord = rtrMemoryWords[RTR_MEMORY_TIME_WORD];
-    const uint32_t prevMouseXWord = rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD];
-    const uint32_t prevMouseYWord = rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD];
-
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_FRAME_WORD] = rtrFrameIndex;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(mouseX);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(mouseY);
     rtrMemoryWords[RTR_MEMORY_TIME_WORD] = rtrF32Word(time);
-    rtrMemoryWords[RTR_MEMORY_PREV_TIME_WORD] = prevTimeWord;
-    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_X_WORD] = prevMouseXWord;
-    rtrMemoryWords[RTR_MEMORY_PREV_MOUSE_Y_WORD] = prevMouseYWord;
 }
 
 static void rtrUpdateMemory(void)
@@ -617,8 +604,8 @@ int rtrVulkanInit(void *windowSurface)
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
                              0u, NULL, 1u, &(VkBufferMemoryBarrier){
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .buffer = rtrMemoryBuffer,
@@ -756,8 +743,8 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
                          0u, NULL, 1u, &(VkBufferMemoryBarrier){
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = rtrMemoryBuffer,
