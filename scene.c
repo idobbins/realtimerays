@@ -4,6 +4,8 @@
 
 enum {
     RTR_SCENE_COUNT_WORD = 8,
+    RTR_SCENE_BOUNDS_MIN_WORD = 9,
+    RTR_SCENE_BOUNDS_MAX_WORD = 12,
     RTR_SCENE_GEOM_WORD = 16,
     RTR_SCENE_SPHERE_COUNT = 100,
     RTR_SCENE_SPHERE_WORDS = 4,
@@ -45,6 +47,8 @@ void rtrScene(uint32_t *words)
     words[RTR_SCENE_COUNT_WORD] = RTR_SCENE_SPHERE_COUNT;
 
     RTRSphere spheres[RTR_SCENE_SPHERE_COUNT];
+    float boundsMin[3] = {1.0e20f, 1.0e20f, 1.0e20f};
+    float boundsMax[3] = {-1.0e20f, -1.0e20f, -1.0e20f};
 
     for (uint32_t z = 0u; z < 10u; z++) {
         for (uint32_t x = 0u; x < 10u; x++) {
@@ -66,10 +70,21 @@ void rtrScene(uint32_t *words)
                 },
                 .morton = rtrMorton2D(x, z),
             };
+
+            const float cy = -1.0f + r;
+            const float lo[3] = {fx - r, cy - r, fz - r};
+            const float hi[3] = {fx + r, cy + r, fz + r};
+            for (uint32_t axis = 0u; axis < 3u; axis++) {
+                if (lo[axis] < boundsMin[axis]) boundsMin[axis] = lo[axis];
+                if (hi[axis] > boundsMax[axis]) boundsMax[axis] = hi[axis];
+            }
         }
     }
 
     qsort(spheres, RTR_SCENE_SPHERE_COUNT, sizeof(spheres[0]), rtrCompareSphere);
+
+    memcpy(words + RTR_SCENE_BOUNDS_MIN_WORD, boundsMin, sizeof(boundsMin));
+    memcpy(words + RTR_SCENE_BOUNDS_MAX_WORD, boundsMax, sizeof(boundsMax));
 
     for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
         memcpy(words + RTR_SCENE_GEOM_WORD + i * RTR_SCENE_SPHERE_WORDS,

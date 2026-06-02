@@ -5,6 +5,7 @@
 #endif
 #define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -248,25 +249,50 @@ static void rtrPushGpuTiming(double gpuMs)
     rtrSortTimingSamples(sorted, RTR_TIMING_WINDOW);
 
     const double avg = sum / (double)RTR_TIMING_WINDOW;
+    const double median =
+        (sorted[RTR_TIMING_WINDOW / 2u - 1u] + sorted[RTR_TIMING_WINDOW / 2u]) * 0.5;
+    const double p95 = sorted[(RTR_TIMING_WINDOW * 95u) / 100u - 1u];
+
     double variance = 0.0;
     for (uint32_t i = 0u; i < RTR_TIMING_WINDOW; i++) {
         const double delta = rtrTimingSamples[i] - avg;
         variance += delta * delta;
     }
     variance /= (double)RTR_TIMING_WINDOW;
+    const double stddev = sqrt(variance);
+    const double cvPercent = avg > 0.0 ? (stddev / avg) * 100.0 : 0.0;
 
-    printf("gpu[%u] frames %u-%u %ux%u avg %.3f ms min %.3f p01 %.3f p99 %.3f max %.3f var %.6f ms^2\n",
+    double jitterSum = 0.0;
+    for (uint32_t i = 1u; i < RTR_TIMING_WINDOW; i++) {
+        jitterSum += rtrTimingSamples[i] - rtrTimingSamples[i - 1u];
+    }
+
+    const uint32_t jitterCount = RTR_TIMING_WINDOW - 1u;
+    const double jitterAvg = jitterSum / (double)jitterCount;
+    double jitterVariance = 0.0;
+    for (uint32_t i = 1u; i < RTR_TIMING_WINDOW; i++) {
+        const double delta = (rtrTimingSamples[i] - rtrTimingSamples[i - 1u]) - jitterAvg;
+        jitterVariance += delta * delta;
+    }
+    jitterVariance /= (double)jitterCount;
+    const double jitterStddev = sqrt(jitterVariance);
+
+    printf("gpu[%u] frames %u-%u %ux%u avg %.3f ms med %.3f ms min %.3f p01 %.3f p95 %.3f p99 %.3f max %.3f stddev %.3f ms cv %.1f%% jitter %.3f ms\n",
            RTR_TIMING_WINDOW,
            rtrTimingWindowFirstFrame,
            rtrTimingFrameIndex,
            rtrSwapExtent.width,
            rtrSwapExtent.height,
            avg,
+           median,
            sorted[0],
            sorted[0],
+           p95,
            sorted[RTR_TIMING_WINDOW - 2u],
            sorted[RTR_TIMING_WINDOW - 1u],
-           variance);
+           stddev,
+           cvPercent,
+           jitterStddev);
     fflush(stdout);
     rtrTimingSampleCount = 0u;
 }

@@ -11,6 +11,8 @@ layout(std430, binding = 1) readonly buffer RTRMemory {
 const uint RTR_MOUSE_X_WORD = 5u;
 const uint RTR_TIME_WORD = 7u;
 const uint RTR_SPHERE_COUNT_WORD = 8u;
+const uint RTR_BOUNDS_MIN_WORD = 9u;
+const uint RTR_BOUNDS_MAX_WORD = 12u;
 
 const uint RTR_MAX_SPHERES = 100u;
 const uint RTR_WORKGROUP_SIZE = 64u;
@@ -33,9 +35,11 @@ shared vec4 shSphereGeom[100];
 shared uint shSphereCount;
 
 shared vec3 shRo;
-shared vec3 shForward;
-shared vec3 shRight;
-shared vec3 shUp;
+shared vec3 shBoundsMin;
+shared vec3 shBoundsMax;
+shared vec3 shRayBase;
+shared vec3 shRayDx;
+shared vec3 shRayDy;
 
 struct RTRHit {
     float t;
@@ -50,6 +54,15 @@ uint rtrLoadU32(uint word)
 float rtrLoadF32(uint word)
 {
     return uintBitsToFloat(rtrLoadU32(word));
+}
+
+vec3 rtrLoadVec3(uint word)
+{
+    return uintBitsToFloat(uvec3(
+        rtrMem[word + 0u],
+        rtrMem[word + 1u],
+        rtrMem[word + 2u]
+    ));
 }
 
 vec4 rtrLoadVec4(uint word)
@@ -96,6 +109,20 @@ void rtrCamera(float time,
     up = cross(right, forward);
 }
 
+bool rtrBoxHit(vec3 ro, vec3 rd, float maxT)
+{
+    vec3 invRd = 1.0 / rd;
+    vec3 t0 = (shBoundsMin - ro) * invRd;
+    vec3 t1 = (shBoundsMax - ro) * invRd;
+    vec3 lo = min(t0, t1);
+    vec3 hi = max(t0, t1);
+
+    float nearT = max(max(lo.x, lo.y), max(lo.z, RTR_EPS));
+    float farT = min(min(hi.x, hi.y), min(hi.z, maxT));
+
+    return nearT <= farT;
+}
+
 void rtrTraceSphere(vec3 ro, vec3 rd, uint i, inout float bestT, inout int bestId)
 {
     vec4 s = shSphereGeom[int(i)];
@@ -138,6 +165,9 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
         }
     }
 
+    if (!rtrBoxHit(ro, rd, hit.t))
+        return hit;
+
     for (uint i = 0u; i < shSphereCount; ++i) {
         rtrTraceSphere(ro, rd, i, hit.t, hit.id);
     }
@@ -151,6 +181,9 @@ float rtrShadow(vec3 p, vec3 n, vec3 l, float maxT, int skipId)
 
     maxT -= 0.02;
     if (maxT <= RTR_EPS)
+        return 1.0;
+
+    if (!rtrBoxHit(ro, l, maxT))
         return 1.0;
 
     for (uint i = 0u; i < shSphereCount; ++i) {
@@ -248,10 +281,16 @@ void main()
 
         rtrCamera(time, mouseX, szf, ro, forward, right, up);
 
+        float invH = 1.0 / max(szf.y, 1.0);
+
         shRo = ro;
-        shForward = forward;
-        shRight = right;
-        shUp = up;
+        shBoundsMin = rtrLoadVec3(RTR_BOUNDS_MIN_WORD);
+        shBoundsMax = rtrLoadVec3(RTR_BOUNDS_MAX_WORD);
+        shRayBase = forward * RTR_FOCAL +
+                    right * ((1.0 - szf.x) * invH) +
+                    up * ((szf.y - 1.0) * invH);
+        shRayDx = right * (2.0 * invH);
+        shRayDy = up * (-2.0 * invH);
     }
 
     barrier();
@@ -265,12 +304,7 @@ void main()
     if (any(greaterThanEqual(p, sz)))
         return;
 
-    vec2 uv = (vec2(p) + 0.5) / szf;
-    vec2 screen = uv * 2.0 - 1.0;
-    screen.x *= szf.x / szf.y;
-    screen.y = -screen.y;
-
-    vec3 ray = shForward * RTR_FOCAL + shRight * screen.x + shUp * screen.y;
+    vec3 ray = shRayBase + shRayDx * float(p.x) + shRayDy * float(p.y);
     vec3 rd = ray * inversesqrt(dot(ray, ray));
 
     RTRHit hit = rtrTrace(shRo, rd);
