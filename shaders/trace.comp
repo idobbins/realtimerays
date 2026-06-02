@@ -20,7 +20,7 @@ const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
 
-const uint RTR_MAX_SPHERES = 1000u;
+const uint RTR_MAX_SPHERES = 10000u;
 const uint RTR_MAX_BVH_NODES = RTR_MAX_SPHERES * 2u - 1u;
 const uint RTR_WORKGROUP_SIZE = 64u;
 

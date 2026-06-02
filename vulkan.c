@@ -8,6 +8,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -16,7 +17,7 @@
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
 #define RTR_MEMORY_HEADER_WORDS 24u
-#define RTR_SCENE_SPHERE_COUNT 1000u
+#define RTR_SCENE_SPHERE_COUNT 10000u
 #define RTR_SCENE_SPHERE_WORDS 8u
 #define RTR_SCENE_BVH_NODE_COUNT (RTR_SCENE_SPHERE_COUNT * 2u - 1u)
 #define RTR_SCENE_BVH_NODE_WORDS 8u
@@ -139,6 +140,26 @@ static uint32_t rtrF32Word(float value)
     uint32_t word = 0u;
     memcpy(&word, &value, sizeof(word));
     return word;
+}
+
+static float rtrEnvF32(const char *name, float fallback)
+{
+    const char *value = getenv(name);
+    if (!(value && *value)) return fallback;
+
+    char *end = NULL;
+    const float parsed = strtof(value, &end);
+    return end != value ? parsed : fallback;
+}
+
+static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    if (!(value && *value)) return fallback;
+
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    return end != value ? (uint32_t)parsed : fallback;
 }
 
 static uint32_t rtrFindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags)
@@ -922,13 +943,22 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
     rtrSwapExtent = (VkExtent2D){width, height};
     if (rtrVulkanInit(NULL)) return 1;
 
+    const uint32_t autoOrbit =
+        rtrEnvU32("RTR_XPOST_AUTO_ORBIT", RTR_CAMERA_AUTO_DEFAULT) ? 1u : 0u;
+    const float cameraYaw =
+        rtrEnvF32("RTR_XPOST_CAMERA_YAW", RTR_CAMERA_DEFAULT_YAW);
+    const float cameraPitch =
+        rtrEnvF32("RTR_XPOST_CAMERA_PITCH", RTR_CAMERA_DEFAULT_PITCH);
+    const float cameraRadius =
+        rtrEnvF32("RTR_XPOST_CAMERA_RADIUS", RTR_CAMERA_DEFAULT_RADIUS);
+
     VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (uint32_t frame = 0u; frame < frames; frame++) {
         rtrUpdateMemoryWith((float)frame / (float)fps, -1.0f, -1.0f,
-                            RTR_CAMERA_AUTO_DEFAULT,
-                            RTR_CAMERA_DEFAULT_YAW,
-                            RTR_CAMERA_DEFAULT_PITCH,
-                            RTR_CAMERA_DEFAULT_RADIUS);
+                            autoOrbit,
+                            cameraYaw,
+                            cameraPitch,
+                            cameraRadius);
         vkResetCommandBuffer(rtrCommandBuffers[0], 0u);
         rtrRecordExportFrame(rtrCommandBuffers[0], rtrSwapImages[0],
                              rtrExportStagingBuffer, oldLayout);
