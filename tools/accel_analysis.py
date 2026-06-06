@@ -209,6 +209,59 @@ def uniform_grid(
     return Cost(name, touched_cells, spheres, total, "O(N)", memory, note)
 
 
+def strict_two_level_grid(
+    scene: Scene,
+    scenario: Scenario,
+    traversal_cost: float,
+    sphere_cost: float,
+) -> Cost:
+    """Fixed two-level 2D grid: coarse cells plus fixed-ratio fine subgrids."""
+
+    best: tuple[float, float, float, float, int, int, int] | None = None
+    lo = max(scene.min_radius * 0.35, 0.001)
+    hi = scene.disk_radius
+    for ratio in (4, 8, 16):
+        for i in range(180):
+            t = i / 179.0
+            fine_h = lo * (hi / lo) ** t
+            coarse_h = fine_h * ratio
+            coarse_dim = max(1, math.ceil((scene.disk_radius * 2.0) / coarse_h))
+            coarse_h = (scene.disk_radius * 2.0) / coarse_dim
+            fine_h = coarse_h / ratio
+
+            fine_area = dilated_area(scene, scenario, 0.7071 * fine_h)
+            coarse_area = dilated_area(scene, scenario, 0.7071 * coarse_h)
+            fine_cells = max(1.0, fine_area / (fine_h * fine_h))
+            coarse_cells = max(1.0, coarse_area / (coarse_h * coarse_h))
+            traversal = coarse_cells + fine_cells
+            spheres = min(float(scene.sphere_count), scene.density * fine_area)
+            total = score(traversal, spheres, traversal_cost, sphere_cost)
+            if best is None or total < best[0]:
+                best = (total, traversal, spheres, fine_h, ratio, coarse_dim, coarse_cells)
+
+    assert best is not None
+    total, traversal, spheres, fine_h, ratio, coarse_dim, coarse_cells = best
+    coarse_cells_total = coarse_dim * coarse_dim
+    occupied_coarse = min(
+        coarse_cells_total,
+        int(math.ceil(scene.disk_area / ((fine_h * ratio) * (fine_h * ratio)))),
+    )
+    fine_cells_total = occupied_coarse * ratio * ratio
+    avg_occ = scene.sphere_count / max(1, fine_cells_total)
+    return Cost(
+        "strict 2-level grid",
+        traversal,
+        spheres,
+        total,
+        "O(N)",
+        f"~{coarse_cells_total}+{fine_cells_total} cells",
+        (
+            f"fine_h={fine_h:.4f}, ratio={ratio}, coarse_checks={coarse_cells:.2f}, "
+            f"avg_fine_occ={avg_occ:.2f}"
+        ),
+    )
+
+
 def hgrid(scene: Scene, scenario: Scenario, traversal_cost: float, sphere_cost: float) -> Cost:
     levels: list[tuple[float, float, int]] = []
     r0 = scene.min_radius
@@ -355,6 +408,7 @@ def costs_for(scene: Scene, scenario: Scenario, traversal_cost: float, sphere_co
     )
     costs.append(uniform_grid(scene, scenario, traversal_cost, sphere_cost, hashed=False))
     costs.append(uniform_grid(scene, scenario, traversal_cost, sphere_cost, hashed=True))
+    costs.append(strict_two_level_grid(scene, scenario, traversal_cost, sphere_cost))
     costs.append(hgrid(scene, scenario, traversal_cost, sphere_cost))
     costs.append(
         leaf_size_models(
