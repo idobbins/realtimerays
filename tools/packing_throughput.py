@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""First-principles ray throughput limits for packed scene data.
+"""First-principles ray throughput limits for the packed scene data layout.
 
 The model asks: if bandwidth is the ceiling, how many bytes must each ray touch?
-It reuses the analytical candidate counts from accel_analysis.py, then compares
-FP32 storage with practical and aggressive fixed-point packing.
+It reuses the analytical candidate counts from accel_analysis.py and reports the
+single canonical packed fixed-point layout used by the renderer.
 """
 
 from __future__ import annotations
@@ -136,42 +136,18 @@ def make_profiles(scene) -> list[Profile]:
 
 
 def make_layouts(ray_queue: bool) -> list[Layout]:
-    ray0 = 32.0 if ray_queue else 0.0
     ray1 = 16.0 if ray_queue else 0.0
-    ray2 = 12.0 if ray_queue else 0.0
     return [
         Layout(
-            "current FP32",
-            node_bytes=32.0,
-            sphere_bytes=16.0,
-            cell_bytes=4.0,
-            ray_roundtrip_bytes=ray0,
-            node_ops=35.0,
-            sphere_ops=40.0,
-            cell_ops=5.0,
-            note="vec4 sphere, 32B BVH node",
-        ),
-        Layout(
-            "packed fixed 16",
+            "packed fixed 3D",
             node_bytes=16.0,
-            sphere_bytes=8.0,
+            sphere_bytes=4.0,
             cell_bytes=4.0,
             ray_roundtrip_bytes=ray1,
             node_ops=50.0,
             sphere_ops=55.0,
             cell_ops=5.0,
-            note="uint2 sphere, 16B quantized 2D node",
-        ),
-        Layout(
-            "aggressive fixed",
-            node_bytes=8.0,
-            sphere_bytes=4.0,
-            cell_bytes=2.0,
-            ray_roundtrip_bytes=ray2,
-            node_ops=65.0,
-            sphere_ops=70.0,
-            cell_ops=7.0,
-            note="32-bit sphere, 64-bit implicit/quantized node",
+            note="4B sphere, procedural color, 16B quantized 3D node",
         ),
     ]
 
@@ -279,10 +255,10 @@ def main() -> int:
         print()
 
     print("Interpretation:")
-    print("  - 16-bit fixed packing roughly doubles BVH throughput when bandwidth-bound.")
-    print("  - 32-bit sphere records can 4x brute force, but brute force remains poor.")
+    print("  - Sphere geometry and BVH nodes are the canonical packed runtime layout.")
+    print("  - Sphere colors are reconstructed procedurally; there is no material table.")
     print("  - Once candidate data falls below ~50B/ray, ray queue traffic starts to matter.")
-    print("  - Aggressive node packing must inflate bounds enough to cover quantization error.")
+    print("  - Quantized node bounds are inflated enough to cover quantization error.")
     return 0
 
 

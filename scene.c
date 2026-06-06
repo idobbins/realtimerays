@@ -1,5 +1,4 @@
 #include <stdint.h>
-#include <string.h>
 #include <stdlib.h>
 #include <math.h>
 
@@ -12,6 +11,7 @@
 #endif
 
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
+#define RTR_SCENE_PACKED_META_INTERNAL_FLAG 0x80000000u
 #define RTR_SCENE_PI 3.14159265358979323846f
 #define RTR_SCENE_GROUND_Y -1.0f
 #define RTR_SCENE_DISK_RADIUS 2.60f
@@ -28,15 +28,12 @@
 
 enum {
     RTR_SCENE_COUNT_WORD = 8,
-    RTR_SCENE_BOUNDS_MIN_WORD = 9,
-    RTR_SCENE_BOUNDS_MAX_WORD = 12,
     RTR_SCENE_BVH_NODE_COUNT_WORD = 15,
     RTR_SCENE_GEOM_WORD = 24,
     RTR_SCENE_SPHERE_COUNT = 10000,
-    RTR_SCENE_SPHERE_WORDS = 4,
-    RTR_SCENE_MAT_WORD = RTR_SCENE_GEOM_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
-    RTR_SCENE_BVH_WORD = RTR_SCENE_MAT_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
-    RTR_SCENE_BVH_NODE_WORDS = 8,
+    RTR_SCENE_SPHERE_WORDS = 1,
+    RTR_SCENE_BVH_WORD = RTR_SCENE_GEOM_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
+    RTR_SCENE_BVH_NODE_WORDS = 4,
     RTR_SCENE_BVH_MAX_NODES = RTR_SCENE_SPHERE_COUNT * 2 - 1,
     RTR_SCENE_BLUE_NOISE_WORD = RTR_SCENE_BVH_WORD +
         RTR_SCENE_BVH_MAX_NODES * RTR_SCENE_BVH_NODE_WORDS,
@@ -44,7 +41,6 @@ enum {
 
 typedef struct RTRSphere {
     float geom[4];
-    float mat[4];
 } RTRSphere;
 
 typedef struct RTRBVHNode {
@@ -82,6 +78,79 @@ static uint32_t rtrHashU32(uint32_t value)
 static float rtrHash01(uint32_t value)
 {
     return (float)(rtrHashU32(value) & 0x00ffffffu) / 16777215.0f;
+}
+
+static float rtrClampF32(float value, float minValue, float maxValue)
+{
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+static uint32_t rtrPack2x16(uint32_t lo, uint32_t hi)
+{
+    return (lo & 0xffffu) | ((hi & 0xffffu) << 16u);
+}
+
+static uint32_t rtrPackUnorm16Floor(float value, float minValue, float maxValue)
+{
+    const float t = rtrClampF32((value - minValue) / (maxValue - minValue),
+                                0.0f, 1.0f);
+    return (uint32_t)floorf(t * 65535.0f);
+}
+
+static uint32_t rtrPackUnorm16Ceil(float value, float minValue, float maxValue)
+{
+    const float t = rtrClampF32((value - minValue) / (maxValue - minValue),
+                                0.0f, 1.0f);
+    uint32_t q = (uint32_t)ceilf(t * 65535.0f);
+    return q > 65535u ? 65535u : q;
+}
+
+static uint32_t rtrPackUnormNNearest(float value,
+                                     float minValue,
+                                     float maxValue,
+                                     uint32_t bits)
+{
+    const uint32_t maxQuant = (1u << bits) - 1u;
+    const float t = rtrClampF32((value - minValue) / (maxValue - minValue),
+                                0.0f, 1.0f);
+
+    return (uint32_t)floorf(t * (float)maxQuant + 0.5f);
+}
+
+static float rtrUnpackUnormN(uint32_t value,
+                             float minValue,
+                             float maxValue,
+                             uint32_t bits)
+{
+    const uint32_t maxQuant = (1u << bits) - 1u;
+
+    return minValue + (maxValue - minValue) *
+        ((float)(value & maxQuant) / (float)maxQuant);
+}
+
+static void rtrQuantizeSphereGeom(RTRSphere *sphere)
+{
+    const uint32_t x = rtrPackUnormNNearest(sphere->geom[0],
+                                            -RTR_SCENE_DISK_RADIUS,
+                                            RTR_SCENE_DISK_RADIUS,
+                                            12u);
+    const uint32_t z = rtrPackUnormNNearest(sphere->geom[2],
+                                            -RTR_SCENE_DISK_RADIUS,
+                                            RTR_SCENE_DISK_RADIUS,
+                                            12u);
+    const uint32_t r = rtrPackUnormNNearest(sphere->geom[3],
+                                            0.0f,
+                                            RTR_SCENE_MAX_SPHERE_RADIUS,
+                                            8u);
+
+    sphere->geom[0] = rtrUnpackUnormN(x, -RTR_SCENE_DISK_RADIUS,
+                                      RTR_SCENE_DISK_RADIUS, 12u);
+    sphere->geom[2] = rtrUnpackUnormN(z, -RTR_SCENE_DISK_RADIUS,
+                                      RTR_SCENE_DISK_RADIUS, 12u);
+    sphere->geom[3] = rtrUnpackUnormN(r, 0.0f, RTR_SCENE_MAX_SPHERE_RADIUS, 8u);
+    sphere->geom[1] = RTR_SCENE_GROUND_Y + sphere->geom[3];
 }
 
 static int rtrCompareSphereByRadiusDesc(const void *lhs, const void *rhs)
@@ -541,11 +610,60 @@ static uint32_t rtrBuildBVH(RTRSphere *spheres, RTRBVHNode *nodes, uint32_t *nod
 static void rtrStoreBVHNode(uint32_t *words, uint32_t index, const RTRBVHNode *node)
 {
     const uint32_t word = RTR_SCENE_BVH_WORD + index * RTR_SCENE_BVH_NODE_WORDS;
+    const uint32_t minX = rtrPackUnorm16Floor(node->boundsMin[0],
+                                              -RTR_SCENE_DISK_RADIUS,
+                                              RTR_SCENE_DISK_RADIUS);
+    const uint32_t minZ = rtrPackUnorm16Floor(node->boundsMin[2],
+                                              -RTR_SCENE_DISK_RADIUS,
+                                              RTR_SCENE_DISK_RADIUS);
+    const uint32_t maxX = rtrPackUnorm16Ceil(node->boundsMax[0],
+                                             -RTR_SCENE_DISK_RADIUS,
+                                             RTR_SCENE_DISK_RADIUS);
+    const uint32_t maxZ = rtrPackUnorm16Ceil(node->boundsMax[2],
+                                             -RTR_SCENE_DISK_RADIUS,
+                                             RTR_SCENE_DISK_RADIUS);
+    const uint32_t minY = rtrPackUnorm16Floor(node->boundsMin[1],
+                                              RTR_SCENE_GROUND_Y,
+                                              RTR_SCENE_GROUND_Y +
+                                                  RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f);
+    const uint32_t maxY = rtrPackUnorm16Ceil(node->boundsMax[1],
+                                             RTR_SCENE_GROUND_Y,
+                                             RTR_SCENE_GROUND_Y +
+                                                 RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f);
 
-    memcpy(words + word, node->boundsMin, sizeof(node->boundsMin));
-    words[word + 3u] = node->leftFirst;
-    memcpy(words + word + 4u, node->boundsMax, sizeof(node->boundsMax));
-    words[word + 7u] = node->countRight;
+    words[word + 0u] = rtrPack2x16(minX, minZ);
+    words[word + 1u] = rtrPack2x16(maxX, maxZ);
+    words[word + 2u] = rtrPack2x16(minY, maxY);
+    if ((node->countRight & RTR_SCENE_BVH_INTERNAL_FLAG) != 0u) {
+        const uint32_t right = node->countRight & ~RTR_SCENE_BVH_INTERNAL_FLAG;
+        words[word + 3u] =
+            RTR_SCENE_PACKED_META_INTERNAL_FLAG |
+            (node->leftFirst & 0x7fffu) |
+            ((right & 0x7fffu) << 15u);
+    } else {
+        words[word + 3u] =
+            (node->leftFirst & 0x3fffu) |
+            ((node->countRight & 0x0fu) << 14u);
+    }
+}
+
+static void rtrStoreSphereGeom(uint32_t *words, uint32_t index, const RTRSphere *sphere)
+{
+    const uint32_t word = RTR_SCENE_GEOM_WORD + index * RTR_SCENE_SPHERE_WORDS;
+    const uint32_t x = rtrPackUnormNNearest(sphere->geom[0],
+                                            -RTR_SCENE_DISK_RADIUS,
+                                            RTR_SCENE_DISK_RADIUS,
+                                            12u);
+    const uint32_t z = rtrPackUnormNNearest(sphere->geom[2],
+                                            -RTR_SCENE_DISK_RADIUS,
+                                            RTR_SCENE_DISK_RADIUS,
+                                            12u);
+    const uint32_t r = rtrPackUnormNNearest(sphere->geom[3],
+                                            0.0f,
+                                            RTR_SCENE_MAX_SPHERE_RADIUS,
+                                            8u);
+
+    words[word] = x | (z << 12u) | (r << 24u);
 }
 
 void rtrScene(uint32_t *words)
@@ -584,29 +702,17 @@ void rtrScene(uint32_t *words)
             spheres[i].geom[3] = 0.0005f;
             placed = rtrPlaceSphere(spheres, &placementGrid, i);
         }
-
-        const float u = spheres[i].geom[0] / (RTR_SCENE_DISK_RADIUS * 2.0f) + 0.5f;
-        const float v = spheres[i].geom[2] / (RTR_SCENE_DISK_RADIUS * 2.0f) + 0.5f;
-        const float w = rtrHash01(i * 2246822519u + 3266489917u);
-        const float r = spheres[i].geom[3];
-
-        spheres[i].mat[0] = 0.24f + 0.52f * u;
-        spheres[i].mat[1] = 0.24f + 0.42f * w;
-        spheres[i].mat[2] = 0.34f + 0.36f * v;
-        spheres[i].mat[3] = 1.0f / r;
     }
+
+    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
+        rtrQuantizeSphereGeom(spheres + i);
 
     rtrBuildBVH(spheres, nodes, &nodeCount, 0u, RTR_SCENE_SPHERE_COUNT);
 
-    memcpy(words + RTR_SCENE_BOUNDS_MIN_WORD, nodes[0].boundsMin, sizeof(nodes[0].boundsMin));
-    memcpy(words + RTR_SCENE_BOUNDS_MAX_WORD, nodes[0].boundsMax, sizeof(nodes[0].boundsMax));
     words[RTR_SCENE_BVH_NODE_COUNT_WORD] = nodeCount;
 
     for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-        memcpy(words + RTR_SCENE_GEOM_WORD + i * RTR_SCENE_SPHERE_WORDS,
-               spheres[i].geom, sizeof(spheres[i].geom));
-        memcpy(words + RTR_SCENE_MAT_WORD + i * RTR_SCENE_SPHERE_WORDS,
-               spheres[i].mat, sizeof(spheres[i].mat));
+        rtrStoreSphereGeom(words, i, spheres + i);
     }
 
     for (uint32_t i = 0u; i < nodeCount; i++) {
