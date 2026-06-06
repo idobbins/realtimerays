@@ -267,6 +267,14 @@ bool rtrBoxHitBounds(vec3 ro,
     return nearT <= farT;
 }
 
+vec3 rtrSafeInvDir(vec3 rd)
+{
+    vec3 magnitude = max(abs(rd), vec3(1.0e-8));
+    vec3 direction = mix(-magnitude, magnitude, greaterThanEqual(rd, vec3(0.0)));
+
+    return 1.0 / direction;
+}
+
 bool rtrSceneBoxHit(vec3 ro, vec3 invRd, float maxT)
 {
     float nearT;
@@ -324,7 +332,7 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
     RTRHit hit;
     hit.t = RTR_INF;
     hit.id = RTR_HIT_NONE;
-    vec3 invRd = 1.0 / rd;
+    vec3 invRd = rtrSafeInvDir(rd);
 
     if (rd.y < -0.00001) {
         float t = (RTR_PLANE_Y - ro.y) / rd.y;
@@ -402,7 +410,7 @@ float rtrShadow(vec3 p, vec3 n, vec3 l, float maxT, int skipId)
     if (maxT <= RTR_EPS)
         return 1.0;
 
-    vec3 invL = 1.0 / l;
+    vec3 invL = rtrSafeInvDir(l);
 
     if (shBVHNodeCount == 0u || !rtrSceneBoxHit(ro, invL, maxT))
         return 1.0;
@@ -601,8 +609,10 @@ vec3 rtrRadiance(vec3 ro, vec3 rd, uint sampleIndex, uint sampleCount)
 
 vec3 rtrTonemap(vec3 color)
 {
-    color = color / (color + vec3(1.0));
-    return sqrt(color);
+    color *= 0.85;
+    color = (color * (2.51 * color + vec3(0.03))) /
+            (color * (2.43 * color + vec3(0.59)) + vec3(0.14));
+    return sqrt(clamp(color, vec3(0.0), vec3(1.0)));
 }
 
 void main()

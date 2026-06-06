@@ -58,6 +58,7 @@ enum {
 #define RTR_CAMERA_DEFAULT_PITCH 0.473f
 #define RTR_CAMERA_DEFAULT_RADIUS 4.0f
 #define RTR_CAMERA_AUTO_SPEED 0.08f
+#define RTR_FRAME_TIME_CLAMP_SECONDS (1.0 / 20.0)
 
 static const char *const rtrInstanceExts[] = {
     VK_KHR_SURFACE_EXTENSION_NAME,
@@ -102,7 +103,9 @@ static VkQueue rtrQueue = VK_NULL_HANDLE;
 static VkSwapchainKHR rtrSwapchain = VK_NULL_HANDLE;
 static VkExtent2D rtrSwapExtent = {0u, 0u};
 static VkImage rtrSwapImages[RTR_MAX_SWAP_IMAGES];
-static VkImageView rtrSwapImageViews[RTR_MAX_SWAP_IMAGES];
+static VkImage rtrRenderImage = VK_NULL_HANDLE;
+static VkImageView rtrRenderImageView = VK_NULL_HANDLE;
+static VkDeviceMemory rtrRenderImageMemory = VK_NULL_HANDLE;
 static VkDescriptorSetLayout rtrDescriptorSetLayout = VK_NULL_HANDLE;
 static VkDescriptorPool rtrDescriptorPool = VK_NULL_HANDLE;
 static VkDescriptorSet rtrDescriptorSets[RTR_MAX_SWAP_IMAGES];
@@ -111,12 +114,11 @@ static VkPipeline rtrPipeline = VK_NULL_HANDLE;
 static VkCommandPool rtrCommandPool = VK_NULL_HANDLE;
 static VkCommandBuffer rtrCommandBuffers[RTR_MAX_SWAP_IMAGES];
 static VkSemaphore rtrImageAvailableSemaphore = VK_NULL_HANDLE;
-static VkSemaphore rtrRenderFinishedSemaphore = VK_NULL_HANDLE;
+static VkSemaphore rtrRenderFinishedSemaphores[RTR_MAX_SWAP_IMAGES];
 static VkFence rtrInFlightFence = VK_NULL_HANDLE;
 static VkQueryPool rtrTimingQueryPool = VK_NULL_HANDLE;
 static VkBuffer rtrMemoryBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory rtrMemoryBufferMemory = VK_NULL_HANDLE;
-static VkDeviceMemory rtrExportImageMemory = VK_NULL_HANDLE;
 static VkBuffer rtrExportStagingBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory rtrExportStagingMemory = VK_NULL_HANDLE;
 static VkDeviceSize rtrExportImageBytes = 0u;
@@ -134,6 +136,9 @@ static float rtrTimestampPeriod = 1.0f;
 static double rtrTimingSamples[RTR_TIMING_WINDOW];
 static FILE *rtrTimingOut = NULL;
 static struct timespec rtrStartTime;
+static double rtrFrameClockSeconds = 0.0;
+static double rtrFrameClockLastSeconds = 0.0;
+static uint32_t rtrFrameClockReady = 0u;
 
 static uint32_t rtrF32Word(float value)
 {
@@ -177,13 +182,143 @@ static uint32_t rtrFindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags
     return UINT32_MAX;
 }
 
-static float rtrElapsedSeconds(void)
+static uint32_t rtrFormatSupports(VkFormat format, VkFormatFeatureFlags features)
+{
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(rtrPhysicalDevice, format, &props);
+
+    return (uint32_t)((props.optimalTilingFeatures & features) == features);
+}
+
+static int rtrChooseSurfaceFormat(VkSurfaceFormatKHR *chosen)
+{
+    uint32_t formatCount = 0u;
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(rtrPhysicalDevice, rtrSurface,
+                                             &formatCount, NULL) != VK_SUCCESS ||
+        formatCount == 0u) {
+        fprintf(stderr, "swapchain: no surface formats available\n");
+        return 1;
+    }
+
+    VkSurfaceFormatKHR *formats =
+        (VkSurfaceFormatKHR *)malloc(sizeof(*formats) * (size_t)formatCount);
+    if (!formats) return 1;
+
+    if (vkGetPhysicalDeviceSurfaceFormatsKHR(rtrPhysicalDevice, rtrSurface,
+                                             &formatCount, formats) != VK_SUCCESS) {
+        free(formats);
+        return 1;
+    }
+
+    const VkFormat preferred[] = {
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM,
+    };
+
+    for (uint32_t p = 0u; p < (uint32_t)(sizeof(preferred) / sizeof(*preferred)); p++) {
+        for (uint32_t i = 0u; i < formatCount; i++) {
+            if (formats[i].format == preferred[p] &&
+                formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                *chosen = formats[i];
+                free(formats);
+                return 0;
+            }
+        }
+    }
+
+    for (uint32_t i = 0u; i < formatCount; i++) {
+        if ((formats[i].format == VK_FORMAT_B8G8R8A8_UNORM ||
+             formats[i].format == VK_FORMAT_R8G8B8A8_UNORM)) {
+            *chosen = formats[i];
+            free(formats);
+            return 0;
+        }
+    }
+
+    fprintf(stderr, "swapchain: no rgba8/bgra8 surface format\n");
+    free(formats);
+    return 1;
+}
+
+static int rtrCreateRenderImage(void)
+{
+    if (!rtrFormatSupports(VK_FORMAT_R8G8B8A8_UNORM,
+                           VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                           VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
+        fprintf(stderr, "render image: R8G8B8A8_UNORM storage/blit source unsupported\n");
+        return 1;
+    }
+
+    if (vkCreateImage(rtrDevice, &(VkImageCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {rtrSwapExtent.width, rtrSwapExtent.height, 1u},
+        .mipLevels = 1u,
+        .arrayLayers = 1u,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    }, NULL, &rtrRenderImage) != VK_SUCCESS) return 1;
+
+    VkMemoryRequirements imageReq;
+    vkGetImageMemoryRequirements(rtrDevice, rtrRenderImage, &imageReq);
+    const uint32_t imageMemoryType = rtrFindMemoryType(
+        imageReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (imageMemoryType == UINT32_MAX) return 1;
+
+    if (vkAllocateMemory(rtrDevice, &(VkMemoryAllocateInfo){
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = imageReq.size,
+        .memoryTypeIndex = imageMemoryType,
+    }, NULL, &rtrRenderImageMemory) != VK_SUCCESS) return 1;
+    vkBindImageMemory(rtrDevice, rtrRenderImage, rtrRenderImageMemory, 0u);
+
+    if (vkCreateImageView(rtrDevice, &(VkImageViewCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = rtrRenderImage,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1u,
+            .layerCount = 1u,
+        },
+    }, NULL, &rtrRenderImageView) != VK_SUCCESS) return 1;
+
+    return 0;
+}
+
+static double rtrElapsedSeconds(void)
 {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     const double seconds = (double)(now.tv_sec - rtrStartTime.tv_sec);
     const double nanos = (double)(now.tv_nsec - rtrStartTime.tv_nsec) / 1000000000.0;
-    return (float)(seconds + nanos);
+    return seconds + nanos;
+}
+
+static float rtrFrameSeconds(void)
+{
+    const double now = rtrElapsedSeconds();
+    if (!rtrFrameClockReady) {
+        rtrFrameClockLastSeconds = now;
+        rtrFrameClockReady = 1u;
+        return 0.0f;
+    }
+
+    double dt = now - rtrFrameClockLastSeconds;
+    rtrFrameClockLastSeconds = now;
+
+    if (dt < 0.0)
+        dt = 0.0;
+    if (dt > RTR_FRAME_TIME_CLAMP_SECONDS)
+        dt = RTR_FRAME_TIME_CLAMP_SECONDS;
+
+    rtrFrameClockSeconds += dt;
+    return (float)rtrFrameClockSeconds;
 }
 
 static int rtrCreateMemoryBuffer(void)
@@ -265,7 +400,7 @@ static void rtrUpdateMemory(void)
 
     rtrWindowMouse(&mouseX, &mouseY);
     rtrWindowCamera(&autoOrbit, &cameraYaw, &cameraPitch, &cameraRadius);
-    rtrUpdateMemoryWith(rtrElapsedSeconds(), mouseX, mouseY,
+    rtrUpdateMemoryWith(rtrFrameSeconds(), mouseX, mouseY,
                         autoOrbit, cameraYaw, cameraPitch, cameraRadius);
 }
 
@@ -430,6 +565,9 @@ int rtrVulkanInit(void *windowSurface)
     rtrTimingOut = windowed ? stdout : stderr;
     clock_gettime(CLOCK_MONOTONIC, &rtrStartTime);
     rtrFrameIndex = 0u;
+    rtrFrameClockSeconds = 0.0;
+    rtrFrameClockLastSeconds = 0.0;
+    rtrFrameClockReady = 0u;
 
     vkCreateInstance(&(VkInstanceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -490,11 +628,21 @@ int rtrVulkanInit(void *windowSurface)
     vkGetDeviceQueue(rtrDevice, 0u, 0u, &rtrQueue);
 
     uint32_t imageCount = 1u;
-    VkFormat imageFormat = VK_FORMAT_R8G8B8A8_UNORM;
     if (windowed) {
         VkSurfaceCapabilitiesKHR caps;
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(rtrPhysicalDevice, rtrSurface, &caps);
         rtrSwapExtent = caps.currentExtent;
+        if ((caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0u) {
+            fprintf(stderr, "swapchain: transfer destination usage unsupported\n");
+            return 1;
+        }
+
+        VkSurfaceFormatKHR surfaceFormat;
+        if (rtrChooseSurfaceFormat(&surfaceFormat)) return 1;
+        if (!rtrFormatSupports(surfaceFormat.format, VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+            fprintf(stderr, "swapchain: selected format cannot receive image blits\n");
+            return 1;
+        }
         uint32_t swapchainMinImageCount = RTR_MAX_SWAP_IMAGES;
         if (swapchainMinImageCount < caps.minImageCount) swapchainMinImageCount = caps.minImageCount;
         if ((caps.maxImageCount != 0u) && (swapchainMinImageCount > caps.maxImageCount)) {
@@ -505,11 +653,11 @@ int rtrVulkanInit(void *windowSurface)
             .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .surface = rtrSurface,
             .minImageCount = swapchainMinImageCount,
-            .imageFormat = VK_FORMAT_B8G8R8A8_UNORM,
-            .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+            .imageFormat = surfaceFormat.format,
+            .imageColorSpace = surfaceFormat.colorSpace,
             .imageExtent = rtrSwapExtent,
             .imageArrayLayers = 1u,
-            .imageUsage = VK_IMAGE_USAGE_STORAGE_BIT,
+            .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .preTransform = caps.currentTransform,
             .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -520,37 +668,11 @@ int rtrVulkanInit(void *windowSurface)
         vkGetSwapchainImagesKHR(rtrDevice, rtrSwapchain, &imageCount, NULL);
         if ((imageCount < 2u) || (imageCount > RTR_MAX_SWAP_IMAGES)) return 1;
         vkGetSwapchainImagesKHR(rtrDevice, rtrSwapchain, &imageCount, rtrSwapImages);
-        imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
     } else {
         rtrExportImageBytes =
             (VkDeviceSize)rtrSwapExtent.width *
             (VkDeviceSize)rtrSwapExtent.height *
             (VkDeviceSize)4u;
-
-        vkCreateImage(rtrDevice, &(VkImageCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .imageType = VK_IMAGE_TYPE_2D,
-            .format = imageFormat,
-            .extent = {rtrSwapExtent.width, rtrSwapExtent.height, 1u},
-            .mipLevels = 1u,
-            .arrayLayers = 1u,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        }, NULL, &rtrSwapImages[0]);
-
-        VkMemoryRequirements imageReq;
-        vkGetImageMemoryRequirements(rtrDevice, rtrSwapImages[0], &imageReq);
-        uint32_t imageMemoryType = rtrFindMemoryType(
-            imageReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkAllocateMemory(rtrDevice, &(VkMemoryAllocateInfo){
-            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = imageReq.size,
-            .memoryTypeIndex = imageMemoryType,
-        }, NULL, &rtrExportImageMemory);
-        vkBindImageMemory(rtrDevice, rtrSwapImages[0], rtrExportImageMemory, 0u);
 
         vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -574,6 +696,7 @@ int rtrVulkanInit(void *windowSurface)
                     &rtrExportStagingPixels);
     }
 
+    if (rtrCreateRenderImage()) return 1;
     if (rtrCreateMemoryBuffer()) return 1;
     if (rtrCreateTimingQueryPool()) return 1;
 
@@ -656,22 +779,9 @@ int rtrVulkanInit(void *windowSurface)
         .layerCount = 1u,
     };
 
-    for (uint32_t i = 0u; i < imageCount; i++)
-    {
-        vkCreateImageView(rtrDevice, &(VkImageViewCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = rtrSwapImages[i],
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format = imageFormat,
-            .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .levelCount = 1u,
-                .layerCount = 1u,
-            },
-        }, NULL, &rtrSwapImageViews[i]);
-
+    for (uint32_t i = 0u; i < imageCount; i++) {
         const VkDescriptorImageInfo imageInfo = {
-            .imageView = rtrSwapImageViews[i],
+            .imageView = rtrRenderImageView,
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
         const VkDescriptorBufferInfo bufferInfo = {
@@ -711,6 +821,19 @@ int rtrVulkanInit(void *windowSurface)
             .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = rtrRenderImage,
+            .subresourceRange = imageRange,
+        });
+
+        vkCmdPipelineBarrier(rtrCommandBuffers[i], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
+                             0u, NULL, 0u, NULL, 1u, &(VkImageMemoryBarrier){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = rtrSwapImages[i],
@@ -754,11 +877,50 @@ int rtrVulkanInit(void *windowSurface)
         }
 
         vkCmdPipelineBarrier(rtrCommandBuffers[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0u,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0u,
                              0u, NULL, 0u, NULL, 1u, &(VkImageMemoryBarrier){
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = rtrRenderImage,
+            .subresourceRange = imageRange,
+        });
+
+        vkCmdBlitImage(rtrCommandBuffers[i],
+                       rtrRenderImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       rtrSwapImages[i],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1u,
+                       &(VkImageBlit){
+            .srcSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1u,
+            },
+            .srcOffsets = {
+                {0, 0, 0},
+                {(int32_t)rtrSwapExtent.width, (int32_t)rtrSwapExtent.height, 1},
+            },
+            .dstSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1u,
+            },
+            .dstOffsets = {
+                {0, 0, 0},
+                {(int32_t)rtrSwapExtent.width, (int32_t)rtrSwapExtent.height, 1},
+            },
+        }, VK_FILTER_NEAREST);
+
+        vkCmdPipelineBarrier(rtrCommandBuffers[i], VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0u,
+                             0u, NULL, 0u, NULL, 1u, &(VkImageMemoryBarrier){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -774,9 +936,11 @@ int rtrVulkanInit(void *windowSurface)
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
         }, NULL, &rtrImageAvailableSemaphore);
 
-        vkCreateSemaphore(rtrDevice, &(VkSemaphoreCreateInfo){
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-        }, NULL, &rtrRenderFinishedSemaphore);
+        for (uint32_t i = 0u; i < imageCount; i++) {
+            vkCreateSemaphore(rtrDevice, &(VkSemaphoreCreateInfo){
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            }, NULL, &rtrRenderFinishedSemaphores[i]);
+        }
 
         vkCreateFence(rtrDevice, &(VkFenceCreateInfo){
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -793,15 +957,20 @@ int rtrVulkanInit(void *windowSurface)
 
 void rtrVulkanFrame(void)
 {
-    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     vkWaitForFences(rtrDevice, 1u, &rtrInFlightFence, VK_TRUE, UINT64_MAX);
     rtrReportGpuTiming();
     rtrUpdateMemory();
-    vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
 
     uint32_t imageIndex = 0u;
-    vkAcquireNextImageKHR(rtrDevice, rtrSwapchain, UINT64_MAX,
-                          rtrImageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+    VkResult result = vkAcquireNextImageKHR(rtrDevice, rtrSwapchain, UINT64_MAX,
+                                            rtrImageAvailableSemaphore,
+                                            VK_NULL_HANDLE,
+                                            &imageIndex);
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return;
+
+    VkSemaphore renderFinished = rtrRenderFinishedSemaphores[imageIndex];
+    vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
 
     vkQueueSubmit(rtrQueue, 1u, &(VkSubmitInfo){
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -811,17 +980,18 @@ void rtrVulkanFrame(void)
         .commandBufferCount = 1u,
         .pCommandBuffers = &rtrCommandBuffers[imageIndex],
         .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &rtrRenderFinishedSemaphore,
+        .pSignalSemaphores = &renderFinished,
     }, rtrInFlightFence);
 
-    vkQueuePresentKHR(rtrQueue, &(VkPresentInfoKHR){
+    result = vkQueuePresentKHR(rtrQueue, &(VkPresentInfoKHR){
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1u,
-        .pWaitSemaphores = &rtrRenderFinishedSemaphore,
+        .pWaitSemaphores = &renderFinished,
         .swapchainCount = 1u,
         .pSwapchains = &rtrSwapchain,
         .pImageIndices = &imageIndex,
     });
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return;
 
     if (rtrTimingSupported) {
         rtrTimingPending = 1u;
@@ -960,7 +1130,7 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
                             cameraPitch,
                             cameraRadius);
         vkResetCommandBuffer(rtrCommandBuffers[0], 0u);
-        rtrRecordExportFrame(rtrCommandBuffers[0], rtrSwapImages[0],
+        rtrRecordExportFrame(rtrCommandBuffers[0], rtrRenderImage,
                              rtrExportStagingBuffer, oldLayout);
         oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 

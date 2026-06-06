@@ -107,6 +107,16 @@ static uint32_t rtrPackUnorm16Ceil(float value, float minValue, float maxValue)
     return q > 65535u ? 65535u : q;
 }
 
+static uint32_t rtrQuantPadMin16(uint32_t value)
+{
+    return value > 0u ? value - 1u : 0u;
+}
+
+static uint32_t rtrQuantPadMax16(uint32_t value)
+{
+    return value < 65535u ? value + 1u : 65535u;
+}
+
 static uint32_t rtrPackUnormNNearest(float value,
                                      float minValue,
                                      float maxValue,
@@ -610,26 +620,26 @@ static uint32_t rtrBuildBVH(RTRSphere *spheres, RTRBVHNode *nodes, uint32_t *nod
 static void rtrStoreBVHNode(uint32_t *words, uint32_t index, const RTRBVHNode *node)
 {
     const uint32_t word = RTR_SCENE_BVH_WORD + index * RTR_SCENE_BVH_NODE_WORDS;
-    const uint32_t minX = rtrPackUnorm16Floor(node->boundsMin[0],
-                                              -RTR_SCENE_DISK_RADIUS,
-                                              RTR_SCENE_DISK_RADIUS);
-    const uint32_t minZ = rtrPackUnorm16Floor(node->boundsMin[2],
-                                              -RTR_SCENE_DISK_RADIUS,
-                                              RTR_SCENE_DISK_RADIUS);
-    const uint32_t maxX = rtrPackUnorm16Ceil(node->boundsMax[0],
-                                             -RTR_SCENE_DISK_RADIUS,
-                                             RTR_SCENE_DISK_RADIUS);
-    const uint32_t maxZ = rtrPackUnorm16Ceil(node->boundsMax[2],
-                                             -RTR_SCENE_DISK_RADIUS,
-                                             RTR_SCENE_DISK_RADIUS);
-    const uint32_t minY = rtrPackUnorm16Floor(node->boundsMin[1],
-                                              RTR_SCENE_GROUND_Y,
-                                              RTR_SCENE_GROUND_Y +
-                                                  RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f);
-    const uint32_t maxY = rtrPackUnorm16Ceil(node->boundsMax[1],
-                                             RTR_SCENE_GROUND_Y,
-                                             RTR_SCENE_GROUND_Y +
-                                                 RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f);
+    const uint32_t minX = rtrQuantPadMin16(rtrPackUnorm16Floor(node->boundsMin[0],
+                                                               -RTR_SCENE_DISK_RADIUS,
+                                                               RTR_SCENE_DISK_RADIUS));
+    const uint32_t minZ = rtrQuantPadMin16(rtrPackUnorm16Floor(node->boundsMin[2],
+                                                               -RTR_SCENE_DISK_RADIUS,
+                                                               RTR_SCENE_DISK_RADIUS));
+    const uint32_t maxX = rtrQuantPadMax16(rtrPackUnorm16Ceil(node->boundsMax[0],
+                                                              -RTR_SCENE_DISK_RADIUS,
+                                                              RTR_SCENE_DISK_RADIUS));
+    const uint32_t maxZ = rtrQuantPadMax16(rtrPackUnorm16Ceil(node->boundsMax[2],
+                                                              -RTR_SCENE_DISK_RADIUS,
+                                                              RTR_SCENE_DISK_RADIUS));
+    const uint32_t minY = rtrQuantPadMin16(rtrPackUnorm16Floor(
+        node->boundsMin[1],
+        RTR_SCENE_GROUND_Y,
+        RTR_SCENE_GROUND_Y + RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f));
+    const uint32_t maxY = rtrQuantPadMax16(rtrPackUnorm16Ceil(
+        node->boundsMax[1],
+        RTR_SCENE_GROUND_Y,
+        RTR_SCENE_GROUND_Y + RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f));
 
     words[word + 0u] = rtrPack2x16(minX, minZ);
     words[word + 1u] = rtrPack2x16(maxX, maxZ);
