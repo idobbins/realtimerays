@@ -12,7 +12,7 @@ const uint RTR_MOUSE_X_WORD = 5u;
 const uint RTR_MOUSE_Y_WORD = 6u;
 const uint RTR_TIME_WORD = 7u;
 const uint RTR_FRAME_WORD = 4u;
-const uint RTR_SPHERE_COUNT_WORD = 8u;
+const uint RTR_TRIANGLE_COUNT_WORD = 8u;
 const uint RTR_BVH_NODE_COUNT_WORD = 15u;
 const uint RTR_CAMERA_AUTO_WORD = 16u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
@@ -23,19 +23,20 @@ const uint RTR_PREV_CAMERA_YAW_WORD = 21u;
 const uint RTR_PREV_CAMERA_PITCH_WORD = 22u;
 const uint RTR_PREV_CAMERA_RADIUS_WORD = 23u;
 
-const uint RTR_MAX_SPHERES = 1000000u;
-const uint RTR_MAX_BVH_NODES = RTR_MAX_SPHERES * 2u - 1u;
+const uint RTR_MAX_TRIANGLES = 900000u;
+const uint RTR_MAX_BVH_NODES = RTR_MAX_TRIANGLES * 2u - 1u;
 const uint RTR_WORKGROUP_SIZE = 64u;
 
-const uint RTR_SPHERE_GEOM_WORD = 24u;
-const uint RTR_SPHERE_WORDS = 1u;
-const uint RTR_BVH_NODE_WORD = RTR_SPHERE_GEOM_WORD + RTR_MAX_SPHERES * RTR_SPHERE_WORDS;
-const uint RTR_BVH_NODE_WORDS = 5u;
+const uint RTR_TRIANGLE_GEOM_WORD = 24u;
+const uint RTR_TRIANGLE_WORDS = 9u;
+const uint RTR_BVH_NODE_WORD = RTR_TRIANGLE_GEOM_WORD +
+    RTR_MAX_TRIANGLES * RTR_TRIANGLE_WORDS;
+const uint RTR_BVH_NODE_WORDS = 8u;
 const uint RTR_BLUE_NOISE_SIZE = 64u;
 const uint RTR_BLUE_NOISE_WORD =
     RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
 const uint RTR_HISTORY_WORD = RTR_BLUE_NOISE_WORD + RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE;
-const uint RTR_HISTORY_PIXEL_WORDS = 4u;
+const uint RTR_HISTORY_PIXEL_WORDS = 7u;
 const uint RTR_RESTIR_PIXEL_WORDS = 12u;
 const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
 const int RTR_BVH_STACK_SIZE = 64;
@@ -64,22 +65,28 @@ const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
 const float RTR_FOCAL = 1.35;
 const float RTR_INV_PI = 0.31830988618;
-const float RTR_TEMPORAL_NORMAL_DOT = 0.82;
-const float RTR_TEMPORAL_DEPTH_REL = 0.035;
+const float RTR_TEMPORAL_NORMAL_DOT = 0.9;
+const float RTR_TEMPORAL_DEPTH_REL = 0.025;
 const float RTR_TEMPORAL_DEPTH_ABS = 0.015;
+const float RTR_TEMPORAL_GI_ALPHA = 0.14;
+const float RTR_TEMPORAL_GI_CLAMP_MIN = 0.08;
+const float RTR_TEMPORAL_GI_CLAMP_SCALE = 1.75;
 const float RTR_RESTIR_MIN_TARGET = 1.0e-5;
 const float RTR_RESTIR_MAX_M = 32.0;
-const float RTR_RESTIR_MAX_WEIGHT = 6.0;
-const float RTR_RESTIR_MAX_AGE = 10.0;
-const float RTR_RESTIR_SPATIAL_RADIUS = 10.0;
+const float RTR_RESTIR_MAX_WEIGHT = 4.0;
+const float RTR_RESTIR_MAX_AGE = 6.0;
+const float RTR_RESTIR_TEMPORAL_WEIGHT_CAP = 5.0;
+const float RTR_RESTIR_SPATIAL_WEIGHT_CAP = 1.75;
+const float RTR_RESTIR_REUSE_BLEND = 0.65;
+const float RTR_RESTIR_SPATIAL_RADIUS = 6.0;
 const int RTR_RESTIR_SPATIAL_TAPS = 4;
+const bool RTR_RESTIR_REUSE_ENABLED = false;
 const float RTR_PLANE_Y = -1.0;
 const float RTR_SCENE_DISK_RADIUS = 26.0;
-const float RTR_MAX_SPHERE_RADIUS = 0.025;
 const float RTR_UNORM16_SCALE = 1.0 / 65535.0;
 const float RTR_UNORM12_SCALE = 1.0 / 4095.0;
 const float RTR_UNORM8_SCALE = 1.0 / 255.0;
-const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.92, 0.0);
+const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
 
 const int RTR_HIT_NONE = -1;
 const int RTR_HIT_PLANE = -2;
@@ -88,7 +95,7 @@ const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
 const float RTR_LIGHT_RADIUS = 0.7;
 
-shared uint shSphereCount;
+shared uint shTriangleCount;
 shared uint shBVHNodeCount;
 shared uint shSampleCount;
 
@@ -204,56 +211,46 @@ vec2 rtrBlueNoise2(uvec2 coord,
     return fract(noise + offset);
 }
 
-vec2 rtrUnpackDisk2(uint packed)
+struct RTRTriangle {
+    vec3 v0;
+    vec3 v1;
+    vec3 v2;
+};
+
+RTRTriangle rtrLoadTriangle(uint i)
 {
-    return vec2(
-        rtrUnpackUnorm16(rtrLo16(packed), -RTR_SCENE_DISK_RADIUS, RTR_SCENE_DISK_RADIUS),
-        rtrUnpackUnorm16(rtrHi16(packed), -RTR_SCENE_DISK_RADIUS, RTR_SCENE_DISK_RADIUS)
-    );
+    uint word = RTR_TRIANGLE_GEOM_WORD + i * RTR_TRIANGLE_WORDS;
+    RTRTriangle tri;
+
+    tri.v0 = vec3(rtrLoadF32(word),
+                  rtrLoadF32(word + 1u),
+                  rtrLoadF32(word + 2u));
+    tri.v1 = vec3(rtrLoadF32(word + 3u),
+                  rtrLoadF32(word + 4u),
+                  rtrLoadF32(word + 5u));
+    tri.v2 = vec3(rtrLoadF32(word + 6u),
+                  rtrLoadF32(word + 7u),
+                  rtrLoadF32(word + 8u));
+
+    return tri;
 }
 
-vec2 rtrUnpackNodeY2(uint packed)
+vec3 rtrTriangleAlbedo(uint i, vec3 p, vec3 n)
 {
-    return vec2(
-        rtrUnpackUnorm16(rtrLo16(packed), RTR_PLANE_Y,
-                         RTR_PLANE_Y + RTR_MAX_SPHERE_RADIUS * 2.0),
-        rtrUnpackUnorm16(rtrHi16(packed), RTR_PLANE_Y,
-                         RTR_PLANE_Y + RTR_MAX_SPHERE_RADIUS * 2.0)
-    );
-}
+    float h = float(rtrHashU32(i * 2246822519u + 3266489917u) & 0xffffu) /
+              65535.0;
+    float vertical = clamp((p.y - RTR_PLANE_Y) * 0.45, 0.0, 1.0);
+    vec3 base = mix(vec3(0.28, 0.43, 0.36), vec3(0.48, 0.62, 0.50), vertical);
+    vec3 cool = vec3(0.05, 0.08, 0.07) * max(n.y, 0.0);
 
-vec4 rtrLoadSphereGeom(uint i)
-{
-    uint packed = rtrLoadU32(RTR_SPHERE_GEOM_WORD + i * RTR_SPHERE_WORDS);
-    float x = rtrUnpackUnormN(packed, 0xfffu, RTR_UNORM12_SCALE,
-                              -RTR_SCENE_DISK_RADIUS, RTR_SCENE_DISK_RADIUS);
-    float z = rtrUnpackUnormN(packed >> 12u, 0xfffu, RTR_UNORM12_SCALE,
-                              -RTR_SCENE_DISK_RADIUS, RTR_SCENE_DISK_RADIUS);
-    float radius = rtrUnpackUnormN(packed >> 24u, 0xffu, RTR_UNORM8_SCALE,
-                                   0.0, RTR_MAX_SPHERE_RADIUS);
-
-    return vec4(x, RTR_PLANE_Y + radius, z, radius);
-}
-
-vec3 rtrSphereAlbedo(uint i, vec4 geom)
-{
-    float u = geom.x / (RTR_SCENE_DISK_RADIUS * 2.0) + 0.5;
-    float v = geom.z / (RTR_SCENE_DISK_RADIUS * 2.0) + 0.5;
-    float w = float(rtrHashU32(i * 2246822519u + 3266489917u) & 0x00ffffffu) /
-              16777215.0;
-
-    return vec3(0.24 + 0.52 * u,
-                0.24 + 0.42 * w,
-                0.34 + 0.36 * v);
+    return base * (0.82 + 0.18 * h) + cool;
 }
 
 vec3 rtrLoadBVHMin(uint i)
 {
     uint word = RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS;
-    vec2 xz = rtrUnpackDisk2(rtrLoadU32(word));
-    vec2 y = rtrUnpackNodeY2(rtrLoadU32(word + 2u));
 
-    return vec3(xz.x, y.x, xz.y);
+    return vec3(rtrLoadF32(word), rtrLoadF32(word + 1u), rtrLoadF32(word + 2u));
 }
 
 uint rtrLoadBVHLeftFirst(uint i)
@@ -264,15 +261,13 @@ uint rtrLoadBVHLeftFirst(uint i)
 vec3 rtrLoadBVHMax(uint i)
 {
     uint word = RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS;
-    vec2 xz = rtrUnpackDisk2(rtrLoadU32(word + 1u));
-    vec2 y = rtrUnpackNodeY2(rtrLoadU32(word + 2u));
 
-    return vec3(xz.x, y.y, xz.y);
+    return vec3(rtrLoadF32(word + 4u), rtrLoadF32(word + 5u), rtrLoadF32(word + 6u));
 }
 
 uint rtrLoadBVHCountRight(uint i)
 {
-    return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 4u);
+    return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 7u);
 }
 
 vec2 rtrPrimaryJitter(uvec2 coord,
@@ -343,50 +338,48 @@ bool rtrSceneBoxHit(vec3 ro, vec3 invRd, float maxT)
     return rtrBoxHitBounds(ro, invRd, shBoundsMin, shBoundsMax, maxT, nearT);
 }
 
-void rtrTraceSphere(vec3 ro, vec3 rd, uint i, inout float bestT, inout int bestId)
+bool rtrTriangleHit(vec3 ro, vec3 rd, RTRTriangle tri, float maxT, out float hitT)
 {
-    vec4 s = rtrLoadSphereGeom(i);
+    vec3 e1 = tri.v1 - tri.v0;
+    vec3 e2 = tri.v2 - tri.v0;
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
 
-    vec3 oc = ro - s.xyz;
-    float r = s.w;
+    if (abs(det) < 1.0e-8)
+        return false;
 
-    float b = dot(oc, rd);
-    float centerT = -b;
+    float invDet = 1.0 / det;
+    vec3 tvec = ro - tri.v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0)
+        return false;
 
-    if (centerT + r < RTR_EPS || centerT - r >= bestT)
-        return;
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0)
+        return false;
 
-    float h = b * b - (dot(oc, oc) - r * r);
-    if (h < 0.0)
-        return;
+    float t = dot(e2, qvec) * invDet;
+    if (t < RTR_EPS || t >= maxT)
+        return false;
 
-    float root = sqrt(h);
-    float t = centerT - root;
-    if (t < RTR_EPS)
-        t = centerT + root;
+    hitT = t;
+    return true;
+}
 
-    if (t >= RTR_EPS && t < bestT) {
+void rtrTraceTriangle(vec3 ro, vec3 rd, uint i, inout float bestT, inout int bestId)
+{
+    float t;
+    if (rtrTriangleHit(ro, rd, rtrLoadTriangle(i), bestT, t)) {
         bestT = t;
         bestId = int(i);
     }
 }
 
-bool rtrSphereOccludes(vec3 ro, vec3 l, float maxT, uint i)
+bool rtrTriangleOccludes(vec3 ro, vec3 l, float maxT, uint i)
 {
-    vec4 s = rtrLoadSphereGeom(i);
-    vec3 oc = ro - s.xyz;
-    float r = s.w;
-
-    float b = dot(oc, l);
-    float centerT = -b;
-
-    if (centerT + r < RTR_EPS || centerT - r > maxT)
-        return false;
-
-    float t = clamp(centerT, RTR_EPS, maxT);
-    float dist2 = dot(oc, oc) + t * (2.0 * b + t);
-
-    return dist2 <= r * r;
+    float t;
+    return rtrTriangleHit(ro, l, rtrLoadTriangle(i), maxT, t);
 }
 
 RTRHit rtrTrace(vec3 ro, vec3 rd)
@@ -450,9 +443,9 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
             }
         } else {
             for (uint i = 0u; i < countRight; i++) {
-                uint sphereId = leftFirst + i;
-                if (sphereId < shSphereCount)
-                    rtrTraceSphere(ro, rd, sphereId, hit.t, hit.id);
+                uint triangleId = leftFirst + i;
+                if (triangleId < shTriangleCount)
+                    rtrTraceTriangle(ro, rd, triangleId, hit.t, hit.id);
             }
         }
 
@@ -520,9 +513,9 @@ float rtrShadow(vec3 p, vec3 n, vec3 l, float maxT, int skipId)
             }
         } else {
             for (uint i = 0u; i < countRight; i++) {
-                uint sphereId = leftFirst + i;
-                if (sphereId < shSphereCount && int(sphereId) != skipId &&
-                    rtrSphereOccludes(ro, l, maxT, sphereId)) {
+                uint triangleId = leftFirst + i;
+                if (triangleId < shTriangleCount && int(triangleId) != skipId &&
+                    rtrTriangleOccludes(ro, l, maxT, triangleId)) {
                     return 0.0;
                 }
             }
@@ -554,10 +547,10 @@ void rtrSurface(RTRHit hit,
         albedo = vec3(0.52, 0.54, 0.49) * mix(0.78, 1.0, check);
     } else {
         uint id = uint(hit.id);
-        vec4 g = rtrLoadSphereGeom(id);
+        RTRTriangle tri = rtrLoadTriangle(id);
 
-        n = (p - g.xyz) / max(g.w, 0.00001);
-        albedo = rtrSphereAlbedo(id, g);
+        n = normalize(cross(tri.v1 - tri.v0, tri.v2 - tri.v0));
+        albedo = rtrTriangleAlbedo(id, p, n);
         skipId = hit.id;
     }
 
@@ -890,6 +883,7 @@ float rtrReservoirFinalWeight(RTRGIReservoir reservoir)
 bool rtrReservoirToCandidate(RTRGIReservoir source,
                              vec3 n,
                              vec3 albedo,
+                             float weightCap,
                              out RTRGICandidate candidate)
 {
     rtrClearCandidate(candidate);
@@ -905,7 +899,7 @@ bool rtrReservoirToCandidate(RTRGIReservoir source,
         return false;
 
     float sourceWeight = source.weightSum / max(source.target, RTR_RESTIR_MIN_TARGET);
-    sourceWeight = min(sourceWeight, RTR_RESTIR_MAX_M * RTR_RESTIR_MAX_WEIGHT);
+    sourceWeight = min(sourceWeight, weightCap);
 
     candidate.valid = true;
     candidate.dir = source.dir;
@@ -952,12 +946,20 @@ vec3 rtrLoadHistoryNormal(uvec2 p, uint width, uint height, uint page)
     return vec3(rtrLoadF32(word), rtrLoadF32(word + 1u), rtrLoadF32(word + 2u));
 }
 
+vec3 rtrLoadHistoryIndirect(uvec2 p, uint width, uint height, uint page)
+{
+    uint word = rtrHistoryPixelWord(p, width, height, page) + 4u;
+
+    return vec3(rtrLoadF32(word), rtrLoadF32(word + 1u), rtrLoadF32(word + 2u));
+}
+
 void rtrStoreHistoryPixel(uvec2 p,
                           uint width,
                           uint height,
                           uint page,
                           float depth,
-                          vec3 normal)
+                          vec3 normal,
+                          vec3 indirect)
 {
     uint word = rtrHistoryPixelWord(p, width, height, page);
 
@@ -965,6 +967,9 @@ void rtrStoreHistoryPixel(uvec2 p,
     rtrStoreF32(word + 1u, normal.x);
     rtrStoreF32(word + 2u, normal.y);
     rtrStoreF32(word + 3u, normal.z);
+    rtrStoreF32(word + 4u, indirect.x);
+    rtrStoreF32(word + 5u, indirect.y);
+    rtrStoreF32(word + 6u, indirect.z);
 }
 
 bool rtrReprojectHistory(vec3 worldP,
@@ -1020,6 +1025,14 @@ bool rtrHistoryAccepts(uvec2 p,
     bool normalOk = dot(historyNormal, expectedNormal) >= RTR_TEMPORAL_NORMAL_DOT;
 
     return depthOk && normalOk;
+}
+
+vec3 rtrClampTemporalGI(vec3 history, vec3 current)
+{
+    vec3 radius = max(vec3(RTR_TEMPORAL_GI_CLAMP_MIN),
+                      abs(current) * RTR_TEMPORAL_GI_CLAMP_SCALE);
+
+    return clamp(history, current - radius, current + radius);
 }
 
 uint rtrRestirWord(uint width, uint height)
@@ -1098,7 +1111,7 @@ void rtrStoreGIReservoir(uvec2 p,
 
 ivec2 rtrSpatialOffset(uvec2 coord, uint frameIndex, int tap, inout uint rng)
 {
-    vec2 noise = rtrBlueNoise2(coord, frameIndex, 0u, 48u + uint(tap), rng);
+    vec2 noise = rtrBlueNoise2(coord, 0u, 0u, 48u + uint(tap), rng);
     float angle = noise.x * 6.2831853;
     float radius = max(1.0, sqrt(noise.y) * RTR_RESTIR_SPATIAL_RADIUS);
     ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
@@ -1116,7 +1129,7 @@ void main()
     vec2 szf = vec2(sz);
 
     if (gl_LocalInvocationIndex == 0u) {
-        shSphereCount = min(rtrLoadU32(RTR_SPHERE_COUNT_WORD), RTR_MAX_SPHERES);
+        shTriangleCount = min(rtrLoadU32(RTR_TRIANGLE_COUNT_WORD), RTR_MAX_TRIANGLES);
         shBVHNodeCount = min(rtrLoadU32(RTR_BVH_NODE_COUNT_WORD), RTR_MAX_BVH_NODES);
 
         float cameraYaw = rtrLoadF32(RTR_CAMERA_YAW_WORD);
@@ -1166,7 +1179,13 @@ void main()
 
     RTRPrimarySample primary;
     if (!rtrTracePrimary(shRo, rd, primary)) {
-        rtrStoreHistoryPixel(uvec2(p), width, height, currentPage, 0.0, vec3(0.0));
+        rtrStoreHistoryPixel(uvec2(p),
+                             width,
+                             height,
+                             currentPage,
+                             0.0,
+                             vec3(0.0),
+                             vec3(0.0));
 
         RTRGIReservoir invalidReservoir;
         rtrClearReservoir(invalidReservoir);
@@ -1188,14 +1207,53 @@ void main()
 
     RTRGIReservoir reservoir;
     RTRGICandidate candidate;
+    vec3 freshIndirect = vec3(0.0);
+    float freshCount = 0.0;
     rtrClearReservoir(reservoir);
 
     for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++) {
         rtrMakeFreshGICandidate(primary, uvec2(p), frameIndex, sampleIndex, rng, candidate);
+        if (candidate.valid) {
+            freshIndirect += candidate.contribution;
+            freshCount += 1.0;
+        }
         rtrUpdateReservoir(reservoir, candidate, rng);
     }
 
+    if (freshCount > 0.0)
+        freshIndirect /= freshCount;
+
+    vec3 indirect = freshCount > 0.0 ? freshIndirect : vec3(0.0);
+
     if (accumCount > 0u) {
+        float prevCameraYaw = rtrLoadF32(RTR_PREV_CAMERA_YAW_WORD);
+        float prevCameraPitch = rtrLoadF32(RTR_PREV_CAMERA_PITCH_WORD);
+        float prevCameraRadius = rtrLoadF32(RTR_PREV_CAMERA_RADIUS_WORD);
+        uvec2 historyP;
+        float reprojectedDepth;
+
+        if (rtrReprojectHistory(primary.point,
+                                prevCameraYaw,
+                                prevCameraPitch,
+                                prevCameraRadius,
+                                szf,
+                                historyP,
+                                reprojectedDepth) &&
+            rtrHistoryAccepts(historyP,
+                              width,
+                              height,
+                              previousPage,
+                              reprojectedDepth,
+                              primary.normal)) {
+            vec3 historyIndirect = rtrClampTemporalGI(
+                rtrLoadHistoryIndirect(historyP, width, height, previousPage),
+                indirect);
+            float alpha = max(1.0 / float(accumCount + 1u), RTR_TEMPORAL_GI_ALPHA);
+            indirect = mix(historyIndirect, indirect, alpha);
+        }
+    }
+
+    if (RTR_RESTIR_REUSE_ENABLED && accumCount > 0u) {
         float prevCameraYaw = rtrLoadF32(RTR_PREV_CAMERA_YAW_WORD);
         float prevCameraPitch = rtrLoadF32(RTR_PREV_CAMERA_PITCH_WORD);
         float prevCameraRadius = rtrLoadF32(RTR_PREV_CAMERA_RADIUS_WORD);
@@ -1220,6 +1278,7 @@ void main()
                 if (rtrReservoirToCandidate(previousReservoir,
                                             primary.normal,
                                             primary.albedo,
+                                            RTR_RESTIR_TEMPORAL_WEIGHT_CAP,
                                             candidate)) {
                     rtrUpdateReservoir(reservoir, candidate, rng);
                 }
@@ -1246,6 +1305,7 @@ void main()
                 if (rtrReservoirToCandidate(neighborReservoir,
                                             primary.normal,
                                             primary.albedo,
+                                            RTR_RESTIR_SPATIAL_WEIGHT_CAP,
                                             candidate)) {
                     rtrUpdateReservoir(reservoir, candidate, rng);
                 }
@@ -1253,7 +1313,6 @@ void main()
         }
     }
 
-    vec3 indirect = reservoir.contribution * rtrReservoirFinalWeight(reservoir);
     vec3 color = primary.color + indirect;
 
     rtrStoreHistoryPixel(uvec2(p),
@@ -1261,7 +1320,8 @@ void main()
                          height,
                          currentPage,
                          primary.depth,
-                         primary.normal);
+                         primary.normal,
+                         indirect);
     rtrStoreGIReservoir(uvec2(p), width, height, currentPage, reservoir);
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }

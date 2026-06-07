@@ -3,36 +3,29 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define RTR_CHECK_HEADER_WORDS 24u
-#define RTR_CHECK_SPHERE_COUNT 1000000u
-#define RTR_CHECK_SPHERE_WORDS 1u
-#define RTR_CHECK_BVH_NODE_COUNT (RTR_CHECK_SPHERE_COUNT * 2u - 1u)
-#define RTR_CHECK_BVH_NODE_WORDS 5u
+#define RTR_CHECK_TRIANGLE_CAPACITY 900000u
+#define RTR_CHECK_TRIANGLE_WORDS 9u
+#define RTR_CHECK_BVH_NODE_COUNT (RTR_CHECK_TRIANGLE_CAPACITY * 2u - 1u)
+#define RTR_CHECK_BVH_NODE_WORDS 8u
 #define RTR_CHECK_BLUE_NOISE_WORDS (64u * 64u)
 #define RTR_CHECK_WORDS \
     (RTR_CHECK_HEADER_WORDS + \
-     RTR_CHECK_SPHERE_COUNT * RTR_CHECK_SPHERE_WORDS + \
+     RTR_CHECK_TRIANGLE_CAPACITY * RTR_CHECK_TRIANGLE_WORDS + \
      RTR_CHECK_BVH_NODE_COUNT * RTR_CHECK_BVH_NODE_WORDS + \
      RTR_CHECK_BLUE_NOISE_WORDS)
 
-#define RTR_CHECK_SPHERE_COUNT_WORD 8u
+#define RTR_CHECK_TRIANGLE_COUNT_WORD 8u
 #define RTR_CHECK_BVH_NODE_COUNT_WORD 15u
-#define RTR_CHECK_SPHERE_WORD 24u
+#define RTR_CHECK_TRIANGLE_WORD 24u
 #define RTR_CHECK_BVH_NODE_WORD \
-    (RTR_CHECK_SPHERE_WORD + RTR_CHECK_SPHERE_COUNT * RTR_CHECK_SPHERE_WORDS)
+    (RTR_CHECK_TRIANGLE_WORD + RTR_CHECK_TRIANGLE_CAPACITY * RTR_CHECK_TRIANGLE_WORDS)
 #define RTR_CHECK_BVH_INTERNAL_FLAG 0x80000000u
-#define RTR_CHECK_GRID_EMPTY UINT32_MAX
 #define RTR_CHECK_STACK_SIZE 64
-
-#define RTR_CHECK_DISK_RADIUS 26.0f
-#define RTR_CHECK_MAX_SPHERE_RADIUS 0.025f
-#define RTR_CHECK_PLANE_Y -1.0f
 #define RTR_CHECK_EPS 0.0001f
 #define RTR_CHECK_INF 1.0e20f
-#define RTR_CHECK_UNORM16_SCALE (1.0f / 65535.0f)
-#define RTR_CHECK_UNORM12_SCALE (1.0f / 4095.0f)
-#define RTR_CHECK_UNORM8_SCALE (1.0f / 255.0f)
 
 void rtrScene(uint32_t *words);
 
@@ -42,12 +35,11 @@ typedef struct RTRCheckVec3 {
     float z;
 } RTRCheckVec3;
 
-typedef struct RTRCheckSphere {
-    float x;
-    float y;
-    float z;
-    float r;
-} RTRCheckSphere;
+typedef struct RTRCheckTriangle {
+    RTRCheckVec3 v0;
+    RTRCheckVec3 v1;
+    RTRCheckVec3 v2;
+} RTRCheckTriangle;
 
 typedef struct RTRCheckHit {
     float t;
@@ -69,67 +61,17 @@ static float rtrCheckHash01(uint32_t value)
     return (float)(rtrCheckHashU32(value) & 0x00ffffffu) / 16777215.0f;
 }
 
-static float rtrCheckUnpackUnorm16(uint32_t value, float minValue, float maxValue)
+static float rtrCheckLoadF32(const uint32_t *words, uint32_t word)
 {
-    return minValue + (maxValue - minValue) *
-        ((float)(value & 0xffffu) * RTR_CHECK_UNORM16_SCALE);
+    float value = 0.0f;
+    const uint32_t bits = words[word];
+    memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
-static float rtrCheckUnpackUnormN(uint32_t value,
-                                  uint32_t mask,
-                                  float scale,
-                                  float minValue,
-                                  float maxValue)
+static RTRCheckVec3 rtrCheckAdd(RTRCheckVec3 a, RTRCheckVec3 b)
 {
-    return minValue + (maxValue - minValue) * ((float)(value & mask) * scale);
-}
-
-static RTRCheckSphere rtrCheckLoadSphere(const uint32_t *words, uint32_t i)
-{
-    const uint32_t packed = words[RTR_CHECK_SPHERE_WORD + i * RTR_CHECK_SPHERE_WORDS];
-    const float x = rtrCheckUnpackUnormN(packed, 0xfffu, RTR_CHECK_UNORM12_SCALE,
-                                         -RTR_CHECK_DISK_RADIUS,
-                                         RTR_CHECK_DISK_RADIUS);
-    const float z = rtrCheckUnpackUnormN(packed >> 12u, 0xfffu, RTR_CHECK_UNORM12_SCALE,
-                                         -RTR_CHECK_DISK_RADIUS,
-                                         RTR_CHECK_DISK_RADIUS);
-    const float r = rtrCheckUnpackUnormN(packed >> 24u, 0xffu, RTR_CHECK_UNORM8_SCALE,
-                                         0.0f, RTR_CHECK_MAX_SPHERE_RADIUS);
-
-    return (RTRCheckSphere){x, RTR_CHECK_PLANE_Y + r, z, r};
-}
-
-static RTRCheckVec3 rtrCheckLoadBVHMin(const uint32_t *words, uint32_t i)
-{
-    const uint32_t word = RTR_CHECK_BVH_NODE_WORD + i * RTR_CHECK_BVH_NODE_WORDS;
-    const uint32_t xz = words[word];
-    const uint32_t yy = words[word + 2u];
-
-    return (RTRCheckVec3){
-        rtrCheckUnpackUnorm16(xz, -RTR_CHECK_DISK_RADIUS, RTR_CHECK_DISK_RADIUS),
-        rtrCheckUnpackUnorm16(yy, RTR_CHECK_PLANE_Y,
-                              RTR_CHECK_PLANE_Y + RTR_CHECK_MAX_SPHERE_RADIUS * 2.0f),
-        rtrCheckUnpackUnorm16(xz >> 16u, -RTR_CHECK_DISK_RADIUS, RTR_CHECK_DISK_RADIUS),
-    };
-}
-
-static RTRCheckVec3 rtrCheckLoadBVHMax(const uint32_t *words, uint32_t i)
-{
-    const uint32_t word = RTR_CHECK_BVH_NODE_WORD + i * RTR_CHECK_BVH_NODE_WORDS;
-    const uint32_t xz = words[word + 1u];
-    const uint32_t yy = words[word + 2u];
-
-    return (RTRCheckVec3){
-        rtrCheckUnpackUnorm16(xz, -RTR_CHECK_DISK_RADIUS, RTR_CHECK_DISK_RADIUS),
-        rtrCheckUnpackUnorm16(yy >> 16u, RTR_CHECK_PLANE_Y,
-                              RTR_CHECK_PLANE_Y + RTR_CHECK_MAX_SPHERE_RADIUS * 2.0f),
-        rtrCheckUnpackUnorm16(xz >> 16u, -RTR_CHECK_DISK_RADIUS, RTR_CHECK_DISK_RADIUS),
-    };
-}
-
-static float rtrCheckDot(RTRCheckVec3 a, RTRCheckVec3 b)
-{
-    return a.x * b.x + a.y * b.y + a.z * b.z;
+    return (RTRCheckVec3){a.x + b.x, a.y + b.y, a.z + b.z};
 }
 
 static RTRCheckVec3 rtrCheckSub(RTRCheckVec3 a, RTRCheckVec3 b)
@@ -137,11 +79,30 @@ static RTRCheckVec3 rtrCheckSub(RTRCheckVec3 a, RTRCheckVec3 b)
     return (RTRCheckVec3){a.x - b.x, a.y - b.y, a.z - b.z};
 }
 
+static RTRCheckVec3 rtrCheckMul(RTRCheckVec3 v, float s)
+{
+    return (RTRCheckVec3){v.x * s, v.y * s, v.z * s};
+}
+
+static float rtrCheckDot(RTRCheckVec3 a, RTRCheckVec3 b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static RTRCheckVec3 rtrCheckCross(RTRCheckVec3 a, RTRCheckVec3 b)
+{
+    return (RTRCheckVec3){
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
+}
+
 static RTRCheckVec3 rtrCheckNormalize(RTRCheckVec3 v)
 {
     const float len2 = rtrCheckDot(v, v);
     const float invLen = len2 > 0.0f ? 1.0f / sqrtf(len2) : 0.0f;
-    return (RTRCheckVec3){v.x * invLen, v.y * invLen, v.z * invLen};
+    return rtrCheckMul(v, invLen);
 }
 
 static RTRCheckVec3 rtrCheckSafeInvDir(RTRCheckVec3 rd)
@@ -154,6 +115,51 @@ static RTRCheckVec3 rtrCheckSafeInvDir(RTRCheckVec3 rd)
         1.0f / (rd.x >= 0.0f ? ax : -ax),
         1.0f / (rd.y >= 0.0f ? ay : -ay),
         1.0f / (rd.z >= 0.0f ? az : -az),
+    };
+}
+
+static RTRCheckTriangle rtrCheckLoadTriangle(const uint32_t *words, uint32_t i)
+{
+    const uint32_t word = RTR_CHECK_TRIANGLE_WORD + i * RTR_CHECK_TRIANGLE_WORDS;
+
+    return (RTRCheckTriangle){
+        .v0 = {
+            rtrCheckLoadF32(words, word),
+            rtrCheckLoadF32(words, word + 1u),
+            rtrCheckLoadF32(words, word + 2u),
+        },
+        .v1 = {
+            rtrCheckLoadF32(words, word + 3u),
+            rtrCheckLoadF32(words, word + 4u),
+            rtrCheckLoadF32(words, word + 5u),
+        },
+        .v2 = {
+            rtrCheckLoadF32(words, word + 6u),
+            rtrCheckLoadF32(words, word + 7u),
+            rtrCheckLoadF32(words, word + 8u),
+        },
+    };
+}
+
+static RTRCheckVec3 rtrCheckLoadBVHMin(const uint32_t *words, uint32_t i)
+{
+    const uint32_t word = RTR_CHECK_BVH_NODE_WORD + i * RTR_CHECK_BVH_NODE_WORDS;
+
+    return (RTRCheckVec3){
+        rtrCheckLoadF32(words, word),
+        rtrCheckLoadF32(words, word + 1u),
+        rtrCheckLoadF32(words, word + 2u),
+    };
+}
+
+static RTRCheckVec3 rtrCheckLoadBVHMax(const uint32_t *words, uint32_t i)
+{
+    const uint32_t word = RTR_CHECK_BVH_NODE_WORD + i * RTR_CHECK_BVH_NODE_WORDS;
+
+    return (RTRCheckVec3){
+        rtrCheckLoadF32(words, word + 4u),
+        rtrCheckLoadF32(words, word + 5u),
+        rtrCheckLoadF32(words, word + 6u),
     };
 }
 
@@ -183,31 +189,38 @@ static uint32_t rtrCheckBoxHit(RTRCheckVec3 ro,
     return (uint32_t)(lo <= hi);
 }
 
-static void rtrCheckTraceSphere(RTRCheckVec3 ro,
-                                RTRCheckVec3 rd,
-                                const RTRCheckSphere *sphere,
-                                uint32_t id,
-                                RTRCheckHit *hit)
+static void rtrCheckTraceTriangle(RTRCheckVec3 ro,
+                                  RTRCheckVec3 rd,
+                                  const RTRCheckTriangle *tri,
+                                  uint32_t id,
+                                  RTRCheckHit *hit)
 {
-    const RTRCheckVec3 center = {sphere->x, sphere->y, sphere->z};
-    const RTRCheckVec3 oc = rtrCheckSub(ro, center);
-    const float b = rtrCheckDot(oc, rd);
-    const float centerT = -b;
-    const float r = sphere->r;
-    float h = 0.0f;
+    const RTRCheckVec3 e1 = rtrCheckSub(tri->v1, tri->v0);
+    const RTRCheckVec3 e2 = rtrCheckSub(tri->v2, tri->v0);
+    const RTRCheckVec3 pvec = rtrCheckCross(rd, e2);
+    const float det = rtrCheckDot(e1, pvec);
+    float invDet = 0.0f;
+    RTRCheckVec3 tvec;
+    float u = 0.0f;
+    RTRCheckVec3 qvec;
+    float v = 0.0f;
     float t = 0.0f;
 
-    if (centerT + r < RTR_CHECK_EPS || centerT - r >= hit->t)
+    if (fabsf(det) < 1.0e-8f)
         return;
 
-    h = b * b - (rtrCheckDot(oc, oc) - r * r);
-    if (h < 0.0f)
+    invDet = 1.0f / det;
+    tvec = rtrCheckSub(ro, tri->v0);
+    u = rtrCheckDot(tvec, pvec) * invDet;
+    if (u < 0.0f || u > 1.0f)
         return;
 
-    t = centerT - sqrtf(h);
-    if (t < RTR_CHECK_EPS)
-        t = centerT + sqrtf(h);
+    qvec = rtrCheckCross(tvec, e1);
+    v = rtrCheckDot(rd, qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f)
+        return;
 
+    t = rtrCheckDot(e2, qvec) * invDet;
     if (t >= RTR_CHECK_EPS && t < hit->t) {
         hit->t = t;
         hit->id = (int32_t)id;
@@ -216,13 +229,13 @@ static void rtrCheckTraceSphere(RTRCheckVec3 ro,
 
 static RTRCheckHit rtrCheckTraceBrute(RTRCheckVec3 ro,
                                       RTRCheckVec3 rd,
-                                      const RTRCheckSphere *spheres,
-                                      uint32_t sphereCount)
+                                      const RTRCheckTriangle *triangles,
+                                      uint32_t triangleCount)
 {
     RTRCheckHit hit = {RTR_CHECK_INF, -1};
 
-    for (uint32_t i = 0u; i < sphereCount; i++)
-        rtrCheckTraceSphere(ro, rd, spheres + i, i, &hit);
+    for (uint32_t i = 0u; i < triangleCount; i++)
+        rtrCheckTraceTriangle(ro, rd, triangles + i, i, &hit);
 
     return hit;
 }
@@ -230,8 +243,8 @@ static RTRCheckHit rtrCheckTraceBrute(RTRCheckVec3 ro,
 static RTRCheckHit rtrCheckTraceBVH(RTRCheckVec3 ro,
                                     RTRCheckVec3 rd,
                                     const uint32_t *words,
-                                    const RTRCheckSphere *spheres,
-                                    uint32_t sphereCount,
+                                    const RTRCheckTriangle *triangles,
+                                    uint32_t triangleCount,
                                     uint32_t nodeCount)
 {
     RTRCheckHit hit = {RTR_CHECK_INF, -1};
@@ -251,7 +264,7 @@ static RTRCheckHit rtrCheckTraceBVH(RTRCheckVec3 ro,
         const uint32_t word = RTR_CHECK_BVH_NODE_WORD +
             nodeIndex * RTR_CHECK_BVH_NODE_WORDS;
         const uint32_t leftFirst = words[word + 3u];
-        const uint32_t countRight = words[word + 4u];
+        const uint32_t countRight = words[word + 7u];
 
         if ((countRight & RTR_CHECK_BVH_INTERNAL_FLAG) != 0u) {
             const uint32_t left = leftFirst;
@@ -290,9 +303,10 @@ static RTRCheckHit rtrCheckTraceBVH(RTRCheckVec3 ro,
             }
         } else {
             for (uint32_t i = 0u; i < countRight; i++) {
-                const uint32_t sphereId = leftFirst + i;
-                if (sphereId < sphereCount)
-                    rtrCheckTraceSphere(ro, rd, spheres + sphereId, sphereId, &hit);
+                const uint32_t triangleId = leftFirst + i;
+                if (triangleId < triangleCount)
+                    rtrCheckTraceTriangle(ro, rd, triangles + triangleId,
+                                          triangleId, &hit);
             }
         }
 
@@ -304,126 +318,88 @@ static RTRCheckHit rtrCheckTraceBVH(RTRCheckVec3 ro,
     return hit;
 }
 
-static uint32_t rtrCheckGridCoord(float value, uint32_t dim, float cellSize)
+static int rtrCheckSceneGeometry(const RTRCheckTriangle *triangles,
+                                 uint32_t triangleCount,
+                                 RTRCheckVec3 rootMin,
+                                 RTRCheckVec3 rootMax)
 {
-    int32_t coord = (int32_t)floorf((value + RTR_CHECK_DISK_RADIUS) / cellSize);
+    uint32_t invalid = 0u;
+    uint32_t outsideRoot = 0u;
+    float minArea2 = FLT_MAX;
 
-    if (coord < 0) return 0u;
-    if (coord >= (int32_t)dim) return dim - 1u;
-    return (uint32_t)coord;
-}
+    for (uint32_t i = 0u; i < triangleCount; i++) {
+        const RTRCheckTriangle *tri = triangles + i;
+        const RTRCheckVec3 e1 = rtrCheckSub(tri->v1, tri->v0);
+        const RTRCheckVec3 e2 = rtrCheckSub(tri->v2, tri->v0);
+        const RTRCheckVec3 cross = rtrCheckCross(e1, e2);
+        const float area2 = rtrCheckDot(cross, cross);
+        const RTRCheckVec3 verts[3] = {tri->v0, tri->v1, tri->v2};
 
-static int rtrCheckSceneGeometry(const RTRCheckSphere *spheres, uint32_t sphereCount)
-{
-    const float cellSize = RTR_CHECK_MAX_SPHERE_RADIUS * 2.0f;
-    const uint32_t dim =
-        (uint32_t)ceilf((RTR_CHECK_DISK_RADIUS * 2.0f) / cellSize) + 1u;
-    const uint64_t cellCount = (uint64_t)dim * (uint64_t)dim;
-    const float overlapLimit = RTR_CHECK_MAX_SPHERE_RADIUS * 2.0f;
-    const uint32_t cellRange = (uint32_t)ceilf(overlapLimit / cellSize) + 1u;
-    uint32_t *heads = (uint32_t *)malloc(sizeof(*heads) * (size_t)cellCount);
-    uint32_t *next = (uint32_t *)malloc(sizeof(*next) * (size_t)sphereCount);
-    uint32_t overlapPairs = 0u;
-    uint32_t boundaryFailures = 0u;
-    float worstMargin = FLT_MAX;
+        if (area2 < minArea2)
+            minArea2 = area2;
+        if (!isfinite(area2))
+            invalid++;
 
-    if (!(heads && next)) {
-        free(heads);
-        free(next);
-        fprintf(stderr, "correctness: failed to allocate geometry grid\n");
-        return 1;
-    }
-
-    for (uint64_t i = 0u; i < cellCount; i++)
-        heads[i] = RTR_CHECK_GRID_EMPTY;
-    for (uint32_t i = 0u; i < sphereCount; i++)
-        next[i] = RTR_CHECK_GRID_EMPTY;
-
-    for (uint32_t i = 0u; i < sphereCount; i++) {
-        const uint32_t centerX = rtrCheckGridCoord(spheres[i].x, dim, cellSize);
-        const uint32_t centerZ = rtrCheckGridCoord(spheres[i].z, dim, cellSize);
-        const float diskDistance = sqrtf(spheres[i].x * spheres[i].x +
-                                         spheres[i].z * spheres[i].z);
-        int32_t minX = (int32_t)centerX - (int32_t)cellRange;
-        int32_t minZ = (int32_t)centerZ - (int32_t)cellRange;
-        int32_t maxX = (int32_t)centerX + (int32_t)cellRange;
-        int32_t maxZ = (int32_t)centerZ + (int32_t)cellRange;
-
-        if (diskDistance + spheres[i].r > RTR_CHECK_DISK_RADIUS + 0.0002f)
-            boundaryFailures++;
-
-        if (minX < 0) minX = 0;
-        if (minZ < 0) minZ = 0;
-        if (maxX >= (int32_t)dim) maxX = (int32_t)dim - 1;
-        if (maxZ >= (int32_t)dim) maxZ = (int32_t)dim - 1;
-
-        for (int32_t cellZ = minZ; cellZ <= maxZ; cellZ++) {
-            for (int32_t cellX = minX; cellX <= maxX; cellX++) {
-                uint32_t j = heads[(uint64_t)cellZ * (uint64_t)dim + (uint64_t)cellX];
-
-                while (j != RTR_CHECK_GRID_EMPTY) {
-                    const float dx = spheres[i].x - spheres[j].x;
-                    const float dz = spheres[i].z - spheres[j].z;
-                    const float dist = sqrtf(dx * dx + dz * dz);
-                    const float margin = dist - (spheres[i].r + spheres[j].r);
-
-                    if (margin < worstMargin)
-                        worstMargin = margin;
-                    if (margin < -0.00001f)
-                        overlapPairs++;
-
-                    j = next[j];
-                }
+        for (uint32_t v = 0u; v < 3u; v++) {
+            if (verts[v].x < rootMin.x - 0.001f || verts[v].x > rootMax.x + 0.001f ||
+                verts[v].y < rootMin.y - 0.001f || verts[v].y > rootMax.y + 0.001f ||
+                verts[v].z < rootMin.z - 0.001f || verts[v].z > rootMax.z + 0.001f) {
+                outsideRoot++;
+                break;
             }
         }
-
-        next[i] = heads[(uint64_t)centerZ * (uint64_t)dim + (uint64_t)centerX];
-        heads[(uint64_t)centerZ * (uint64_t)dim + (uint64_t)centerX] = i;
     }
 
-    free(heads);
-    free(next);
-
-    if (overlapPairs || boundaryFailures) {
+    if (invalid || outsideRoot) {
         fprintf(stderr,
-                "correctness: geometry failed: overlaps=%u boundary=%u worst_margin=%g\n",
-                overlapPairs, boundaryFailures, worstMargin);
+                "correctness: geometry failed invalid=%u outside_root=%u min_area2=%g\n",
+                invalid, outsideRoot, minArea2);
         return 1;
     }
 
-    printf("geometry: ok, worst packed margin %.6f\n", worstMargin);
+    printf("geometry: ok, %u triangles root [(%.3f %.3f %.3f) (%.3f %.3f %.3f)] min_area2 %.3g\n",
+           triangleCount,
+           rootMin.x, rootMin.y, rootMin.z,
+           rootMax.x, rootMax.y, rootMax.z,
+           minArea2);
     return 0;
 }
 
 static int rtrCheckBVH(const uint32_t *words,
-                       const RTRCheckSphere *spheres,
-                       uint32_t sphereCount,
-                       uint32_t nodeCount)
+                       const RTRCheckTriangle *triangles,
+                       uint32_t triangleCount,
+                       uint32_t nodeCount,
+                       RTRCheckVec3 rootMin,
+                       RTRCheckVec3 rootMax)
 {
     uint32_t failures = 0u;
+    const RTRCheckVec3 center = rtrCheckMul(rtrCheckAdd(rootMin, rootMax), 0.5f);
+    const RTRCheckVec3 extent = rtrCheckSub(rootMax, rootMin);
+    const float radius = sqrtf(rtrCheckDot(extent, extent)) * 0.9f + 1.0f;
 
     for (uint32_t i = 0u; i < 96u; i++) {
+        const float angle = 6.2831853f * rtrCheckHash01(i * 747796405u + 0x10203040u);
+        const float yJitter = rtrCheckHash01(i * 2891336453u + 0x50607080u);
         RTRCheckVec3 ro;
         RTRCheckVec3 target;
         RTRCheckVec3 rd;
         RTRCheckHit brute;
         RTRCheckHit bvh;
 
-        ro.x = (rtrCheckHash01(i * 747796405u + 0x10203040u) - 0.5f) * 14.0f;
-        ro.y = 0.15f + rtrCheckHash01(i * 2891336453u + 0x50607080u) * 4.5f;
-        ro.z = (rtrCheckHash01(i * 2246822519u + 0x90abcdefu) - 0.5f) * 14.0f;
-        target.x = (rtrCheckHash01(i * 3266489917u + 0x13579bdfu) - 0.5f) * 24.0f;
-        target.y = RTR_CHECK_PLANE_Y +
-            rtrCheckHash01(i * 668265263u + 0x2468ace0u) * 0.08f;
-        target.z = (rtrCheckHash01(i * 374761393u + 0xfedcba09u) - 0.5f) * 24.0f;
+        ro.x = center.x + cosf(angle) * radius;
+        ro.y = center.y + (yJitter - 0.25f) * radius;
+        ro.z = center.z + sinf(angle) * radius;
+        target.x = rootMin.x + rtrCheckHash01(i * 2246822519u + 0x90abcdefu) * extent.x;
+        target.y = rootMin.y + rtrCheckHash01(i * 3266489917u + 0x13579bdfu) * extent.y;
+        target.z = rootMin.z + rtrCheckHash01(i * 668265263u + 0x2468ace0u) * extent.z;
         rd = rtrCheckNormalize(rtrCheckSub(target, ro));
 
-        brute = rtrCheckTraceBrute(ro, rd, spheres, sphereCount);
-        bvh = rtrCheckTraceBVH(ro, rd, words, spheres, sphereCount, nodeCount);
+        brute = rtrCheckTraceBrute(ro, rd, triangles, triangleCount);
+        bvh = rtrCheckTraceBVH(ro, rd, words, triangles, triangleCount, nodeCount);
 
         if (bvh.id == -2 ||
             ((brute.id < 0) != (bvh.id < 0)) ||
-            (brute.id >= 0 && fabsf(brute.t - bvh.t) > 0.002f)) {
+            (brute.id >= 0 && fabsf(brute.t - bvh.t) > 0.0005f)) {
             fprintf(stderr,
                     "correctness: bvh mismatch ray=%u brute=(%d,%g) bvh=(%d,%g)\n",
                     i, brute.id, brute.t, bvh.id, bvh.t);
@@ -443,39 +419,47 @@ static int rtrCheckBVH(const uint32_t *words,
 int main(void)
 {
     uint32_t *words = (uint32_t *)calloc((size_t)RTR_CHECK_WORDS, sizeof(*words));
-    RTRCheckSphere *spheres =
-        (RTRCheckSphere *)malloc(sizeof(*spheres) * (size_t)RTR_CHECK_SPHERE_COUNT);
-    uint32_t sphereCount = 0u;
+    RTRCheckTriangle *triangles =
+        (RTRCheckTriangle *)malloc(sizeof(*triangles) *
+                                   (size_t)RTR_CHECK_TRIANGLE_CAPACITY);
+    uint32_t triangleCount = 0u;
     uint32_t nodeCount = 0u;
+    RTRCheckVec3 rootMin;
+    RTRCheckVec3 rootMax;
     int failed = 0;
 
-    if (!(words && spheres)) {
+    if (!(words && triangles)) {
         fprintf(stderr, "correctness: allocation failed\n");
         free(words);
-        free(spheres);
+        free(triangles);
         return 1;
     }
 
     rtrScene(words);
-    sphereCount = words[RTR_CHECK_SPHERE_COUNT_WORD];
+    triangleCount = words[RTR_CHECK_TRIANGLE_COUNT_WORD];
     nodeCount = words[RTR_CHECK_BVH_NODE_COUNT_WORD];
 
-    if (sphereCount != RTR_CHECK_SPHERE_COUNT || nodeCount == 0u ||
+    if (triangleCount == 0u ||
+        triangleCount > RTR_CHECK_TRIANGLE_CAPACITY ||
+        nodeCount == 0u ||
         nodeCount > RTR_CHECK_BVH_NODE_COUNT) {
-        fprintf(stderr, "correctness: invalid counts spheres=%u nodes=%u\n",
-                sphereCount, nodeCount);
+        fprintf(stderr, "correctness: invalid counts triangles=%u nodes=%u\n",
+                triangleCount, nodeCount);
         free(words);
-        free(spheres);
+        free(triangles);
         return 1;
     }
 
-    for (uint32_t i = 0u; i < sphereCount; i++)
-        spheres[i] = rtrCheckLoadSphere(words, i);
+    for (uint32_t i = 0u; i < triangleCount; i++)
+        triangles[i] = rtrCheckLoadTriangle(words, i);
 
-    failed |= rtrCheckSceneGeometry(spheres, sphereCount);
-    failed |= rtrCheckBVH(words, spheres, sphereCount, nodeCount);
+    rootMin = rtrCheckLoadBVHMin(words, 0u);
+    rootMax = rtrCheckLoadBVHMax(words, 0u);
+
+    failed |= rtrCheckSceneGeometry(triangles, triangleCount, rootMin, rootMax);
+    failed |= rtrCheckBVH(words, triangles, triangleCount, nodeCount, rootMin, rootMax);
 
     free(words);
-    free(spheres);
+    free(triangles);
     return failed ? 1 : 0;
 }

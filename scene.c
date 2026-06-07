@@ -1,33 +1,25 @@
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #ifndef RTR_BVH_LEAF_SIZE
-#define RTR_BVH_LEAF_SIZE 6u
+#define RTR_BVH_LEAF_SIZE 4u
 #endif
 
 #ifndef RTR_BVH_BIN_COUNT
 #define RTR_BVH_BIN_COUNT 32u
 #endif
 
+#ifndef RTR_SCENE_DRAGON_PATH
+#define RTR_SCENE_DRAGON_PATH "assets/dragon/dragon_recon/dragon_vrip.ply"
+#endif
+
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
-#define RTR_SCENE_PI 3.14159265358979323846f
-#define RTR_SCENE_GROUND_Y -1.0f
-#define RTR_SCENE_DISK_RADIUS 26.0f
-#define RTR_SCENE_MIN_SPHERE_RADIUS 0.012f
-#define RTR_SCENE_MAX_SPHERE_RADIUS 0.025f
-#define RTR_SCENE_SPHERE_CLEARANCE 0.0012f
-#define RTR_SCENE_PLACE_ATTEMPTS 8192u
-#define RTR_SCENE_PLACE_GRID_DIM 128u
-#define RTR_SCENE_PLACE_GRID_CELLS (RTR_SCENE_PLACE_GRID_DIM * RTR_SCENE_PLACE_GRID_DIM)
-#define RTR_SCENE_GRID_EMPTY UINT32_MAX
-#define RTR_SCENE_DENSE_PLACEMENT_THRESHOLD 50000u
-#define RTR_SCENE_DENSE_RADIUS_SCALE 1.0f
-#define RTR_SCENE_DENSE_HEX_ROW_SCALE 0.8660254037844386f
-#define RTR_SCENE_CENTER_QUANT_STEP ((RTR_SCENE_DISK_RADIUS * 2.0f) / 4095.0f)
-#define RTR_SCENE_RADIUS_QUANT_STEP (RTR_SCENE_MAX_SPHERE_RADIUS / 255.0f)
-#define RTR_SCENE_DENSE_MARGIN \
-    (RTR_SCENE_MIN_SPHERE_RADIUS + RTR_SCENE_SPHERE_CLEARANCE + RTR_SCENE_CENTER_QUANT_STEP)
+#define RTR_SCENE_PLANE_Y -1.0f
+#define RTR_SCENE_DRAGON_HEIGHT 1.75f
+#define RTR_SCENE_BOUNDS_EPS 0.0001f
 #define RTR_SCENE_BLUE_NOISE_SIZE 64u
 #define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
 #define RTR_SCENE_BLUE_NOISE_CANDIDATES 64u
@@ -36,18 +28,28 @@ enum {
     RTR_SCENE_COUNT_WORD = 8,
     RTR_SCENE_BVH_NODE_COUNT_WORD = 15,
     RTR_SCENE_GEOM_WORD = 24,
-    RTR_SCENE_SPHERE_COUNT = 1000000,
-    RTR_SCENE_SPHERE_WORDS = 1,
-    RTR_SCENE_BVH_WORD = RTR_SCENE_GEOM_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
-    RTR_SCENE_BVH_NODE_WORDS = 5,
-    RTR_SCENE_BVH_MAX_NODES = RTR_SCENE_SPHERE_COUNT * 2 - 1,
+    RTR_SCENE_TRIANGLE_CAPACITY = 900000,
+    RTR_SCENE_TRIANGLE_WORDS = 9,
+    RTR_SCENE_BVH_WORD = RTR_SCENE_GEOM_WORD +
+        RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS,
+    RTR_SCENE_BVH_NODE_WORDS = 8,
+    RTR_SCENE_BVH_MAX_NODES = RTR_SCENE_TRIANGLE_CAPACITY * 2 - 1,
     RTR_SCENE_BLUE_NOISE_WORD = RTR_SCENE_BVH_WORD +
         RTR_SCENE_BVH_MAX_NODES * RTR_SCENE_BVH_NODE_WORDS,
 };
 
-typedef struct RTRSphere {
-    float geom[4];
-} RTRSphere;
+typedef struct RTRVec3 {
+    float x;
+    float y;
+    float z;
+} RTRVec3;
+
+typedef struct RTRTriangle {
+    RTRVec3 v0;
+    RTRVec3 v1;
+    RTRVec3 v2;
+    RTRVec3 centroid;
+} RTRTriangle;
 
 typedef struct RTRBVHNode {
     float boundsMin[3];
@@ -63,12 +65,14 @@ typedef struct RTRSplit {
     uint32_t valid;
 } RTRSplit;
 
-typedef struct RTRPlacementGrid {
-    uint32_t heads[RTR_SCENE_PLACE_GRID_CELLS];
-    uint32_t next[RTR_SCENE_SPHERE_COUNT];
-} RTRPlacementGrid;
-
 static uint32_t rtrSortAxis = 0u;
+
+static uint32_t rtrF32Word(float value)
+{
+    uint32_t word = 0u;
+    memcpy(&word, &value, sizeof(word));
+    return word;
+}
 
 static uint32_t rtrHashU32(uint32_t value)
 {
@@ -84,466 +88,6 @@ static uint32_t rtrHashU32(uint32_t value)
 static float rtrHash01(uint32_t value)
 {
     return (float)(rtrHashU32(value) & 0x00ffffffu) / 16777215.0f;
-}
-
-static float rtrClampF32(float value, float minValue, float maxValue)
-{
-    if (value < minValue) return minValue;
-    if (value > maxValue) return maxValue;
-    return value;
-}
-
-static uint32_t rtrPack2x16(uint32_t lo, uint32_t hi)
-{
-    return (lo & 0xffffu) | ((hi & 0xffffu) << 16u);
-}
-
-static uint32_t rtrPackUnorm16Floor(float value, float minValue, float maxValue)
-{
-    const float t = rtrClampF32((value - minValue) / (maxValue - minValue),
-                                0.0f, 1.0f);
-    return (uint32_t)floorf(t * 65535.0f);
-}
-
-static uint32_t rtrPackUnorm16Ceil(float value, float minValue, float maxValue)
-{
-    const float t = rtrClampF32((value - minValue) / (maxValue - minValue),
-                                0.0f, 1.0f);
-    uint32_t q = (uint32_t)ceilf(t * 65535.0f);
-    return q > 65535u ? 65535u : q;
-}
-
-static uint32_t rtrQuantPadMin16(uint32_t value)
-{
-    return value > 0u ? value - 1u : 0u;
-}
-
-static uint32_t rtrQuantPadMax16(uint32_t value)
-{
-    return value < 65535u ? value + 1u : 65535u;
-}
-
-static uint32_t rtrPackUnormNNearest(float value,
-                                     float minValue,
-                                     float maxValue,
-                                     uint32_t bits)
-{
-    const uint32_t maxQuant = (1u << bits) - 1u;
-    const float t = rtrClampF32((value - minValue) / (maxValue - minValue),
-                                0.0f, 1.0f);
-
-    return (uint32_t)floorf(t * (float)maxQuant + 0.5f);
-}
-
-static float rtrUnpackUnormN(uint32_t value,
-                             float minValue,
-                             float maxValue,
-                             uint32_t bits)
-{
-    const uint32_t maxQuant = (1u << bits) - 1u;
-
-    return minValue + (maxValue - minValue) *
-        ((float)(value & maxQuant) / (float)maxQuant);
-}
-
-static void rtrQuantizeSphereGeom(RTRSphere *sphere)
-{
-    const uint32_t x = rtrPackUnormNNearest(sphere->geom[0],
-                                            -RTR_SCENE_DISK_RADIUS,
-                                            RTR_SCENE_DISK_RADIUS,
-                                            12u);
-    const uint32_t z = rtrPackUnormNNearest(sphere->geom[2],
-                                            -RTR_SCENE_DISK_RADIUS,
-                                            RTR_SCENE_DISK_RADIUS,
-                                            12u);
-    const uint32_t r = rtrPackUnormNNearest(sphere->geom[3],
-                                            0.0f,
-                                            RTR_SCENE_MAX_SPHERE_RADIUS,
-                                            8u);
-
-    sphere->geom[0] = rtrUnpackUnormN(x, -RTR_SCENE_DISK_RADIUS,
-                                      RTR_SCENE_DISK_RADIUS, 12u);
-    sphere->geom[2] = rtrUnpackUnormN(z, -RTR_SCENE_DISK_RADIUS,
-                                      RTR_SCENE_DISK_RADIUS, 12u);
-    sphere->geom[3] = rtrUnpackUnormN(r, 0.0f, RTR_SCENE_MAX_SPHERE_RADIUS, 8u);
-    sphere->geom[1] = RTR_SCENE_GROUND_Y + sphere->geom[3];
-}
-
-static int rtrCompareSphereByRadiusDesc(const void *lhs, const void *rhs)
-{
-    const RTRSphere *a = (const RTRSphere *)lhs;
-    const RTRSphere *b = (const RTRSphere *)rhs;
-
-    if (a->geom[3] > b->geom[3]) return -1;
-    if (a->geom[3] < b->geom[3]) return 1;
-    return 0;
-}
-
-static void rtrPlacementGridReset(RTRPlacementGrid *grid)
-{
-    for (uint32_t i = 0u; i < RTR_SCENE_PLACE_GRID_CELLS; i++)
-        grid->heads[i] = RTR_SCENE_GRID_EMPTY;
-
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
-        grid->next[i] = RTR_SCENE_GRID_EMPTY;
-}
-
-static uint32_t rtrPlacementGridCoord(float value)
-{
-    const float diameter = RTR_SCENE_DISK_RADIUS * 2.0f;
-    int32_t coord = (int32_t)floorf(
-        (value + RTR_SCENE_DISK_RADIUS) *
-        ((float)RTR_SCENE_PLACE_GRID_DIM / diameter));
-
-    if (coord < 0) return 0u;
-    if (coord >= (int32_t)RTR_SCENE_PLACE_GRID_DIM)
-        return RTR_SCENE_PLACE_GRID_DIM - 1u;
-
-    return (uint32_t)coord;
-}
-
-static uint32_t rtrPlacementGridCell(uint32_t x, uint32_t z)
-{
-    return z * RTR_SCENE_PLACE_GRID_DIM + x;
-}
-
-static void rtrPlacementGridInsert(RTRPlacementGrid *grid,
-                                   const RTRSphere *spheres,
-                                   uint32_t index)
-{
-    const uint32_t x = rtrPlacementGridCoord(spheres[index].geom[0]);
-    const uint32_t z = rtrPlacementGridCoord(spheres[index].geom[2]);
-    const uint32_t cell = rtrPlacementGridCell(x, z);
-
-    grid->next[index] = grid->heads[cell];
-    grid->heads[cell] = index;
-}
-
-static uint32_t rtrOverlapsPlacedSphere(const RTRSphere *spheres,
-                                        const RTRPlacementGrid *grid,
-                                        float x,
-                                        float z,
-                                        float r)
-{
-    const float cellSize =
-        (RTR_SCENE_DISK_RADIUS * 2.0f) / (float)RTR_SCENE_PLACE_GRID_DIM;
-    const float range = r + RTR_SCENE_MAX_SPHERE_RADIUS + RTR_SCENE_SPHERE_CLEARANCE;
-    const uint32_t cellRange = (uint32_t)ceilf(range / cellSize) + 1u;
-    const uint32_t centerX = rtrPlacementGridCoord(x);
-    const uint32_t centerZ = rtrPlacementGridCoord(z);
-
-    int32_t minX = (int32_t)centerX - (int32_t)cellRange;
-    int32_t minZ = (int32_t)centerZ - (int32_t)cellRange;
-    int32_t maxX = (int32_t)centerX + (int32_t)cellRange;
-    int32_t maxZ = (int32_t)centerZ + (int32_t)cellRange;
-
-    if (minX < 0) minX = 0;
-    if (minZ < 0) minZ = 0;
-    if (maxX >= (int32_t)RTR_SCENE_PLACE_GRID_DIM)
-        maxX = (int32_t)RTR_SCENE_PLACE_GRID_DIM - 1;
-    if (maxZ >= (int32_t)RTR_SCENE_PLACE_GRID_DIM)
-        maxZ = (int32_t)RTR_SCENE_PLACE_GRID_DIM - 1;
-
-    for (int32_t cellZ = minZ; cellZ <= maxZ; cellZ++) {
-        for (int32_t cellX = minX; cellX <= maxX; cellX++) {
-            uint32_t i = grid->heads[
-                rtrPlacementGridCell((uint32_t)cellX, (uint32_t)cellZ)];
-
-            while (i != RTR_SCENE_GRID_EMPTY) {
-                const float dx = x - spheres[i].geom[0];
-                const float dz = z - spheres[i].geom[2];
-                const float minDist =
-                    r + spheres[i].geom[3] + RTR_SCENE_SPHERE_CLEARANCE;
-
-                if (dx * dx + dz * dz < minDist * minDist)
-                    return 1u;
-
-                i = grid->next[i];
-            }
-        }
-    }
-
-    return 0u;
-}
-
-static uint32_t rtrPlaceSphere(RTRSphere *spheres, RTRPlacementGrid *grid, uint32_t index)
-{
-    const float r = spheres[index].geom[3];
-    const float diskRadius = RTR_SCENE_DISK_RADIUS - r;
-    float x = 0.0f;
-    float z = 0.0f;
-
-    for (uint32_t attempt = 0u; attempt < RTR_SCENE_PLACE_ATTEMPTS; attempt++) {
-        const uint32_t seed = index * 747796405u + attempt * 2891336453u + 0x9e3779b9u;
-        const float radial = sqrtf(rtrHash01(seed ^ 0x85ebca6bu)) * diskRadius;
-        const float angle = 2.0f * RTR_SCENE_PI * rtrHash01(seed ^ 0xc2b2ae35u);
-
-        x = cosf(angle) * radial;
-        z = sinf(angle) * radial;
-
-        if (!rtrOverlapsPlacedSphere(spheres, grid, x, z, r)) {
-            spheres[index].geom[0] = x;
-            spheres[index].geom[1] = RTR_SCENE_GROUND_Y + r;
-            spheres[index].geom[2] = z;
-            rtrPlacementGridInsert(grid, spheres, index);
-            return 1u;
-        }
-    }
-
-    for (uint32_t scan = 0u; scan < RTR_SCENE_PLACE_GRID_CELLS; scan++) {
-        const uint32_t cell =
-            rtrHashU32(index * 2246822519u + scan * 3266489917u) &
-            (RTR_SCENE_PLACE_GRID_CELLS - 1u);
-        const uint32_t cellX = cell % RTR_SCENE_PLACE_GRID_DIM;
-        const uint32_t cellZ = cell / RTR_SCENE_PLACE_GRID_DIM;
-        const float cellSize =
-            (RTR_SCENE_DISK_RADIUS * 2.0f) / (float)RTR_SCENE_PLACE_GRID_DIM;
-
-        x = -RTR_SCENE_DISK_RADIUS + ((float)cellX + 0.5f) * cellSize;
-        z = -RTR_SCENE_DISK_RADIUS + ((float)cellZ + 0.5f) * cellSize;
-
-        if (x * x + z * z > diskRadius * diskRadius)
-            continue;
-
-        if (!rtrOverlapsPlacedSphere(spheres, grid, x, z, r)) {
-            spheres[index].geom[0] = x;
-            spheres[index].geom[1] = RTR_SCENE_GROUND_Y + r;
-            spheres[index].geom[2] = z;
-            rtrPlacementGridInsert(grid, spheres, index);
-            return 1u;
-        }
-    }
-
-    return 0u;
-}
-
-static uint32_t rtrDenseLatticeCount(float spacing)
-{
-    const float radius = RTR_SCENE_DISK_RADIUS - RTR_SCENE_DENSE_MARGIN;
-    const float rowStep = spacing * RTR_SCENE_DENSE_HEX_ROW_SCALE;
-    uint64_t count = 0u;
-    uint32_t row = 0u;
-
-    if (spacing <= 0.0f || rowStep <= 0.0f || radius <= 0.0f)
-        return 0u;
-
-    for (float z = -radius; z <= radius; z += rowStep, row++) {
-        const float z2 = z * z;
-        if (z2 > radius * radius)
-            continue;
-
-        const float xLimit = sqrtf(radius * radius - z2);
-        const float offset = (row & 1u) ? spacing * 0.5f : 0.0f;
-        const int32_t minCell = (int32_t)ceilf((-xLimit - offset) / spacing);
-        const int32_t maxCell = (int32_t)floorf((xLimit - offset) / spacing);
-
-        if (maxCell >= minCell)
-            count += (uint64_t)(maxCell - minCell + 1);
-        if (count > UINT32_MAX)
-            return UINT32_MAX;
-    }
-
-    return (uint32_t)count;
-}
-
-static float rtrDenseLatticeSpacing(void)
-{
-    float lo = RTR_SCENE_MIN_SPHERE_RADIUS;
-    float hi = RTR_SCENE_MAX_SPHERE_RADIUS * 8.0f;
-
-    while (rtrDenseLatticeCount(hi) >= RTR_SCENE_SPHERE_COUNT)
-        hi *= 1.25f;
-
-    for (uint32_t i = 0u; i < 48u; i++) {
-        const float mid = (lo + hi) * 0.5f;
-        if (rtrDenseLatticeCount(mid) >= RTR_SCENE_SPHERE_COUNT) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-
-    return lo * 0.999f;
-}
-
-static uint32_t rtrDenseGridCoord(float value, uint32_t dim, float cellSize)
-{
-    int32_t coord = (int32_t)floorf((value + RTR_SCENE_DISK_RADIUS) / cellSize);
-
-    if (coord < 0) return 0u;
-    if (coord >= (int32_t)dim) return dim - 1u;
-
-    return (uint32_t)coord;
-}
-
-static void rtrCapDenseSphereRadii(RTRSphere *spheres)
-{
-    const float cellSize = RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f;
-    const uint32_t dim =
-        (uint32_t)ceilf((RTR_SCENE_DISK_RADIUS * 2.0f) / cellSize) + 1u;
-    const uint64_t cellCount64 = (uint64_t)dim * (uint64_t)dim;
-    const float neighborLimit =
-        RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f +
-        RTR_SCENE_SPHERE_CLEARANCE +
-        RTR_SCENE_RADIUS_QUANT_STEP * 2.0f;
-    const uint32_t cellRange = (uint32_t)ceilf(neighborLimit / cellSize) + 1u;
-    uint32_t *heads = NULL;
-    uint32_t *next = NULL;
-
-    if (cellCount64 > UINT32_MAX)
-        return;
-
-    heads = (uint32_t *)malloc(sizeof(*heads) * (size_t)cellCount64);
-    next = (uint32_t *)malloc(sizeof(*next) * (size_t)RTR_SCENE_SPHERE_COUNT);
-    if (!(heads && next)) {
-        free(heads);
-        free(next);
-        return;
-    }
-
-    for (uint64_t i = 0u; i < cellCount64; i++)
-        heads[i] = RTR_SCENE_GRID_EMPTY;
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
-        next[i] = RTR_SCENE_GRID_EMPTY;
-
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-        const uint32_t x = rtrDenseGridCoord(spheres[i].geom[0], dim, cellSize);
-        const uint32_t z = rtrDenseGridCoord(spheres[i].geom[2], dim, cellSize);
-        const uint64_t cell = (uint64_t)z * (uint64_t)dim + (uint64_t)x;
-
-        next[i] = heads[cell];
-        heads[cell] = i;
-    }
-
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-        const uint32_t centerX = rtrDenseGridCoord(spheres[i].geom[0], dim, cellSize);
-        const uint32_t centerZ = rtrDenseGridCoord(spheres[i].geom[2], dim, cellSize);
-        float nearest = neighborLimit;
-        float cap = RTR_SCENE_MAX_SPHERE_RADIUS * RTR_SCENE_DENSE_RADIUS_SCALE;
-        const float boundary =
-            RTR_SCENE_DISK_RADIUS -
-            sqrtf(spheres[i].geom[0] * spheres[i].geom[0] +
-                  spheres[i].geom[2] * spheres[i].geom[2]);
-
-        if (cap > RTR_SCENE_MAX_SPHERE_RADIUS)
-            cap = RTR_SCENE_MAX_SPHERE_RADIUS;
-
-        int32_t minX = (int32_t)centerX - (int32_t)cellRange;
-        int32_t minZ = (int32_t)centerZ - (int32_t)cellRange;
-        int32_t maxX = (int32_t)centerX + (int32_t)cellRange;
-        int32_t maxZ = (int32_t)centerZ + (int32_t)cellRange;
-
-        if (minX < 0) minX = 0;
-        if (minZ < 0) minZ = 0;
-        if (maxX >= (int32_t)dim) maxX = (int32_t)dim - 1;
-        if (maxZ >= (int32_t)dim) maxZ = (int32_t)dim - 1;
-
-        for (int32_t cellZ = minZ; cellZ <= maxZ; cellZ++) {
-            for (int32_t cellX = minX; cellX <= maxX; cellX++) {
-                uint32_t j = heads[(uint64_t)cellZ * (uint64_t)dim + (uint64_t)cellX];
-
-                while (j != RTR_SCENE_GRID_EMPTY) {
-                    if (j != i) {
-                        const float dx = spheres[i].geom[0] - spheres[j].geom[0];
-                        const float dz = spheres[i].geom[2] - spheres[j].geom[2];
-                        const float d2 = dx * dx + dz * dz;
-
-                        if (d2 < nearest * nearest)
-                            nearest = sqrtf(d2);
-                    }
-                    j = next[j];
-                }
-            }
-        }
-
-        if (nearest < neighborLimit) {
-            const float neighborCap =
-                (nearest - RTR_SCENE_SPHERE_CLEARANCE) * 0.5f -
-                RTR_SCENE_RADIUS_QUANT_STEP;
-            if (neighborCap < cap)
-                cap = neighborCap;
-        }
-
-        if (boundary - RTR_SCENE_RADIUS_QUANT_STEP < cap)
-            cap = boundary - RTR_SCENE_RADIUS_QUANT_STEP;
-        if (cap < 0.0f)
-            cap = 0.0f;
-
-        if (spheres[i].geom[3] > cap)
-            spheres[i].geom[3] = cap;
-        spheres[i].geom[1] = RTR_SCENE_GROUND_Y + spheres[i].geom[3];
-    }
-
-    free(heads);
-    free(next);
-}
-
-static void rtrPlaceDenseSpheres(RTRSphere *spheres)
-{
-    float spacing = rtrDenseLatticeSpacing();
-    uint32_t candidateCount = rtrDenseLatticeCount(spacing);
-    uint32_t selected = 0u;
-    uint32_t seen = 0u;
-    const float radius = RTR_SCENE_DISK_RADIUS - RTR_SCENE_DENSE_MARGIN;
-    float rowStep = 0.0f;
-    uint32_t row = 0u;
-
-    while (candidateCount < RTR_SCENE_SPHERE_COUNT) {
-        spacing *= 0.99f;
-        candidateCount = rtrDenseLatticeCount(spacing);
-    }
-    rowStep = spacing * RTR_SCENE_DENSE_HEX_ROW_SCALE;
-
-    for (float z = -radius;
-         z <= radius && selected < RTR_SCENE_SPHERE_COUNT;
-         z += rowStep, row++) {
-        const float z2 = z * z;
-        if (z2 > radius * radius)
-            continue;
-
-        const float xLimit = sqrtf(radius * radius - z2);
-        const float offset = (row & 1u) ? spacing * 0.5f : 0.0f;
-        const int32_t minCell = (int32_t)ceilf((-xLimit - offset) / spacing);
-        const int32_t maxCell = (int32_t)floorf((xLimit - offset) / spacing);
-
-        for (int32_t cell = minCell;
-             cell <= maxCell && selected < RTR_SCENE_SPHERE_COUNT;
-             cell++) {
-            const uint32_t remainingCandidates = candidateCount - seen;
-            const uint32_t remainingNeeded = RTR_SCENE_SPHERE_COUNT - selected;
-            const float x = offset + (float)cell * spacing;
-            const float chooseThreshold =
-                (float)remainingNeeded / (float)remainingCandidates;
-            const uint32_t choose =
-                remainingNeeded >= remainingCandidates ||
-                rtrHash01(seen * 747796405u + 0xa511e9b3u) <= chooseThreshold;
-
-            seen++;
-            if (!choose)
-                continue;
-
-            const uint32_t qx = rtrPackUnormNNearest(x,
-                                                     -RTR_SCENE_DISK_RADIUS,
-                                                     RTR_SCENE_DISK_RADIUS,
-                                                     12u);
-            const uint32_t qz = rtrPackUnormNNearest(z,
-                                                     -RTR_SCENE_DISK_RADIUS,
-                                                     RTR_SCENE_DISK_RADIUS,
-                                                     12u);
-
-            spheres[selected].geom[0] =
-                rtrUnpackUnormN(qx, -RTR_SCENE_DISK_RADIUS,
-                                RTR_SCENE_DISK_RADIUS, 12u);
-            spheres[selected].geom[2] =
-                rtrUnpackUnormN(qz, -RTR_SCENE_DISK_RADIUS,
-                                RTR_SCENE_DISK_RADIUS, 12u);
-            spheres[selected].geom[3] *= RTR_SCENE_DENSE_RADIUS_SCALE;
-            spheres[selected].geom[1] = RTR_SCENE_GROUND_Y + spheres[selected].geom[3];
-            selected++;
-        }
-    }
-
-    rtrCapDenseSphereRadii(spheres);
 }
 
 static uint32_t rtrToroidalDistance2(uint32_t a, uint32_t b)
@@ -637,6 +181,16 @@ static void rtrBoundsReset(float boundsMin[3], float boundsMax[3])
     boundsMax[0] = boundsMax[1] = boundsMax[2] = -1.0e20f;
 }
 
+static void rtrBoundsExtendPoint(float boundsMin[3], float boundsMax[3], RTRVec3 p)
+{
+    if (p.x < boundsMin[0]) boundsMin[0] = p.x;
+    if (p.y < boundsMin[1]) boundsMin[1] = p.y;
+    if (p.z < boundsMin[2]) boundsMin[2] = p.z;
+    if (p.x > boundsMax[0]) boundsMax[0] = p.x;
+    if (p.y > boundsMax[1]) boundsMax[1] = p.y;
+    if (p.z > boundsMax[2]) boundsMax[2] = p.z;
+}
+
 static void rtrBoundsExtend(float boundsMin[3], float boundsMax[3],
                             const float otherMin[3], const float otherMax[3])
 {
@@ -646,15 +200,26 @@ static void rtrBoundsExtend(float boundsMin[3], float boundsMax[3],
     }
 }
 
-static void rtrSphereBounds(const RTRSphere *sphere, float boundsMin[3], float boundsMax[3])
+static void rtrTriangleFinalize(RTRTriangle *triangle)
 {
-    const float r = sphere->geom[3];
-    boundsMin[0] = sphere->geom[0] - r;
-    boundsMin[1] = sphere->geom[1] - r;
-    boundsMin[2] = sphere->geom[2] - r;
-    boundsMax[0] = sphere->geom[0] + r;
-    boundsMax[1] = sphere->geom[1] + r;
-    boundsMax[2] = sphere->geom[2] + r;
+    triangle->centroid.x = (triangle->v0.x + triangle->v1.x + triangle->v2.x) / 3.0f;
+    triangle->centroid.y = (triangle->v0.y + triangle->v1.y + triangle->v2.y) / 3.0f;
+    triangle->centroid.z = (triangle->v0.z + triangle->v1.z + triangle->v2.z) / 3.0f;
+}
+
+static void rtrTriangleBounds(const RTRTriangle *triangle,
+                              float boundsMin[3],
+                              float boundsMax[3])
+{
+    rtrBoundsReset(boundsMin, boundsMax);
+    rtrBoundsExtendPoint(boundsMin, boundsMax, triangle->v0);
+    rtrBoundsExtendPoint(boundsMin, boundsMax, triangle->v1);
+    rtrBoundsExtendPoint(boundsMin, boundsMax, triangle->v2);
+
+    for (uint32_t axis = 0u; axis < 3u; axis++) {
+        boundsMin[axis] -= RTR_SCENE_BOUNDS_EPS;
+        boundsMax[axis] += RTR_SCENE_BOUNDS_EPS;
+    }
 }
 
 static float rtrBoundsArea(const float boundsMin[3], const float boundsMax[3])
@@ -666,13 +231,22 @@ static float rtrBoundsArea(const float boundsMin[3], const float boundsMax[3])
     return 2.0f * (dx * dy + dx * dz + dy * dz);
 }
 
-static int rtrCompareSphereByAxis(const void *lhs, const void *rhs)
+static float rtrTriangleCentroidAxis(const RTRTriangle *triangle, uint32_t axis)
 {
-    const RTRSphere *a = (const RTRSphere *)lhs;
-    const RTRSphere *b = (const RTRSphere *)rhs;
+    if (axis == 0u) return triangle->centroid.x;
+    if (axis == 1u) return triangle->centroid.y;
+    return triangle->centroid.z;
+}
 
-    if (a->geom[rtrSortAxis] < b->geom[rtrSortAxis]) return -1;
-    if (a->geom[rtrSortAxis] > b->geom[rtrSortAxis]) return 1;
+static int rtrCompareTriangleByAxis(const void *lhs, const void *rhs)
+{
+    const RTRTriangle *a = (const RTRTriangle *)lhs;
+    const RTRTriangle *b = (const RTRTriangle *)rhs;
+    const float av = rtrTriangleCentroidAxis(a, rtrSortAxis);
+    const float bv = rtrTriangleCentroidAxis(b, rtrSortAxis);
+
+    if (av < bv) return -1;
+    if (av > bv) return 1;
     return 0;
 }
 
@@ -686,41 +260,43 @@ static uint32_t rtrLongestAxis(const float boundsMin[3], const float boundsMax[3
     return ey >= ez ? 1u : 2u;
 }
 
-static void rtrCentroidBounds(const RTRSphere *spheres, uint32_t start, uint32_t count,
-                              float boundsMin[3], float boundsMax[3])
+static void rtrCentroidBounds(const RTRTriangle *triangles,
+                              uint32_t start,
+                              uint32_t count,
+                              float boundsMin[3],
+                              float boundsMax[3])
 {
     rtrBoundsReset(boundsMin, boundsMax);
 
     for (uint32_t i = 0u; i < count; i++) {
-        const RTRSphere *sphere = spheres + start + i;
-        for (uint32_t axis = 0u; axis < 3u; axis++) {
-            const float value = sphere->geom[axis];
-            if (value < boundsMin[axis]) boundsMin[axis] = value;
-            if (value > boundsMax[axis]) boundsMax[axis] = value;
-        }
+        const RTRTriangle *triangle = triangles + start + i;
+        rtrBoundsExtendPoint(boundsMin, boundsMax, triangle->centroid);
     }
 }
 
-static void rtrNodeBounds(const RTRSphere *spheres, uint32_t start, uint32_t count,
-                          float boundsMin[3], float boundsMax[3])
+static void rtrNodeBounds(const RTRTriangle *triangles,
+                          uint32_t start,
+                          uint32_t count,
+                          float boundsMin[3],
+                          float boundsMax[3])
 {
     rtrBoundsReset(boundsMin, boundsMax);
 
     for (uint32_t i = 0u; i < count; i++) {
-        float sphereMin[3];
-        float sphereMax[3];
-        rtrSphereBounds(spheres + start + i, sphereMin, sphereMax);
-        rtrBoundsExtend(boundsMin, boundsMax, sphereMin, sphereMax);
+        float triMin[3];
+        float triMax[3];
+        rtrTriangleBounds(triangles + start + i, triMin, triMax);
+        rtrBoundsExtend(boundsMin, boundsMax, triMin, triMax);
     }
 }
 
-static RTRSplit rtrFindSplit(const RTRSphere *spheres, uint32_t start, uint32_t count)
+static RTRSplit rtrFindSplit(const RTRTriangle *triangles, uint32_t start, uint32_t count)
 {
     RTRSplit best = {.cost = 1.0e30f};
     float centroidMin[3];
     float centroidMax[3];
 
-    rtrCentroidBounds(spheres, start, count, centroidMin, centroidMax);
+    rtrCentroidBounds(triangles, start, count, centroidMin, centroidMax);
 
     for (uint32_t axis = 0u; axis < 3u; axis++) {
         const float extent = centroidMax[axis] - centroidMin[axis];
@@ -736,15 +312,17 @@ static RTRSplit rtrFindSplit(const RTRSphere *spheres, uint32_t start, uint32_t 
 
         const float scale = ((float)RTR_BVH_BIN_COUNT - 1.0f) / extent;
         for (uint32_t i = 0u; i < count; i++) {
-            const RTRSphere *sphere = spheres + start + i;
-            uint32_t bin = (uint32_t)((sphere->geom[axis] - centroidMin[axis]) * scale);
+            const RTRTriangle *triangle = triangles + start + i;
+            uint32_t bin = (uint32_t)(
+                (rtrTriangleCentroidAxis(triangle, axis) - centroidMin[axis]) * scale);
+            float triMin[3];
+            float triMax[3];
+
             if (bin >= RTR_BVH_BIN_COUNT) bin = RTR_BVH_BIN_COUNT - 1u;
 
-            float sphereMin[3];
-            float sphereMax[3];
-            rtrSphereBounds(sphere, sphereMin, sphereMax);
+            rtrTriangleBounds(triangle, triMin, triMax);
             binCounts[bin]++;
-            rtrBoundsExtend(binMin[bin], binMax[bin], sphereMin, sphereMax);
+            rtrBoundsExtend(binMin[bin], binMax[bin], triMin, triMax);
         }
 
         for (uint32_t splitBin = 0u; splitBin + 1u < RTR_BVH_BIN_COUNT; splitBin++) {
@@ -789,12 +367,14 @@ static RTRSplit rtrFindSplit(const RTRSphere *spheres, uint32_t start, uint32_t 
     return best;
 }
 
-static uint32_t rtrPartitionSpheres(RTRSphere *spheres, uint32_t start, uint32_t count,
-                                    RTRSplit split)
+static uint32_t rtrPartitionTriangles(RTRTriangle *triangles,
+                                      uint32_t start,
+                                      uint32_t count,
+                                      RTRSplit split)
 {
     float centroidMin[3];
     float centroidMax[3];
-    rtrCentroidBounds(spheres, start, count, centroidMin, centroidMax);
+    rtrCentroidBounds(triangles, start, count, centroidMin, centroidMax);
 
     const float extent = centroidMax[split.axis] - centroidMin[split.axis];
     if (extent <= 1.0e-8f) return start;
@@ -804,30 +384,34 @@ static uint32_t rtrPartitionSpheres(RTRSphere *spheres, uint32_t start, uint32_t
     const float scale = ((float)RTR_BVH_BIN_COUNT - 1.0f) / extent;
 
     while (left < right) {
-        uint32_t bin = (uint32_t)((spheres[left].geom[split.axis] - centroidMin[split.axis]) *
-                                  scale);
+        uint32_t bin = (uint32_t)(
+            (rtrTriangleCentroidAxis(triangles + left, split.axis) -
+             centroidMin[split.axis]) * scale);
         if (bin >= RTR_BVH_BIN_COUNT) bin = RTR_BVH_BIN_COUNT - 1u;
 
         if (bin <= split.bin) {
             left++;
         } else {
             right--;
-            RTRSphere tmp = spheres[left];
-            spheres[left] = spheres[right];
-            spheres[right] = tmp;
+            RTRTriangle tmp = triangles[left];
+            triangles[left] = triangles[right];
+            triangles[right] = tmp;
         }
     }
 
     return left;
 }
 
-static uint32_t rtrBuildBVH(RTRSphere *spheres, RTRBVHNode *nodes, uint32_t *nodeCount,
-                            uint32_t start, uint32_t count)
+static uint32_t rtrBuildBVH(RTRTriangle *triangles,
+                            RTRBVHNode *nodes,
+                            uint32_t *nodeCount,
+                            uint32_t start,
+                            uint32_t count)
 {
     const uint32_t nodeIndex = (*nodeCount)++;
     RTRBVHNode *node = nodes + nodeIndex;
 
-    rtrNodeBounds(spheres, start, count, node->boundsMin, node->boundsMax);
+    rtrNodeBounds(triangles, start, count, node->boundsMin, node->boundsMax);
 
     if (count <= RTR_BVH_LEAF_SIZE) {
         node->leftFirst = start;
@@ -835,148 +419,242 @@ static uint32_t rtrBuildBVH(RTRSphere *spheres, RTRBVHNode *nodes, uint32_t *nod
         return nodeIndex;
     }
 
-    RTRSplit split = rtrFindSplit(spheres, start, count);
-    uint32_t mid = split.valid ? rtrPartitionSpheres(spheres, start, count, split) : start;
+    RTRSplit split = rtrFindSplit(triangles, start, count);
+    uint32_t mid = split.valid ?
+        rtrPartitionTriangles(triangles, start, count, split) :
+        start;
 
     if (mid == start || mid == start + count) {
         rtrSortAxis = rtrLongestAxis(node->boundsMin, node->boundsMax);
-        qsort(spheres + start, count, sizeof(spheres[0]), rtrCompareSphereByAxis);
+        qsort(triangles + start, count, sizeof(triangles[0]), rtrCompareTriangleByAxis);
         mid = start + count / 2u;
     }
 
-    const uint32_t left = rtrBuildBVH(spheres, nodes, nodeCount, start, mid - start);
-    const uint32_t right = rtrBuildBVH(spheres, nodes, nodeCount, mid, start + count - mid);
+    const uint32_t left = rtrBuildBVH(triangles, nodes, nodeCount, start, mid - start);
+    const uint32_t right = rtrBuildBVH(triangles, nodes, nodeCount, mid, start + count - mid);
 
     node->leftFirst = left;
     node->countRight = RTR_SCENE_BVH_INTERNAL_FLAG | right;
     return nodeIndex;
 }
 
+static int rtrReadLine(FILE *file, char *line, size_t lineSize)
+{
+    return fgets(line, (int)lineSize, file) != NULL;
+}
+
+static int rtrParseDragonHeader(FILE *file, uint32_t *vertexCount, uint32_t *faceCount)
+{
+    char line[256];
+
+    *vertexCount = 0u;
+    *faceCount = 0u;
+
+    if (!rtrReadLine(file, line, sizeof(line)) || strcmp(line, "ply\n") != 0)
+        return 1;
+
+    while (rtrReadLine(file, line, sizeof(line))) {
+        unsigned parsedCount = 0u;
+
+        if (sscanf(line, "element vertex %u", &parsedCount) == 1) {
+            *vertexCount = (uint32_t)parsedCount;
+            continue;
+        }
+
+        if (sscanf(line, "element face %u", &parsedCount) == 1) {
+            *faceCount = (uint32_t)parsedCount;
+            continue;
+        }
+
+        if (strcmp(line, "end_header\n") == 0)
+            return (*vertexCount == 0u || *faceCount == 0u) ? 1 : 0;
+    }
+
+    return 1;
+}
+
+static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTriangleCount)
+{
+    FILE *file = fopen(RTR_SCENE_DRAGON_PATH, "r");
+    uint32_t vertexCount = 0u;
+    uint32_t faceCount = 0u;
+    RTRVec3 *vertices = NULL;
+    RTRTriangle *triangles = NULL;
+    float sourceMin[3];
+    float sourceMax[3];
+    uint32_t triangleCount = 0u;
+    char line[256];
+
+    *outTriangles = NULL;
+    *outTriangleCount = 0u;
+
+    if (!file) {
+        fprintf(stderr, "scene: failed to open %s\n", RTR_SCENE_DRAGON_PATH);
+        return 1;
+    }
+
+    if (rtrParseDragonHeader(file, &vertexCount, &faceCount)) {
+        fprintf(stderr, "scene: failed to parse dragon PLY header\n");
+        fclose(file);
+        return 1;
+    }
+
+    if (faceCount > RTR_SCENE_TRIANGLE_CAPACITY) {
+        fprintf(stderr,
+                "scene: dragon has %u faces but capacity is %u\n",
+                faceCount,
+                (uint32_t)RTR_SCENE_TRIANGLE_CAPACITY);
+        fclose(file);
+        return 1;
+    }
+
+    vertices = (RTRVec3 *)malloc(sizeof(*vertices) * (size_t)vertexCount);
+    triangles = (RTRTriangle *)malloc(sizeof(*triangles) * (size_t)faceCount);
+    if (!(vertices && triangles)) {
+        fprintf(stderr, "scene: dragon allocation failed\n");
+        free(vertices);
+        free(triangles);
+        fclose(file);
+        return 1;
+    }
+
+    rtrBoundsReset(sourceMin, sourceMax);
+    for (uint32_t i = 0u; i < vertexCount; i++) {
+        RTRVec3 v;
+        if (!rtrReadLine(file, line, sizeof(line)) ||
+            sscanf(line, "%f %f %f", &v.x, &v.y, &v.z) != 3) {
+            fprintf(stderr, "scene: failed to read dragon vertex %u\n", i);
+            free(vertices);
+            free(triangles);
+            fclose(file);
+            return 1;
+        }
+
+        vertices[i] = v;
+        rtrBoundsExtendPoint(sourceMin, sourceMax, v);
+    }
+
+    {
+        const float centerX = (sourceMin[0] + sourceMax[0]) * 0.5f;
+        const float centerZ = (sourceMin[2] + sourceMax[2]) * 0.5f;
+        const float height = sourceMax[1] - sourceMin[1];
+        const float scale = height > 0.0f ? RTR_SCENE_DRAGON_HEIGHT / height : 1.0f;
+
+        for (uint32_t i = 0u; i < vertexCount; i++) {
+            vertices[i].x = (vertices[i].x - centerX) * scale;
+            vertices[i].y = (vertices[i].y - sourceMin[1]) * scale + RTR_SCENE_PLANE_Y;
+            vertices[i].z = (vertices[i].z - centerZ) * scale;
+        }
+    }
+
+    for (uint32_t face = 0u; face < faceCount; face++) {
+        unsigned corners = 0u;
+        unsigned i0 = 0u;
+        unsigned i1 = 0u;
+        unsigned i2 = 0u;
+
+        if (!rtrReadLine(file, line, sizeof(line)) ||
+            sscanf(line, "%u %u %u %u", &corners, &i0, &i1, &i2) != 4) {
+            fprintf(stderr, "scene: failed to read dragon face %u\n", face);
+            free(vertices);
+            free(triangles);
+            fclose(file);
+            return 1;
+        }
+
+        if (corners != 3u ||
+            i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+            fprintf(stderr, "scene: invalid dragon face %u\n", face);
+            free(vertices);
+            free(triangles);
+            fclose(file);
+            return 1;
+        }
+
+        triangles[triangleCount] = (RTRTriangle){
+            .v0 = vertices[i0],
+            .v1 = vertices[i1],
+            .v2 = vertices[i2],
+        };
+        rtrTriangleFinalize(triangles + triangleCount);
+        triangleCount++;
+    }
+
+    fclose(file);
+    free(vertices);
+
+    *outTriangles = triangles;
+    *outTriangleCount = triangleCount;
+    return 0;
+}
+
+static void rtrStoreTriangle(uint32_t *words, uint32_t index, const RTRTriangle *triangle)
+{
+    const uint32_t word = RTR_SCENE_GEOM_WORD + index * RTR_SCENE_TRIANGLE_WORDS;
+
+    words[word + 0u] = rtrF32Word(triangle->v0.x);
+    words[word + 1u] = rtrF32Word(triangle->v0.y);
+    words[word + 2u] = rtrF32Word(triangle->v0.z);
+    words[word + 3u] = rtrF32Word(triangle->v1.x);
+    words[word + 4u] = rtrF32Word(triangle->v1.y);
+    words[word + 5u] = rtrF32Word(triangle->v1.z);
+    words[word + 6u] = rtrF32Word(triangle->v2.x);
+    words[word + 7u] = rtrF32Word(triangle->v2.y);
+    words[word + 8u] = rtrF32Word(triangle->v2.z);
+}
+
 static void rtrStoreBVHNode(uint32_t *words, uint32_t index, const RTRBVHNode *node)
 {
     const uint32_t word = RTR_SCENE_BVH_WORD + index * RTR_SCENE_BVH_NODE_WORDS;
-    const uint32_t minX = rtrQuantPadMin16(rtrPackUnorm16Floor(node->boundsMin[0],
-                                                               -RTR_SCENE_DISK_RADIUS,
-                                                               RTR_SCENE_DISK_RADIUS));
-    const uint32_t minZ = rtrQuantPadMin16(rtrPackUnorm16Floor(node->boundsMin[2],
-                                                               -RTR_SCENE_DISK_RADIUS,
-                                                               RTR_SCENE_DISK_RADIUS));
-    const uint32_t maxX = rtrQuantPadMax16(rtrPackUnorm16Ceil(node->boundsMax[0],
-                                                              -RTR_SCENE_DISK_RADIUS,
-                                                              RTR_SCENE_DISK_RADIUS));
-    const uint32_t maxZ = rtrQuantPadMax16(rtrPackUnorm16Ceil(node->boundsMax[2],
-                                                              -RTR_SCENE_DISK_RADIUS,
-                                                              RTR_SCENE_DISK_RADIUS));
-    const uint32_t minY = rtrQuantPadMin16(rtrPackUnorm16Floor(
-        node->boundsMin[1],
-        RTR_SCENE_GROUND_Y,
-        RTR_SCENE_GROUND_Y + RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f));
-    const uint32_t maxY = rtrQuantPadMax16(rtrPackUnorm16Ceil(
-        node->boundsMax[1],
-        RTR_SCENE_GROUND_Y,
-        RTR_SCENE_GROUND_Y + RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f));
 
-    words[word + 0u] = rtrPack2x16(minX, minZ);
-    words[word + 1u] = rtrPack2x16(maxX, maxZ);
-    words[word + 2u] = rtrPack2x16(minY, maxY);
+    words[word + 0u] = rtrF32Word(node->boundsMin[0]);
+    words[word + 1u] = rtrF32Word(node->boundsMin[1]);
+    words[word + 2u] = rtrF32Word(node->boundsMin[2]);
     words[word + 3u] = node->leftFirst;
-    words[word + 4u] = node->countRight;
-}
-
-static void rtrStoreSphereGeom(uint32_t *words, uint32_t index, const RTRSphere *sphere)
-{
-    const uint32_t word = RTR_SCENE_GEOM_WORD + index * RTR_SCENE_SPHERE_WORDS;
-    const uint32_t x = rtrPackUnormNNearest(sphere->geom[0],
-                                            -RTR_SCENE_DISK_RADIUS,
-                                            RTR_SCENE_DISK_RADIUS,
-                                            12u);
-    const uint32_t z = rtrPackUnormNNearest(sphere->geom[2],
-                                            -RTR_SCENE_DISK_RADIUS,
-                                            RTR_SCENE_DISK_RADIUS,
-                                            12u);
-    const uint32_t r = rtrPackUnormNNearest(sphere->geom[3],
-                                            0.0f,
-                                            RTR_SCENE_MAX_SPHERE_RADIUS,
-                                            8u);
-
-    words[word] = x | (z << 12u) | (r << 24u);
+    words[word + 4u] = rtrF32Word(node->boundsMax[0]);
+    words[word + 5u] = rtrF32Word(node->boundsMax[1]);
+    words[word + 6u] = rtrF32Word(node->boundsMax[2]);
+    words[word + 7u] = node->countRight;
 }
 
 void rtrScene(uint32_t *words)
 {
-    words[RTR_SCENE_COUNT_WORD] = RTR_SCENE_SPHERE_COUNT;
-
-    RTRSphere *spheres =
-        (RTRSphere *)malloc(sizeof(*spheres) * (size_t)RTR_SCENE_SPHERE_COUNT);
-    RTRBVHNode *nodes =
-        (RTRBVHNode *)malloc(sizeof(*nodes) * (size_t)RTR_SCENE_BVH_MAX_NODES);
-    const uint32_t densePlacement =
-        (uint32_t)(RTR_SCENE_SPHERE_COUNT >= RTR_SCENE_DENSE_PLACEMENT_THRESHOLD);
-    RTRPlacementGrid *placementGrid = densePlacement ? NULL :
-        (RTRPlacementGrid *)malloc(sizeof(*placementGrid));
+    RTRTriangle *triangles = NULL;
+    RTRBVHNode *nodes = NULL;
+    uint32_t triangleCount = 0u;
     uint32_t nodeCount = 0u;
 
-    if (!(spheres && nodes && (densePlacement || placementGrid))) {
-        free(spheres);
-        free(nodes);
-        free(placementGrid);
-        words[RTR_SCENE_COUNT_WORD] = 0u;
-        words[RTR_SCENE_BVH_NODE_COUNT_WORD] = 0u;
+    words[RTR_SCENE_COUNT_WORD] = 0u;
+    words[RTR_SCENE_BVH_NODE_COUNT_WORD] = 0u;
+
+    if (rtrLoadDragonTriangles(&triangles, &triangleCount) || triangleCount == 0u) {
+        rtrStoreBlueNoise(words);
+        free(triangles);
         return;
     }
 
-    if (!densePlacement)
-        rtrPlacementGridReset(placementGrid);
-
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-        const float h = rtrHash01(i * 747796405u + 0x165667b1u);
-        const float r =
-            RTR_SCENE_MIN_SPHERE_RADIUS +
-            (RTR_SCENE_MAX_SPHERE_RADIUS - RTR_SCENE_MIN_SPHERE_RADIUS) * h;
-
-        spheres[i] = (RTRSphere){
-            .geom = {0.0f, RTR_SCENE_GROUND_Y + r, 0.0f, r},
-        };
+    nodes = (RTRBVHNode *)malloc(
+        sizeof(*nodes) * (size_t)(triangleCount * 2u - 1u));
+    if (!nodes) {
+        fprintf(stderr, "scene: BVH allocation failed\n");
+        rtrStoreBlueNoise(words);
+        free(triangles);
+        return;
     }
 
-    if (densePlacement) {
-        rtrPlaceDenseSpheres(spheres);
-    } else {
-        qsort(spheres, RTR_SCENE_SPHERE_COUNT, sizeof(spheres[0]), rtrCompareSphereByRadiusDesc);
+    rtrBuildBVH(triangles, nodes, &nodeCount, 0u, triangleCount);
 
-        for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-            uint32_t placed = rtrPlaceSphere(spheres, placementGrid, i);
-            for (uint32_t shrink = 0u; !placed && shrink < 24u; shrink++) {
-                spheres[i].geom[3] *= 0.82f;
-                if (spheres[i].geom[3] < 0.001f)
-                    spheres[i].geom[3] = 0.001f;
-                placed = rtrPlaceSphere(spheres, placementGrid, i);
-            }
-            if (!placed) {
-                spheres[i].geom[3] = 0.0005f;
-                placed = rtrPlaceSphere(spheres, placementGrid, i);
-            }
-        }
-    }
-
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
-        rtrQuantizeSphereGeom(spheres + i);
-
-    rtrBuildBVH(spheres, nodes, &nodeCount, 0u, RTR_SCENE_SPHERE_COUNT);
-
+    words[RTR_SCENE_COUNT_WORD] = triangleCount;
     words[RTR_SCENE_BVH_NODE_COUNT_WORD] = nodeCount;
 
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-        rtrStoreSphereGeom(words, i, spheres + i);
-    }
+    for (uint32_t i = 0u; i < triangleCount; i++)
+        rtrStoreTriangle(words, i, triangles + i);
 
-    for (uint32_t i = 0u; i < nodeCount; i++) {
+    for (uint32_t i = 0u; i < nodeCount; i++)
         rtrStoreBVHNode(words, i, nodes + i);
-    }
 
     rtrStoreBlueNoise(words);
 
-    free(spheres);
+    free(triangles);
     free(nodes);
-    free(placementGrid);
 }

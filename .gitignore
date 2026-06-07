@@ -11,3 +11,7 @@
 # Native build byproducts
 *.o
 *.dSYM/
+
+# Large local mesh assets
+/assets/dragon/dragon_recon/*.ply
+/assets/dragon/*.tar.gz
