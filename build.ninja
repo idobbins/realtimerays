@@ -38,9 +38,18 @@ rule link
   command = $cc -o $out $in $ldflags
   description = LINK $out
 
+rule tool_link
+  command = $cc -o $out $in -lm
+  description = LINK $out
+
 rule run
   command = icd="$${VULKAN_SDK:-}/share/vulkan/icd.d/MoltenVK_icd.json"; if [ -z "$${VK_ICD_FILENAMES:-}" ] && [ -f "$$icd" ]; then VK_ICD_FILENAMES="$$icd" $bin; else $bin; fi
   description = RUN $bin
+  pool = console
+
+rule check
+  command = $build_dir/correctness_check
+  description = CHECK correctness
   pool = console
 
 rule xpost
@@ -53,7 +62,7 @@ rule compdb
   description = COMPDB $out
 
 rule clean
-  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace.comp.spv $build_dir/trace_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $bin compile_commands.json
+  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace.comp.spv $build_dir/trace_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $build_dir/correctness_check.o $build_dir/correctness_check $bin compile_commands.json
   description = CLEAN
 
 build $build_dir/.dir: mkdir
@@ -63,12 +72,15 @@ build $build_dir/main.o: cc main.c || $build_dir/.dir
 build $build_dir/vulkan.o: cc vulkan.c | $build_dir/trace_comp_spv.h || $build_dir/.dir
 build $build_dir/scene.o: cc scene.c || $build_dir/.dir
 build $build_dir/macos.o: objc macos.m || $build_dir/.dir
+build $build_dir/correctness_check.o: cc tools/correctness_check.c || $build_dir/.dir
 build $bin: link $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o
+build $build_dir/correctness_check: tool_link $build_dir/correctness_check.o $build_dir/scene.o
 build compile_commands.json: compdb build.ninja
 
 build build: phony $bin compile_commands.json
 build run: run $bin || compile_commands.json
 build xpost: xpost $bin
+build check: check $build_dir/correctness_check
 build compile-commands: phony compile_commands.json
 build clean: clean
 

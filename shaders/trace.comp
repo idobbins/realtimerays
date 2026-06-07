@@ -11,6 +11,7 @@ layout(std430, binding = 1) readonly buffer RTRMemory {
 const uint RTR_MOUSE_X_WORD = 5u;
 const uint RTR_MOUSE_Y_WORD = 6u;
 const uint RTR_TIME_WORD = 7u;
+const uint RTR_FRAME_WORD = 4u;
 const uint RTR_SPHERE_COUNT_WORD = 8u;
 const uint RTR_BVH_NODE_COUNT_WORD = 15u;
 const uint RTR_CAMERA_AUTO_WORD = 16u;
@@ -41,7 +42,7 @@ const int RTR_BVH_STACK_SIZE = 64;
 #endif
 
 #ifndef RTR_DIRECT_LIGHT_BOUNCES
-#define RTR_DIRECT_LIGHT_BOUNCES 1
+#define RTR_DIRECT_LIGHT_BOUNCES RTR_RAY_BOUNCES
 #endif
 
 #ifndef RTR_DIRECT_LIGHT_SAMPLE_STRIDE
@@ -53,9 +54,9 @@ const int RTR_BVH_STACK_SIZE = 64;
 #endif
 
 const float RTR_INF = 1.0e20;
-const float RTR_EPS = 0.001;
+const float RTR_EPS = 0.0001;
 const float RTR_FOCAL = 1.35;
-const float RTR_BOUNCE_ENERGY = 0.52;
+const float RTR_INV_PI = 0.31830988618;
 const float RTR_PLANE_Y = -1.0;
 const float RTR_SCENE_DISK_RADIUS = 26.0;
 const float RTR_MAX_SPHERE_RADIUS = 0.025;
@@ -125,6 +126,55 @@ uint rtrHashU32(uint value)
     value ^= value >> 16u;
 
     return value;
+}
+
+uint rtrSeedPath(uvec2 coord, uint frameIndex, uint sampleIndex)
+{
+    uint seed = coord.x * 1973u ^
+                coord.y * 9277u ^
+                frameIndex * 26699u ^
+                sampleIndex * 31847u ^
+                0x9e3779b9u;
+
+    return rtrHashU32(seed) | 1u;
+}
+
+uint rtrRandomU32(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rtrRandom01(inout uint state)
+{
+    return float(rtrRandomU32(state) & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+vec2 rtrBlueNoise2(uvec2 coord,
+                   uint frameIndex,
+                   uint sampleIndex,
+                   uint dimension,
+                   inout uint rng)
+{
+    if (dimension >= 64u)
+        return vec2(rtrRandom01(rng), rtrRandom01(rng));
+
+    uint h = rtrHashU32(frameIndex * 0x9e3779b9u ^
+                       sampleIndex * 0x85ebca6bu ^
+                       dimension * 0xc2b2ae35u);
+    uvec2 p = coord +
+        uvec2(h, h >> 16u) +
+        uvec2(dimension * 17u, dimension * 31u);
+    p &= uvec2(RTR_BLUE_NOISE_SIZE - 1u);
+
+    uint word = rtrLoadU32(RTR_BLUE_NOISE_WORD + p.y * RTR_BLUE_NOISE_SIZE + p.x);
+    vec2 noise = vec2(uvec2(word & 0xffffu, word >> 16u)) * (1.0 / 65536.0);
+    uint offsetWord = rtrHashU32(h ^ 0x27d4eb2du);
+    vec2 offset = vec2(uvec2(offsetWord & 0xffffu, offsetWord >> 16u)) *
+        (1.0 / 65536.0);
+
+    return fract(noise + offset);
 }
 
 vec2 rtrUnpackDisk2(uint packed)
@@ -198,18 +248,12 @@ uint rtrLoadBVHCountRight(uint i)
     return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 4u);
 }
 
-vec2 rtrLoadBlueNoise(uvec2 coord, uint seed, int bounce)
+vec2 rtrPrimaryJitter(uvec2 coord,
+                      uint frameIndex,
+                      uint sampleIndex,
+                      inout uint rng)
 {
-    uint h = rtrHashU32(seed ^ uint(bounce) * 0x9e3779b9u);
-    uvec2 p = coord + uvec2(h, h >> 16u) +
-        uvec2(uint(bounce) * 17u, uint(bounce) * 31u);
-    p &= uvec2(RTR_BLUE_NOISE_SIZE - 1u);
-
-    uint word = rtrLoadU32(RTR_BLUE_NOISE_WORD + p.y * RTR_BLUE_NOISE_SIZE + p.x);
-    vec2 noise = vec2(uvec2(word & 0xffffu, word >> 16u)) * (1.0 / 65536.0);
-    vec2 offset = vec2(uvec2(h & 0xffffu, h >> 16u)) * (1.0 / 65536.0);
-
-    return fract(noise + offset);
+    return rtrBlueNoise2(coord, frameIndex, sampleIndex, 0u, rng);
 }
 
 vec3 rtrSky(vec3 rd)
@@ -397,7 +441,7 @@ float rtrShadow(vec3 p, vec3 n, vec3 l, float maxT, int skipId)
 {
     vec3 ro = p + n * (RTR_EPS * 4.0);
 
-    maxT -= 0.02;
+    maxT -= RTR_EPS * 4.0;
     if (maxT <= RTR_EPS)
         return 1.0;
 
@@ -510,50 +554,40 @@ vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, int skipId)
         shadow = rtrShadow(offsetP, n, l, lightDist, skipId);
     }
 
-    vec3 direct = albedo * RTR_LIGHT_COLOR * (ndl * shadow / lightDist2);
-    vec3 ambient = albedo * 0.035;
-
-    return direct + ambient;
+    return albedo * RTR_LIGHT_COLOR * (ndl * shadow / lightDist2) * RTR_INV_PI;
 }
 
-uvec2 rtrSurfaceNoiseCoord(RTRHit hit, vec3 p, vec3 n)
+vec3 rtrBounceDirection(vec3 n,
+                        uvec2 coord,
+                        uint frameIndex,
+                        uint sampleIndex,
+                        int bounce,
+                        inout uint rng)
 {
-    if (hit.id == RTR_HIT_PLANE) {
-        ivec2 cell = ivec2(floor(p.xz * 1.5));
-        return uvec2(cell);
-    }
-
-    uint h = rtrHashU32(uint(hit.id) * 0x9e3779b9u + 0x7f4a7c15u);
-    return uvec2(h, h >> 16u);
-}
-
-uint rtrSurfaceNoiseSeed(RTRHit hit, uint sampleIndex)
-{
-    uint sampleSalt = sampleIndex * 0xa511e9b3u;
-
-    if (hit.id == RTR_HIT_PLANE)
-        return 0x51ed270bu ^ sampleSalt;
-
-    return (uint(hit.id) + 1u) ^ sampleSalt;
-}
-
-vec3 rtrBounceDirection(vec3 n, vec3 rd, uvec2 noiseCoord, uint noiseSeed, int bounce)
-{
-    vec3 reflected = reflect(rd, n);
     vec3 helper = abs(n.y) < 0.97 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 tangent = normalize(cross(helper, n));
     vec3 bitangent = cross(n, tangent);
-    vec2 noise = rtrLoadBlueNoise(noiseCoord, noiseSeed, bounce);
+    vec2 noise = rtrBlueNoise2(coord,
+                               frameIndex,
+                               sampleIndex,
+                               2u + uint(bounce),
+                               rng);
     float angle = noise.x * 6.2831853;
     float radius = sqrt(noise.y);
     vec3 diffuse = normalize(tangent * (cos(angle) * radius) +
                              bitangent * (sin(angle) * radius) +
                              n * sqrt(max(1.0 - noise.y, 0.0)));
 
-    return normalize(mix(diffuse, reflected, 0.34));
+    return diffuse;
 }
 
-vec3 rtrRadiance(vec3 ro, vec3 rd, uint sampleIndex, uint sampleCount)
+vec3 rtrRadiance(vec3 ro,
+                 vec3 rd,
+                 uvec2 coord,
+                 uint frameIndex,
+                 uint sampleIndex,
+                 uint sampleCount,
+                 inout uint rng)
 {
     vec3 color = vec3(0.0);
     vec3 throughput = vec3(1.0);
@@ -574,25 +608,24 @@ vec3 rtrRadiance(vec3 ro, vec3 rd, uint sampleIndex, uint sampleCount)
         rtrSurface(hit, p, rd, n, albedo, skipId);
         if (bounce < RTR_DIRECT_LIGHT_BOUNCES) {
             const uint directLightStride = max(uint(RTR_DIRECT_LIGHT_SAMPLE_STRIDE), 1u);
-            if (sampleIndex % directLightStride == 0u) {
-                float directLightWeight =
-                    min(float(directLightStride), float(sampleCount));
+            float directLightProbability = 1.0 / float(directLightStride);
+            float directLightSample = rtrBlueNoise2(coord,
+                                                    frameIndex,
+                                                    sampleIndex,
+                                                    32u + uint(bounce),
+                                                    rng).x;
+            if (directLightStride == 1u || directLightSample < directLightProbability) {
                 color += throughput *
-                         (rtrDirectLight(p, n, albedo, skipId) * directLightWeight);
+                         (rtrDirectLight(p, n, albedo, skipId) / directLightProbability);
             }
-        } else {
-            color += throughput * (albedo * 0.035);
         }
 
-        throughput *= albedo * RTR_BOUNCE_ENERGY;
+        throughput *= albedo;
         if (max(max(throughput.x, throughput.y), throughput.z) < 0.01)
             break;
 
         ro = p + n * (RTR_EPS * 8.0);
-        rd = rtrBounceDirection(n, rd,
-                                rtrSurfaceNoiseCoord(hit, p, n),
-                                rtrSurfaceNoiseSeed(hit, sampleIndex),
-                                bounce);
+        rd = rtrBounceDirection(n, coord, frameIndex, sampleIndex, bounce, rng);
     }
 
     return color;
@@ -648,12 +681,19 @@ void main()
     if (any(greaterThanEqual(p, sz)))
         return;
 
-    vec3 ray = shRayBase + shRayDx * float(p.x) + shRayDy * float(p.y);
-    vec3 rd = ray * inversesqrt(dot(ray, ray));
-
     vec3 color = vec3(0.0);
-    for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++)
-        color += rtrRadiance(shRo, rd, sampleIndex, shSampleCount);
+    uint frameIndex = rtrLoadU32(RTR_FRAME_WORD);
+    for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++) {
+        uint rng = rtrSeedPath(uvec2(p), frameIndex, sampleIndex);
+        vec2 jitter = rtrPrimaryJitter(uvec2(p), frameIndex, sampleIndex, rng);
+        vec3 ray = shRayBase +
+                   shRayDx * (float(p.x) + jitter.x - 0.5) +
+                   shRayDy * (float(p.y) + jitter.y - 0.5);
+        vec3 rd = ray * inversesqrt(dot(ray, ray));
+
+        color += rtrRadiance(shRo, rd, uvec2(p), frameIndex, sampleIndex,
+                             shSampleCount, rng);
+    }
     color *= 1.0 / float(shSampleCount);
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));

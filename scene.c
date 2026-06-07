@@ -23,7 +23,11 @@
 #define RTR_SCENE_GRID_EMPTY UINT32_MAX
 #define RTR_SCENE_DENSE_PLACEMENT_THRESHOLD 50000u
 #define RTR_SCENE_DENSE_RADIUS_SCALE 1.0f
-#define RTR_SCENE_GOLDEN_ANGLE 2.39996322972865332f
+#define RTR_SCENE_DENSE_HEX_ROW_SCALE 0.8660254037844386f
+#define RTR_SCENE_CENTER_QUANT_STEP ((RTR_SCENE_DISK_RADIUS * 2.0f) / 4095.0f)
+#define RTR_SCENE_RADIUS_QUANT_STEP (RTR_SCENE_MAX_SPHERE_RADIUS / 255.0f)
+#define RTR_SCENE_DENSE_MARGIN \
+    (RTR_SCENE_MIN_SPHERE_RADIUS + RTR_SCENE_SPHERE_CLEARANCE + RTR_SCENE_CENTER_QUANT_STEP)
 #define RTR_SCENE_BLUE_NOISE_SIZE 64u
 #define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
 #define RTR_SCENE_BLUE_NOISE_CANDIDATES 64u
@@ -313,20 +317,233 @@ static uint32_t rtrPlaceSphere(RTRSphere *spheres, RTRPlacementGrid *grid, uint3
     return 0u;
 }
 
-static void rtrPlaceDenseSphere(RTRSphere *sphere, uint32_t index)
+static uint32_t rtrDenseLatticeCount(float spacing)
 {
-    sphere->geom[3] *= RTR_SCENE_DENSE_RADIUS_SCALE;
+    const float radius = RTR_SCENE_DISK_RADIUS - RTR_SCENE_DENSE_MARGIN;
+    const float rowStep = spacing * RTR_SCENE_DENSE_HEX_ROW_SCALE;
+    uint64_t count = 0u;
+    uint32_t row = 0u;
 
-    const float diskRadius = RTR_SCENE_DISK_RADIUS - sphere->geom[3];
-    const float t = ((float)index + 0.5f) / (float)RTR_SCENE_SPHERE_COUNT;
-    const float angleJitter =
-        (rtrHash01(index * 2246822519u + 0x9e3779b9u) - 0.5f) * 0.035f;
-    const float angle = (float)index * RTR_SCENE_GOLDEN_ANGLE + angleJitter;
-    const float radial = sqrtf(t) * diskRadius;
+    if (spacing <= 0.0f || rowStep <= 0.0f || radius <= 0.0f)
+        return 0u;
 
-    sphere->geom[0] = cosf(angle) * radial;
-    sphere->geom[1] = RTR_SCENE_GROUND_Y + sphere->geom[3];
-    sphere->geom[2] = sinf(angle) * radial;
+    for (float z = -radius; z <= radius; z += rowStep, row++) {
+        const float z2 = z * z;
+        if (z2 > radius * radius)
+            continue;
+
+        const float xLimit = sqrtf(radius * radius - z2);
+        const float offset = (row & 1u) ? spacing * 0.5f : 0.0f;
+        const int32_t minCell = (int32_t)ceilf((-xLimit - offset) / spacing);
+        const int32_t maxCell = (int32_t)floorf((xLimit - offset) / spacing);
+
+        if (maxCell >= minCell)
+            count += (uint64_t)(maxCell - minCell + 1);
+        if (count > UINT32_MAX)
+            return UINT32_MAX;
+    }
+
+    return (uint32_t)count;
+}
+
+static float rtrDenseLatticeSpacing(void)
+{
+    float lo = RTR_SCENE_MIN_SPHERE_RADIUS;
+    float hi = RTR_SCENE_MAX_SPHERE_RADIUS * 8.0f;
+
+    while (rtrDenseLatticeCount(hi) >= RTR_SCENE_SPHERE_COUNT)
+        hi *= 1.25f;
+
+    for (uint32_t i = 0u; i < 48u; i++) {
+        const float mid = (lo + hi) * 0.5f;
+        if (rtrDenseLatticeCount(mid) >= RTR_SCENE_SPHERE_COUNT) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    return lo * 0.999f;
+}
+
+static uint32_t rtrDenseGridCoord(float value, uint32_t dim, float cellSize)
+{
+    int32_t coord = (int32_t)floorf((value + RTR_SCENE_DISK_RADIUS) / cellSize);
+
+    if (coord < 0) return 0u;
+    if (coord >= (int32_t)dim) return dim - 1u;
+
+    return (uint32_t)coord;
+}
+
+static void rtrCapDenseSphereRadii(RTRSphere *spheres)
+{
+    const float cellSize = RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f;
+    const uint32_t dim =
+        (uint32_t)ceilf((RTR_SCENE_DISK_RADIUS * 2.0f) / cellSize) + 1u;
+    const uint64_t cellCount64 = (uint64_t)dim * (uint64_t)dim;
+    const float neighborLimit =
+        RTR_SCENE_MAX_SPHERE_RADIUS * 2.0f +
+        RTR_SCENE_SPHERE_CLEARANCE +
+        RTR_SCENE_RADIUS_QUANT_STEP * 2.0f;
+    const uint32_t cellRange = (uint32_t)ceilf(neighborLimit / cellSize) + 1u;
+    uint32_t *heads = NULL;
+    uint32_t *next = NULL;
+
+    if (cellCount64 > UINT32_MAX)
+        return;
+
+    heads = (uint32_t *)malloc(sizeof(*heads) * (size_t)cellCount64);
+    next = (uint32_t *)malloc(sizeof(*next) * (size_t)RTR_SCENE_SPHERE_COUNT);
+    if (!(heads && next)) {
+        free(heads);
+        free(next);
+        return;
+    }
+
+    for (uint64_t i = 0u; i < cellCount64; i++)
+        heads[i] = RTR_SCENE_GRID_EMPTY;
+    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
+        next[i] = RTR_SCENE_GRID_EMPTY;
+
+    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
+        const uint32_t x = rtrDenseGridCoord(spheres[i].geom[0], dim, cellSize);
+        const uint32_t z = rtrDenseGridCoord(spheres[i].geom[2], dim, cellSize);
+        const uint64_t cell = (uint64_t)z * (uint64_t)dim + (uint64_t)x;
+
+        next[i] = heads[cell];
+        heads[cell] = i;
+    }
+
+    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
+        const uint32_t centerX = rtrDenseGridCoord(spheres[i].geom[0], dim, cellSize);
+        const uint32_t centerZ = rtrDenseGridCoord(spheres[i].geom[2], dim, cellSize);
+        float nearest = neighborLimit;
+        float cap = RTR_SCENE_MAX_SPHERE_RADIUS * RTR_SCENE_DENSE_RADIUS_SCALE;
+        const float boundary =
+            RTR_SCENE_DISK_RADIUS -
+            sqrtf(spheres[i].geom[0] * spheres[i].geom[0] +
+                  spheres[i].geom[2] * spheres[i].geom[2]);
+
+        if (cap > RTR_SCENE_MAX_SPHERE_RADIUS)
+            cap = RTR_SCENE_MAX_SPHERE_RADIUS;
+
+        int32_t minX = (int32_t)centerX - (int32_t)cellRange;
+        int32_t minZ = (int32_t)centerZ - (int32_t)cellRange;
+        int32_t maxX = (int32_t)centerX + (int32_t)cellRange;
+        int32_t maxZ = (int32_t)centerZ + (int32_t)cellRange;
+
+        if (minX < 0) minX = 0;
+        if (minZ < 0) minZ = 0;
+        if (maxX >= (int32_t)dim) maxX = (int32_t)dim - 1;
+        if (maxZ >= (int32_t)dim) maxZ = (int32_t)dim - 1;
+
+        for (int32_t cellZ = minZ; cellZ <= maxZ; cellZ++) {
+            for (int32_t cellX = minX; cellX <= maxX; cellX++) {
+                uint32_t j = heads[(uint64_t)cellZ * (uint64_t)dim + (uint64_t)cellX];
+
+                while (j != RTR_SCENE_GRID_EMPTY) {
+                    if (j != i) {
+                        const float dx = spheres[i].geom[0] - spheres[j].geom[0];
+                        const float dz = spheres[i].geom[2] - spheres[j].geom[2];
+                        const float d2 = dx * dx + dz * dz;
+
+                        if (d2 < nearest * nearest)
+                            nearest = sqrtf(d2);
+                    }
+                    j = next[j];
+                }
+            }
+        }
+
+        if (nearest < neighborLimit) {
+            const float neighborCap =
+                (nearest - RTR_SCENE_SPHERE_CLEARANCE) * 0.5f -
+                RTR_SCENE_RADIUS_QUANT_STEP;
+            if (neighborCap < cap)
+                cap = neighborCap;
+        }
+
+        if (boundary - RTR_SCENE_RADIUS_QUANT_STEP < cap)
+            cap = boundary - RTR_SCENE_RADIUS_QUANT_STEP;
+        if (cap < 0.0f)
+            cap = 0.0f;
+
+        if (spheres[i].geom[3] > cap)
+            spheres[i].geom[3] = cap;
+        spheres[i].geom[1] = RTR_SCENE_GROUND_Y + spheres[i].geom[3];
+    }
+
+    free(heads);
+    free(next);
+}
+
+static void rtrPlaceDenseSpheres(RTRSphere *spheres)
+{
+    float spacing = rtrDenseLatticeSpacing();
+    uint32_t candidateCount = rtrDenseLatticeCount(spacing);
+    uint32_t selected = 0u;
+    uint32_t seen = 0u;
+    const float radius = RTR_SCENE_DISK_RADIUS - RTR_SCENE_DENSE_MARGIN;
+    float rowStep = 0.0f;
+    uint32_t row = 0u;
+
+    while (candidateCount < RTR_SCENE_SPHERE_COUNT) {
+        spacing *= 0.99f;
+        candidateCount = rtrDenseLatticeCount(spacing);
+    }
+    rowStep = spacing * RTR_SCENE_DENSE_HEX_ROW_SCALE;
+
+    for (float z = -radius;
+         z <= radius && selected < RTR_SCENE_SPHERE_COUNT;
+         z += rowStep, row++) {
+        const float z2 = z * z;
+        if (z2 > radius * radius)
+            continue;
+
+        const float xLimit = sqrtf(radius * radius - z2);
+        const float offset = (row & 1u) ? spacing * 0.5f : 0.0f;
+        const int32_t minCell = (int32_t)ceilf((-xLimit - offset) / spacing);
+        const int32_t maxCell = (int32_t)floorf((xLimit - offset) / spacing);
+
+        for (int32_t cell = minCell;
+             cell <= maxCell && selected < RTR_SCENE_SPHERE_COUNT;
+             cell++) {
+            const uint32_t remainingCandidates = candidateCount - seen;
+            const uint32_t remainingNeeded = RTR_SCENE_SPHERE_COUNT - selected;
+            const float x = offset + (float)cell * spacing;
+            const float chooseThreshold =
+                (float)remainingNeeded / (float)remainingCandidates;
+            const uint32_t choose =
+                remainingNeeded >= remainingCandidates ||
+                rtrHash01(seen * 747796405u + 0xa511e9b3u) <= chooseThreshold;
+
+            seen++;
+            if (!choose)
+                continue;
+
+            const uint32_t qx = rtrPackUnormNNearest(x,
+                                                     -RTR_SCENE_DISK_RADIUS,
+                                                     RTR_SCENE_DISK_RADIUS,
+                                                     12u);
+            const uint32_t qz = rtrPackUnormNNearest(z,
+                                                     -RTR_SCENE_DISK_RADIUS,
+                                                     RTR_SCENE_DISK_RADIUS,
+                                                     12u);
+
+            spheres[selected].geom[0] =
+                rtrUnpackUnormN(qx, -RTR_SCENE_DISK_RADIUS,
+                                RTR_SCENE_DISK_RADIUS, 12u);
+            spheres[selected].geom[2] =
+                rtrUnpackUnormN(qz, -RTR_SCENE_DISK_RADIUS,
+                                RTR_SCENE_DISK_RADIUS, 12u);
+            spheres[selected].geom[3] *= RTR_SCENE_DENSE_RADIUS_SCALE;
+            spheres[selected].geom[1] = RTR_SCENE_GROUND_Y + spheres[selected].geom[3];
+            selected++;
+        }
+    }
+
+    rtrCapDenseSphereRadii(spheres);
 }
 
 static uint32_t rtrToroidalDistance2(uint32_t a, uint32_t b)
@@ -723,8 +940,7 @@ void rtrScene(uint32_t *words)
     }
 
     if (densePlacement) {
-        for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
-            rtrPlaceDenseSphere(spheres + i, i);
+        rtrPlaceDenseSpheres(spheres);
     } else {
         qsort(spheres, RTR_SCENE_SPHERE_COUNT, sizeof(spheres[0]), rtrCompareSphereByRadiusDesc);
 
