@@ -23,6 +23,8 @@
 #define RTR_SCENE_BVH_NODE_WORDS 5u
 #define RTR_BLUE_NOISE_SIZE 64u
 #define RTR_BLUE_NOISE_WORDS (RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE)
+#define RTR_HISTORY_PIXEL_WORDS 4u
+#define RTR_RESTIR_PIXEL_WORDS 12u
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS + \
      RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS + \
@@ -48,6 +50,10 @@ enum {
     RTR_MEMORY_CAMERA_YAW_WORD = 17,
     RTR_MEMORY_CAMERA_PITCH_WORD = 18,
     RTR_MEMORY_CAMERA_RADIUS_WORD = 19,
+    RTR_MEMORY_ACCUM_COUNT_WORD = 20,
+    RTR_MEMORY_PREV_CAMERA_YAW_WORD = 21,
+    RTR_MEMORY_PREV_CAMERA_PITCH_WORD = 22,
+    RTR_MEMORY_PREV_CAMERA_RADIUS_WORD = 23,
 };
 
 enum {
@@ -139,12 +145,45 @@ static struct timespec rtrStartTime;
 static double rtrFrameClockSeconds = 0.0;
 static double rtrFrameClockLastSeconds = 0.0;
 static uint32_t rtrFrameClockReady = 0u;
+static uint32_t rtrAccumFrameCount = 0u;
+static uint32_t rtrAccumCameraReady = 0u;
+static uint32_t rtrAccumWidth = 0u;
+static uint32_t rtrAccumHeight = 0u;
+static float rtrAccumYaw = 0.0f;
+static float rtrAccumPitch = 0.0f;
+static float rtrAccumRadius = 0.0f;
 
 static uint32_t rtrF32Word(float value)
 {
     uint32_t word = 0u;
     memcpy(&word, &value, sizeof(word));
     return word;
+}
+
+static uint32_t rtrShouldResetAccum(float yaw, float pitch, float radius)
+{
+    return !rtrAccumCameraReady ||
+        rtrAccumWidth != rtrSwapExtent.width ||
+        rtrAccumHeight != rtrSwapExtent.height ||
+        fabsf(rtrAccumYaw - yaw) > 0.35f ||
+        fabsf(rtrAccumPitch - pitch) > 0.25f ||
+        fabsf(logf(radius / rtrAccumRadius)) > 0.25f;
+}
+
+static void rtrRememberCamera(float yaw, float pitch, float radius)
+{
+    rtrAccumCameraReady = 1u;
+    rtrAccumWidth = rtrSwapExtent.width;
+    rtrAccumHeight = rtrSwapExtent.height;
+    rtrAccumYaw = yaw;
+    rtrAccumPitch = pitch;
+    rtrAccumRadius = radius;
+}
+
+static void rtrAdvanceAccumFrame(void)
+{
+    if (rtrAccumFrameCount < UINT32_MAX)
+        rtrAccumFrameCount++;
 }
 
 static float rtrEnvF32(const char *name, float fallback)
@@ -323,9 +362,24 @@ static float rtrFrameSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
+    const VkDeviceSize rtrPixelCount =
+        (VkDeviceSize)rtrSwapExtent.width *
+        (VkDeviceSize)rtrSwapExtent.height;
+    const VkDeviceSize rtrHistoryWords =
+        rtrPixelCount *
+        (VkDeviceSize)RTR_HISTORY_PIXEL_WORDS *
+        (VkDeviceSize)2u;
+    const VkDeviceSize rtrRestirWords =
+        rtrPixelCount *
+        (VkDeviceSize)RTR_RESTIR_PIXEL_WORDS *
+        (VkDeviceSize)2u;
     const VkDeviceSize rtrMemorySize =
-        ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS + (VkDeviceSize)RTR_SCENE_WORDS) *
+        ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
+         (VkDeviceSize)RTR_SCENE_WORDS +
+         rtrHistoryWords +
+         rtrRestirWords) *
         (VkDeviceSize)sizeof(uint32_t);
+    if (rtrPixelCount == 0u) return 1;
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = rtrMemorySize,
@@ -352,7 +406,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 6u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 9u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
@@ -361,6 +415,12 @@ static int rtrCreateMemoryBuffer(void)
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
+    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
+    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
+    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
+    rtrMemoryWords[RTR_MEMORY_ACCUM_COUNT_WORD] = 0u;
+    rtrAccumFrameCount = 0u;
+    rtrAccumCameraReady = 0u;
     rtrScene(rtrMemoryWords);
 
     return 0;
@@ -382,11 +442,25 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_TIME_WORD] = rtrF32Word(time);
     const float activeCameraYaw =
         autoOrbit ? cameraYaw + time * RTR_CAMERA_AUTO_SPEED : cameraYaw;
+    const float prevCameraYaw = rtrAccumCameraReady ? rtrAccumYaw : activeCameraYaw;
+    const float prevCameraPitch = rtrAccumCameraReady ? rtrAccumPitch : cameraPitch;
+    const float prevCameraRadius = rtrAccumCameraReady ? rtrAccumRadius : cameraRadius;
+
+    if (rtrShouldResetAccum(activeCameraYaw, cameraPitch, cameraRadius))
+        rtrAccumFrameCount = 0u;
+    rtrRememberCamera(activeCameraYaw, cameraPitch, cameraRadius);
 
     rtrMemoryWords[RTR_MEMORY_CAMERA_AUTO_WORD] = autoOrbit;
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(activeCameraYaw);
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(cameraPitch);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(cameraRadius);
+    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_YAW_WORD] = rtrF32Word(
+        rtrAccumFrameCount ? prevCameraYaw : activeCameraYaw);
+    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_PITCH_WORD] = rtrF32Word(
+        rtrAccumFrameCount ? prevCameraPitch : cameraPitch);
+    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_RADIUS_WORD] = rtrF32Word(
+        rtrAccumFrameCount ? prevCameraRadius : cameraRadius);
+    rtrMemoryWords[RTR_MEMORY_ACCUM_COUNT_WORD] = rtrAccumFrameCount;
 }
 
 static void rtrUpdateMemory(void)
@@ -852,8 +926,8 @@ int rtrVulkanInit(void *windowSurface)
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
                              0u, NULL, 1u, &(VkBufferMemoryBarrier){
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .buffer = rtrMemoryBuffer,
@@ -993,6 +1067,7 @@ void rtrVulkanFrame(void)
     });
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return;
 
+    rtrAdvanceAccumFrame();
     if (rtrTimingSupported) {
         rtrTimingPending = 1u;
         rtrTimingImageIndex = imageIndex;
@@ -1049,8 +1124,8 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
                          0u, NULL, 1u, &(VkBufferMemoryBarrier){
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = rtrMemoryBuffer,
@@ -1147,6 +1222,7 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
         vkWaitForFences(rtrDevice, 1u, &rtrInFlightFence, VK_TRUE, UINT64_MAX);
         rtrReportGpuTiming();
         vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
+        rtrAdvanceAccumFrame();
 
         fwrite(rtrExportStagingPixels, 1u, (size_t)rtrExportImageBytes, out);
         rtrFrameIndex++;

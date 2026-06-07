@@ -4,7 +4,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
 
-layout(std430, binding = 1) readonly buffer RTRMemory {
+layout(std430, binding = 1) buffer RTRMemory {
     uint rtrMem[];
 };
 
@@ -18,6 +18,10 @@ const uint RTR_CAMERA_AUTO_WORD = 16u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
+const uint RTR_ACCUM_COUNT_WORD = 20u;
+const uint RTR_PREV_CAMERA_YAW_WORD = 21u;
+const uint RTR_PREV_CAMERA_PITCH_WORD = 22u;
+const uint RTR_PREV_CAMERA_RADIUS_WORD = 23u;
 
 const uint RTR_MAX_SPHERES = 1000000u;
 const uint RTR_MAX_BVH_NODES = RTR_MAX_SPHERES * 2u - 1u;
@@ -30,6 +34,9 @@ const uint RTR_BVH_NODE_WORDS = 5u;
 const uint RTR_BLUE_NOISE_SIZE = 64u;
 const uint RTR_BLUE_NOISE_WORD =
     RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
+const uint RTR_HISTORY_WORD = RTR_BLUE_NOISE_WORD + RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE;
+const uint RTR_HISTORY_PIXEL_WORDS = 4u;
+const uint RTR_RESTIR_PIXEL_WORDS = 12u;
 const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
 const int RTR_BVH_STACK_SIZE = 64;
 
@@ -57,6 +64,15 @@ const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
 const float RTR_FOCAL = 1.35;
 const float RTR_INV_PI = 0.31830988618;
+const float RTR_TEMPORAL_NORMAL_DOT = 0.82;
+const float RTR_TEMPORAL_DEPTH_REL = 0.035;
+const float RTR_TEMPORAL_DEPTH_ABS = 0.015;
+const float RTR_RESTIR_MIN_TARGET = 1.0e-5;
+const float RTR_RESTIR_MAX_M = 32.0;
+const float RTR_RESTIR_MAX_WEIGHT = 6.0;
+const float RTR_RESTIR_MAX_AGE = 10.0;
+const float RTR_RESTIR_SPATIAL_RADIUS = 10.0;
+const int RTR_RESTIR_SPATIAL_TAPS = 4;
 const float RTR_PLANE_Y = -1.0;
 const float RTR_SCENE_DISK_RADIUS = 26.0;
 const float RTR_MAX_SPHERE_RADIUS = 0.025;
@@ -70,6 +86,7 @@ const int RTR_HIT_PLANE = -2;
 
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
+const float RTR_LIGHT_RADIUS = 0.7;
 
 shared uint shSphereCount;
 shared uint shBVHNodeCount;
@@ -92,9 +109,19 @@ uint rtrLoadU32(uint word)
     return rtrMem[word];
 }
 
+void rtrStoreU32(uint word, uint value)
+{
+    rtrMem[word] = value;
+}
+
 float rtrLoadF32(uint word)
 {
     return uintBitsToFloat(rtrLoadU32(word));
+}
+
+void rtrStoreF32(uint word, float value)
+{
+    rtrMem[word] = floatBitsToUint(value);
 }
 
 uint rtrLo16(uint value)
@@ -538,11 +565,47 @@ void rtrSurface(RTRHit hit,
         n = -n;
 }
 
-vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, int skipId)
+vec3 rtrSampleLightPoint(vec3 p,
+                         uvec2 coord,
+                         uint frameIndex,
+                         uint sampleIndex,
+                         uint dimension,
+                         inout uint rng)
+{
+    vec3 toCenter = RTR_LIGHT_POS - p;
+    vec3 lightForward = normalize(toCenter);
+    vec3 helper = abs(lightForward.y) < 0.97 ? vec3(0.0, 1.0, 0.0) :
+                                               vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(helper, lightForward));
+    vec3 bitangent = cross(lightForward, tangent);
+    vec2 noise = rtrBlueNoise2(coord, frameIndex, sampleIndex, dimension, rng);
+    float angle = noise.x * 6.2831853;
+    float radius = sqrt(noise.y) * RTR_LIGHT_RADIUS;
+
+    return RTR_LIGHT_POS +
+        tangent * (cos(angle) * radius) +
+        bitangent * (sin(angle) * radius);
+}
+
+vec3 rtrDirectLightSample(vec3 p,
+                          vec3 n,
+                          vec3 albedo,
+                          int skipId,
+                          uvec2 coord,
+                          uint frameIndex,
+                          uint sampleIndex,
+                          uint dimension,
+                          inout uint rng)
 {
     vec3 offsetP = p + n * (RTR_EPS * 4.0);
+    vec3 lightP = rtrSampleLightPoint(offsetP,
+                                      coord,
+                                      frameIndex,
+                                      sampleIndex,
+                                      dimension,
+                                      rng);
 
-    vec3 toLight = RTR_LIGHT_POS - offsetP;
+    vec3 toLight = lightP - offsetP;
     float lightDist2 = max(dot(toLight, toLight), 0.001);
     float invLightDist = inversesqrt(lightDist2);
     vec3 l = toLight * invLightDist;
@@ -555,6 +618,34 @@ vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, int skipId)
     }
 
     return albedo * RTR_LIGHT_COLOR * (ndl * shadow / lightDist2) * RTR_INV_PI;
+}
+
+vec3 rtrDirectLight(vec3 p,
+                    vec3 n,
+                    vec3 albedo,
+                    int skipId,
+                    uvec2 coord,
+                    uint frameIndex,
+                    uint sampleCount,
+                    uint dimension,
+                    inout uint rng)
+{
+    vec3 direct = vec3(0.0);
+    uint count = max(sampleCount, 1u);
+
+    for (uint sampleIndex = 0u; sampleIndex < count; sampleIndex++) {
+        direct += rtrDirectLightSample(p,
+                                       n,
+                                       albedo,
+                                       skipId,
+                                       coord,
+                                       frameIndex,
+                                       sampleIndex,
+                                       dimension,
+                                       rng);
+    }
+
+    return direct / float(count);
 }
 
 vec3 rtrBounceDirection(vec3 n,
@@ -581,62 +672,441 @@ vec3 rtrBounceDirection(vec3 n,
     return diffuse;
 }
 
-vec3 rtrRadiance(vec3 ro,
-                 vec3 rd,
-                 uvec2 coord,
-                 uint frameIndex,
-                 uint sampleIndex,
-                 uint sampleCount,
-                 inout uint rng)
-{
-    vec3 color = vec3(0.0);
-    vec3 throughput = vec3(1.0);
-
-    for (int bounce = 0; bounce < RTR_RAY_BOUNCES; bounce++) {
-        RTRHit hit = rtrTrace(ro, rd);
-
-        if (hit.id == RTR_HIT_NONE) {
-            color += throughput * rtrSky(rd);
-            break;
-        }
-
-        vec3 p = ro + rd * hit.t;
-        vec3 n;
-        vec3 albedo;
-        int skipId;
-
-        rtrSurface(hit, p, rd, n, albedo, skipId);
-        if (bounce < RTR_DIRECT_LIGHT_BOUNCES) {
-            const uint directLightStride = max(uint(RTR_DIRECT_LIGHT_SAMPLE_STRIDE), 1u);
-            float directLightProbability = 1.0 / float(directLightStride);
-            float directLightSample = rtrBlueNoise2(coord,
-                                                    frameIndex,
-                                                    sampleIndex,
-                                                    32u + uint(bounce),
-                                                    rng).x;
-            if (directLightStride == 1u || directLightSample < directLightProbability) {
-                color += throughput *
-                         (rtrDirectLight(p, n, albedo, skipId) / directLightProbability);
-            }
-        }
-
-        throughput *= albedo;
-        if (max(max(throughput.x, throughput.y), throughput.z) < 0.01)
-            break;
-
-        ro = p + n * (RTR_EPS * 8.0);
-        rd = rtrBounceDirection(n, coord, frameIndex, sampleIndex, bounce, rng);
-    }
-
-    return color;
-}
-
 vec3 rtrTonemap(vec3 color)
 {
     color *= 0.85;
     color = (color * (2.51 * color + vec3(0.03))) /
             (color * (2.43 * color + vec3(0.59)) + vec3(0.14));
     return sqrt(clamp(color, vec3(0.0), vec3(1.0)));
+}
+
+float rtrLuminance(vec3 color)
+{
+    return dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+struct RTRPrimarySample {
+    bool hit;
+    float depth;
+    vec3 point;
+    vec3 normal;
+    vec3 albedo;
+    int skipId;
+    vec3 color;
+};
+
+struct RTRGICandidate {
+    bool valid;
+    vec3 dir;
+    vec3 radiance;
+    vec3 contribution;
+    float target;
+    float weight;
+    float m;
+    uint age;
+};
+
+struct RTRGIReservoir {
+    bool valid;
+    vec3 dir;
+    vec3 radiance;
+    vec3 contribution;
+    float target;
+    float weightSum;
+    float m;
+    uint age;
+};
+
+bool rtrTracePrimary(vec3 ro, vec3 rd, out RTRPrimarySample primary)
+{
+    primary.hit = false;
+    primary.depth = 0.0;
+    primary.point = vec3(0.0);
+    primary.normal = vec3(0.0);
+    primary.albedo = vec3(0.0);
+    primary.skipId = RTR_HIT_NONE;
+    primary.color = vec3(0.0);
+
+    RTRHit hit = rtrTrace(ro, rd);
+    if (hit.id == RTR_HIT_NONE) {
+        primary.color = rtrSky(rd);
+        return false;
+    }
+
+    vec3 p = ro + rd * hit.t;
+    vec3 n;
+    vec3 albedo;
+    int skipId;
+    rtrSurface(hit, p, rd, n, albedo, skipId);
+
+    primary.hit = true;
+    primary.depth = hit.t;
+    primary.point = p;
+    primary.normal = n;
+    primary.albedo = albedo;
+    primary.skipId = skipId;
+    primary.color = vec3(0.0);
+    return true;
+}
+
+vec3 rtrIncomingRadiance(vec3 p,
+                         vec3 n,
+                         vec3 wi,
+                         uvec2 coord,
+                         uint frameIndex,
+                         uint sampleIndex,
+                         inout uint rng)
+{
+    RTRHit hit = rtrTrace(p + n * (RTR_EPS * 8.0), wi);
+    if (hit.id == RTR_HIT_NONE)
+        return rtrSky(wi);
+
+    vec3 q = p + n * (RTR_EPS * 8.0) + wi * hit.t;
+    vec3 qn;
+    vec3 qAlbedo;
+    int qSkipId;
+    rtrSurface(hit, q, -wi, qn, qAlbedo, qSkipId);
+
+    return rtrDirectLightSample(q,
+                                qn,
+                                qAlbedo,
+                                qSkipId,
+                                coord,
+                                frameIndex,
+                                sampleIndex,
+                                40u,
+                                rng);
+}
+
+float rtrCandidateTarget(vec3 n, vec3 dir, vec3 contribution)
+{
+    float ndl = dot(n, dir);
+    if (ndl <= 0.0)
+        return 0.0;
+
+    float luminance = rtrLuminance(contribution);
+    if (luminance <= RTR_RESTIR_MIN_TARGET)
+        return 0.0;
+
+    return max(luminance * clamp(ndl * 4.0, 0.0, 1.0), RTR_RESTIR_MIN_TARGET);
+}
+
+void rtrClearCandidate(out RTRGICandidate candidate)
+{
+    candidate.valid = false;
+    candidate.dir = vec3(0.0);
+    candidate.radiance = vec3(0.0);
+    candidate.contribution = vec3(0.0);
+    candidate.target = 0.0;
+    candidate.weight = 0.0;
+    candidate.m = 0.0;
+    candidate.age = 0u;
+}
+
+void rtrMakeFreshGICandidate(RTRPrimarySample primary,
+                             uvec2 coord,
+                             uint frameIndex,
+                             uint sampleIndex,
+                             inout uint rng,
+                             out RTRGICandidate candidate)
+{
+    rtrClearCandidate(candidate);
+
+    vec3 dir = rtrBounceDirection(primary.normal, coord, frameIndex, sampleIndex, 0, rng);
+    vec3 radiance = rtrIncomingRadiance(primary.point,
+                                        primary.normal,
+                                        dir,
+                                        coord,
+                                        frameIndex,
+                                        sampleIndex,
+                                        rng);
+    vec3 contribution = primary.albedo * radiance;
+    float target = rtrCandidateTarget(primary.normal, dir, contribution);
+    if (target <= 0.0)
+        return;
+
+    candidate.valid = true;
+    candidate.dir = dir;
+    candidate.radiance = radiance;
+    candidate.contribution = contribution;
+    candidate.target = target;
+    candidate.weight = target;
+    candidate.m = 1.0;
+    candidate.age = 0u;
+}
+
+void rtrClearReservoir(out RTRGIReservoir reservoir)
+{
+    reservoir.valid = false;
+    reservoir.dir = vec3(0.0);
+    reservoir.radiance = vec3(0.0);
+    reservoir.contribution = vec3(0.0);
+    reservoir.target = 0.0;
+    reservoir.weightSum = 0.0;
+    reservoir.m = 0.0;
+    reservoir.age = 0u;
+}
+
+void rtrUpdateReservoir(inout RTRGIReservoir reservoir,
+                        RTRGICandidate candidate,
+                        inout uint rng)
+{
+    if (!candidate.valid || candidate.weight <= 0.0 ||
+        candidate.target <= 0.0 || candidate.m <= 0.0) {
+        return;
+    }
+
+    float newWeightSum = reservoir.weightSum + candidate.weight;
+    if (!reservoir.valid ||
+        rtrRandom01(rng) < candidate.weight / max(newWeightSum, RTR_RESTIR_MIN_TARGET)) {
+        reservoir.dir = candidate.dir;
+        reservoir.radiance = candidate.radiance;
+        reservoir.contribution = candidate.contribution;
+        reservoir.target = candidate.target;
+        reservoir.age = candidate.age;
+    }
+
+    reservoir.valid = true;
+    reservoir.weightSum = newWeightSum;
+    reservoir.m += candidate.m;
+
+    if (reservoir.m > RTR_RESTIR_MAX_M) {
+        float scale = RTR_RESTIR_MAX_M / reservoir.m;
+        reservoir.weightSum *= scale;
+        reservoir.m = RTR_RESTIR_MAX_M;
+    }
+}
+
+float rtrReservoirFinalWeight(RTRGIReservoir reservoir)
+{
+    if (!reservoir.valid || reservoir.target <= 0.0 || reservoir.m <= 0.0)
+        return 0.0;
+
+    float weight = reservoir.weightSum /
+        max(reservoir.target * reservoir.m, RTR_RESTIR_MIN_TARGET);
+    return clamp(weight, 0.0, RTR_RESTIR_MAX_WEIGHT);
+}
+
+bool rtrReservoirToCandidate(RTRGIReservoir source,
+                             vec3 n,
+                             vec3 albedo,
+                             out RTRGICandidate candidate)
+{
+    rtrClearCandidate(candidate);
+    if (!source.valid || source.target <= RTR_RESTIR_MIN_TARGET ||
+        source.weightSum <= 0.0 || source.m <= 0.0 ||
+        float(source.age) >= RTR_RESTIR_MAX_AGE) {
+        return false;
+    }
+
+    vec3 contribution = albedo * source.radiance;
+    float target = rtrCandidateTarget(n, source.dir, contribution);
+    if (target <= 0.0)
+        return false;
+
+    float sourceWeight = source.weightSum / max(source.target, RTR_RESTIR_MIN_TARGET);
+    sourceWeight = min(sourceWeight, RTR_RESTIR_MAX_M * RTR_RESTIR_MAX_WEIGHT);
+
+    candidate.valid = true;
+    candidate.dir = source.dir;
+    candidate.radiance = source.radiance;
+    candidate.contribution = contribution;
+    candidate.target = target;
+    candidate.weight = target * sourceWeight;
+    candidate.m = min(source.m, RTR_RESTIR_MAX_M);
+    candidate.age = min(source.age + 1u, 255u);
+    return true;
+}
+
+uint rtrPixelIndex(uvec2 p, uint width)
+{
+    return p.y * width + p.x;
+}
+
+uint rtrPixelCount(uint width, uint height)
+{
+    return width * height;
+}
+
+uint rtrHistoryPageWord(uint width, uint height, uint page)
+{
+    return RTR_HISTORY_WORD +
+        page * rtrPixelCount(width, height) * RTR_HISTORY_PIXEL_WORDS;
+}
+
+uint rtrHistoryPixelWord(uvec2 p, uint width, uint height, uint page)
+{
+    return rtrHistoryPageWord(width, height, page) +
+        rtrPixelIndex(p, width) * RTR_HISTORY_PIXEL_WORDS;
+}
+
+float rtrLoadHistoryDepth(uvec2 p, uint width, uint height, uint page)
+{
+    return rtrLoadF32(rtrHistoryPixelWord(p, width, height, page));
+}
+
+vec3 rtrLoadHistoryNormal(uvec2 p, uint width, uint height, uint page)
+{
+    uint word = rtrHistoryPixelWord(p, width, height, page) + 1u;
+
+    return vec3(rtrLoadF32(word), rtrLoadF32(word + 1u), rtrLoadF32(word + 2u));
+}
+
+void rtrStoreHistoryPixel(uvec2 p,
+                          uint width,
+                          uint height,
+                          uint page,
+                          float depth,
+                          vec3 normal)
+{
+    uint word = rtrHistoryPixelWord(p, width, height, page);
+
+    rtrStoreF32(word, depth);
+    rtrStoreF32(word + 1u, normal.x);
+    rtrStoreF32(word + 2u, normal.y);
+    rtrStoreF32(word + 3u, normal.z);
+}
+
+bool rtrReprojectHistory(vec3 worldP,
+                         float cameraYaw,
+                         float cameraPitch,
+                         float cameraRadius,
+                         vec2 szf,
+                         out uvec2 historyP,
+                         out float historyDepth)
+{
+    vec3 prevRo;
+    vec3 prevForward;
+    vec3 prevRight;
+    vec3 prevUp;
+    rtrCamera(cameraYaw, cameraPitch, cameraRadius, szf,
+              prevRo, prevForward, prevRight, prevUp);
+
+    vec3 local = worldP - prevRo;
+    float forwardDepth = dot(local, prevForward);
+    if (forwardDepth <= RTR_EPS)
+        return false;
+
+    float invForwardDepth = 1.0 / forwardDepth;
+    float screenX = RTR_FOCAL * dot(local, prevRight) * invForwardDepth;
+    float screenY = RTR_FOCAL * dot(local, prevUp) * invForwardDepth;
+    vec2 projected = vec2(
+        (screenX * szf.y - 1.0 + szf.x) * 0.5,
+        (szf.y - 1.0 - screenY * szf.y) * 0.5
+    );
+
+    if (any(lessThan(projected, vec2(0.0))) ||
+        projected.x >= szf.x || projected.y >= szf.y)
+        return false;
+
+    historyP = uvec2(projected);
+    historyDepth = length(local);
+    return true;
+}
+
+bool rtrHistoryAccepts(uvec2 p,
+                       uint width,
+                       uint height,
+                       uint page,
+                       float expectedDepth,
+                       vec3 expectedNormal)
+{
+    float historyDepth = rtrLoadHistoryDepth(p, width, height, page);
+    vec3 historyNormal = rtrLoadHistoryNormal(p, width, height, page);
+    float depthTolerance =
+        max(RTR_TEMPORAL_DEPTH_ABS, expectedDepth * RTR_TEMPORAL_DEPTH_REL);
+    bool depthOk = historyDepth > 0.0 &&
+        abs(historyDepth - expectedDepth) <= depthTolerance;
+    bool normalOk = dot(historyNormal, expectedNormal) >= RTR_TEMPORAL_NORMAL_DOT;
+
+    return depthOk && normalOk;
+}
+
+uint rtrRestirWord(uint width, uint height)
+{
+    return RTR_HISTORY_WORD +
+        2u * rtrPixelCount(width, height) * RTR_HISTORY_PIXEL_WORDS;
+}
+
+uint rtrRestirPageWord(uint width, uint height, uint page)
+{
+    return rtrRestirWord(width, height) +
+        page * rtrPixelCount(width, height) * RTR_RESTIR_PIXEL_WORDS;
+}
+
+uint rtrRestirPixelWord(uvec2 p, uint width, uint height, uint page)
+{
+    return rtrRestirPageWord(width, height, page) +
+        rtrPixelIndex(p, width) * RTR_RESTIR_PIXEL_WORDS;
+}
+
+RTRGIReservoir rtrLoadGIReservoir(uvec2 p, uint width, uint height, uint page)
+{
+    RTRGIReservoir reservoir;
+    rtrClearReservoir(reservoir);
+
+    uint word = rtrRestirPixelWord(p, width, height, page);
+    uint valid = rtrLoadU32(word + 10u);
+    if (valid == 0u)
+        return reservoir;
+
+    reservoir.valid = true;
+    reservoir.dir = normalize(vec3(rtrLoadF32(word),
+                                   rtrLoadF32(word + 1u),
+                                   rtrLoadF32(word + 2u)));
+    reservoir.radiance = max(vec3(rtrLoadF32(word + 3u),
+                                  rtrLoadF32(word + 4u),
+                                  rtrLoadF32(word + 5u)), vec3(0.0));
+    reservoir.target = rtrLoadF32(word + 6u);
+    reservoir.weightSum = rtrLoadF32(word + 7u);
+    reservoir.m = rtrLoadF32(word + 8u);
+    reservoir.age = rtrLoadU32(word + 9u);
+
+    if (reservoir.target <= 0.0 || reservoir.weightSum <= 0.0 || reservoir.m <= 0.0)
+        rtrClearReservoir(reservoir);
+
+    return reservoir;
+}
+
+void rtrStoreGIReservoir(uvec2 p,
+                         uint width,
+                         uint height,
+                         uint page,
+                         RTRGIReservoir reservoir)
+{
+    uint word = rtrRestirPixelWord(p, width, height, page);
+    if (!reservoir.valid || reservoir.target <= 0.0 ||
+        reservoir.weightSum <= 0.0 || reservoir.m <= 0.0) {
+        for (uint i = 0u; i < RTR_RESTIR_PIXEL_WORDS; i++)
+            rtrStoreU32(word + i, 0u);
+        return;
+    }
+
+    rtrStoreF32(word, reservoir.dir.x);
+    rtrStoreF32(word + 1u, reservoir.dir.y);
+    rtrStoreF32(word + 2u, reservoir.dir.z);
+    rtrStoreF32(word + 3u, reservoir.radiance.x);
+    rtrStoreF32(word + 4u, reservoir.radiance.y);
+    rtrStoreF32(word + 5u, reservoir.radiance.z);
+    rtrStoreF32(word + 6u, reservoir.target);
+    rtrStoreF32(word + 7u, reservoir.weightSum);
+    rtrStoreF32(word + 8u, reservoir.m);
+    rtrStoreU32(word + 9u, reservoir.age);
+    rtrStoreU32(word + 10u, 1u);
+    rtrStoreF32(word + 11u, rtrReservoirFinalWeight(reservoir));
+}
+
+ivec2 rtrSpatialOffset(uvec2 coord, uint frameIndex, int tap, inout uint rng)
+{
+    vec2 noise = rtrBlueNoise2(coord, frameIndex, 0u, 48u + uint(tap), rng);
+    float angle = noise.x * 6.2831853;
+    float radius = max(1.0, sqrt(noise.y) * RTR_RESTIR_SPATIAL_RADIUS);
+    ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
+
+    if (offset.x == 0 && offset.y == 0)
+        offset.x = tap + 1;
+
+    return offset;
 }
 
 void main()
@@ -681,20 +1151,117 @@ void main()
     if (any(greaterThanEqual(p, sz)))
         return;
 
-    vec3 color = vec3(0.0);
+    uint width = uint(sz.x);
+    uint height = uint(sz.y);
     uint frameIndex = rtrLoadU32(RTR_FRAME_WORD);
-    for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++) {
-        uint rng = rtrSeedPath(uvec2(p), frameIndex, sampleIndex);
-        vec2 jitter = rtrPrimaryJitter(uvec2(p), frameIndex, sampleIndex, rng);
-        vec3 ray = shRayBase +
-                   shRayDx * (float(p.x) + jitter.x - 0.5) +
-                   shRayDy * (float(p.y) + jitter.y - 0.5);
-        vec3 rd = ray * inversesqrt(dot(ray, ray));
+    uint accumCount = rtrLoadU32(RTR_ACCUM_COUNT_WORD);
+    uint currentPage = accumCount & 1u;
+    uint previousPage = (accumCount + 1u) & 1u;
+    uint rng = rtrSeedPath(uvec2(p), frameIndex, 0u);
+    vec2 jitter = rtrPrimaryJitter(uvec2(p), frameIndex, 0u, rng);
+    vec3 ray = shRayBase +
+               shRayDx * (float(p.x) + jitter.x - 0.5) +
+               shRayDy * (float(p.y) + jitter.y - 0.5);
+    vec3 rd = ray * inversesqrt(dot(ray, ray));
 
-        color += rtrRadiance(shRo, rd, uvec2(p), frameIndex, sampleIndex,
-                             shSampleCount, rng);
+    RTRPrimarySample primary;
+    if (!rtrTracePrimary(shRo, rd, primary)) {
+        rtrStoreHistoryPixel(uvec2(p), width, height, currentPage, 0.0, vec3(0.0));
+
+        RTRGIReservoir invalidReservoir;
+        rtrClearReservoir(invalidReservoir);
+        rtrStoreGIReservoir(uvec2(p), width, height, currentPage, invalidReservoir);
+
+        imageStore(rtrOutImage, p, vec4(rtrTonemap(primary.color), 1.0));
+        return;
     }
-    color *= 1.0 / float(shSampleCount);
 
+    primary.color = rtrDirectLight(primary.point,
+                                   primary.normal,
+                                   primary.albedo,
+                                   primary.skipId,
+                                   uvec2(p),
+                                   frameIndex,
+                                   shSampleCount,
+                                   16u,
+                                   rng);
+
+    RTRGIReservoir reservoir;
+    RTRGICandidate candidate;
+    rtrClearReservoir(reservoir);
+
+    for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++) {
+        rtrMakeFreshGICandidate(primary, uvec2(p), frameIndex, sampleIndex, rng, candidate);
+        rtrUpdateReservoir(reservoir, candidate, rng);
+    }
+
+    if (accumCount > 0u) {
+        float prevCameraYaw = rtrLoadF32(RTR_PREV_CAMERA_YAW_WORD);
+        float prevCameraPitch = rtrLoadF32(RTR_PREV_CAMERA_PITCH_WORD);
+        float prevCameraRadius = rtrLoadF32(RTR_PREV_CAMERA_RADIUS_WORD);
+        uvec2 historyP;
+        float reprojectedDepth;
+
+        if (rtrReprojectHistory(primary.point,
+                                prevCameraYaw,
+                                prevCameraPitch,
+                                prevCameraRadius,
+                                szf,
+                                historyP,
+                                reprojectedDepth)) {
+            if (rtrHistoryAccepts(historyP,
+                                  width,
+                                  height,
+                                  previousPage,
+                                  reprojectedDepth,
+                                  primary.normal)) {
+                RTRGIReservoir previousReservoir =
+                    rtrLoadGIReservoir(historyP, width, height, previousPage);
+                if (rtrReservoirToCandidate(previousReservoir,
+                                            primary.normal,
+                                            primary.albedo,
+                                            candidate)) {
+                    rtrUpdateReservoir(reservoir, candidate, rng);
+                }
+            }
+
+            for (int tap = 0; tap < RTR_RESTIR_SPATIAL_TAPS; tap++) {
+                ivec2 q = ivec2(historyP) +
+                    rtrSpatialOffset(uvec2(p), frameIndex, tap, rng);
+                if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y)
+                    continue;
+
+                uvec2 neighborP = uvec2(q);
+                if (!rtrHistoryAccepts(neighborP,
+                                       width,
+                                       height,
+                                       previousPage,
+                                       reprojectedDepth,
+                                       primary.normal)) {
+                    continue;
+                }
+
+                RTRGIReservoir neighborReservoir =
+                    rtrLoadGIReservoir(neighborP, width, height, previousPage);
+                if (rtrReservoirToCandidate(neighborReservoir,
+                                            primary.normal,
+                                            primary.albedo,
+                                            candidate)) {
+                    rtrUpdateReservoir(reservoir, candidate, rng);
+                }
+            }
+        }
+    }
+
+    vec3 indirect = reservoir.contribution * rtrReservoirFinalWeight(reservoir);
+    vec3 color = primary.color + indirect;
+
+    rtrStoreHistoryPixel(uvec2(p),
+                         width,
+                         height,
+                         currentPage,
+                         primary.depth,
+                         primary.normal);
+    rtrStoreGIReservoir(uvec2(p), width, height, currentPage, reservoir);
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }
