@@ -23,13 +23,16 @@
 #define RTR_SCENE_BLUE_NOISE_SIZE 64u
 #define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
 #define RTR_SCENE_BLUE_NOISE_CANDIDATES 64u
+#define RTR_SCENE_TRIANGLE_QUANT_MAX 65535u
 
 enum {
     RTR_SCENE_COUNT_WORD = 8,
     RTR_SCENE_BVH_NODE_COUNT_WORD = 15,
-    RTR_SCENE_GEOM_WORD = 24,
+    RTR_SCENE_QUANT_MIN_WORD = 24,
+    RTR_SCENE_QUANT_MAX_WORD = 27,
+    RTR_SCENE_GEOM_WORD = 32,
     RTR_SCENE_TRIANGLE_CAPACITY = 900000,
-    RTR_SCENE_TRIANGLE_WORDS = 9,
+    RTR_SCENE_TRIANGLE_WORDS = 5,
     RTR_SCENE_BVH_WORD = RTR_SCENE_GEOM_WORD +
         RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS,
     RTR_SCENE_BVH_NODE_WORDS = 8,
@@ -88,6 +91,28 @@ static uint32_t rtrHashU32(uint32_t value)
 static float rtrHash01(uint32_t value)
 {
     return (float)(rtrHashU32(value) & 0x00ffffffu) / 16777215.0f;
+}
+
+static uint32_t rtrPackU16(uint32_t lo, uint32_t hi)
+{
+    return (lo & 0xffffu) | ((hi & 0xffffu) << 16u);
+}
+
+static uint32_t rtrQuantizeUnormNearest(float value,
+                                        float minValue,
+                                        float maxValue,
+                                        uint32_t maxQuant)
+{
+    const float extent = maxValue - minValue;
+    float q;
+
+    if (!(extent > 0.0f))
+        return 0u;
+
+    q = (value - minValue) * (float)maxQuant / extent;
+    if (q <= 0.0f) return 0u;
+    if (q >= (float)maxQuant) return maxQuant;
+    return (uint32_t)floorf(q + 0.5f);
 }
 
 static uint32_t rtrToroidalDistance2(uint32_t a, uint32_t b)
@@ -588,22 +613,49 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
     return 0;
 }
 
-static void rtrStoreTriangle(uint32_t *words, uint32_t index, const RTRTriangle *triangle)
+static void rtrPackTriangle16(uint32_t packed[5], const uint32_t q[9])
 {
-    const uint32_t word = RTR_SCENE_GEOM_WORD + index * RTR_SCENE_TRIANGLE_WORDS;
-
-    words[word + 0u] = rtrF32Word(triangle->v0.x);
-    words[word + 1u] = rtrF32Word(triangle->v0.y);
-    words[word + 2u] = rtrF32Word(triangle->v0.z);
-    words[word + 3u] = rtrF32Word(triangle->v1.x);
-    words[word + 4u] = rtrF32Word(triangle->v1.y);
-    words[word + 5u] = rtrF32Word(triangle->v1.z);
-    words[word + 6u] = rtrF32Word(triangle->v2.x);
-    words[word + 7u] = rtrF32Word(triangle->v2.y);
-    words[word + 8u] = rtrF32Word(triangle->v2.z);
+    packed[0] = rtrPackU16(q[0], q[1]);
+    packed[1] = rtrPackU16(q[2], q[3]);
+    packed[2] = rtrPackU16(q[4], q[5]);
+    packed[3] = rtrPackU16(q[6], q[7]);
+    packed[4] = q[8] & 0xffffu;
 }
 
-static void rtrStoreBVHNode(uint32_t *words, uint32_t index, const RTRBVHNode *node)
+static void rtrStoreTriangle(uint32_t *words,
+                             uint32_t index,
+                             const RTRTriangle *triangle,
+                             const float sceneMin[3],
+                             const float sceneMax[3])
+{
+    const uint32_t word = RTR_SCENE_GEOM_WORD + index * RTR_SCENE_TRIANGLE_WORDS;
+    const float values[9] = {
+        triangle->v0.x, triangle->v0.y, triangle->v0.z,
+        triangle->v1.x, triangle->v1.y, triangle->v1.z,
+        triangle->v2.x, triangle->v2.y, triangle->v2.z,
+    };
+    uint32_t q[9];
+    uint32_t packed[5];
+
+    for (uint32_t i = 0u; i < 9u; i++) {
+        const uint32_t axis = i % 3u;
+        q[i] = rtrQuantizeUnormNearest(values[i],
+                                       sceneMin[axis],
+                                       sceneMax[axis],
+                                       RTR_SCENE_TRIANGLE_QUANT_MAX);
+    }
+
+    rtrPackTriangle16(packed, q);
+    words[word + 0u] = packed[0];
+    words[word + 1u] = packed[1];
+    words[word + 2u] = packed[2];
+    words[word + 3u] = packed[3];
+    words[word + 4u] = packed[4];
+}
+
+static void rtrStoreBVHNode(uint32_t *words,
+                            uint32_t index,
+                            const RTRBVHNode *node)
 {
     const uint32_t word = RTR_SCENE_BVH_WORD + index * RTR_SCENE_BVH_NODE_WORDS;
 
@@ -617,12 +669,24 @@ static void rtrStoreBVHNode(uint32_t *words, uint32_t index, const RTRBVHNode *n
     words[word + 7u] = node->countRight;
 }
 
+static void rtrStoreSceneQuantBounds(uint32_t *words,
+                                     const float sceneMin[3],
+                                     const float sceneMax[3])
+{
+    for (uint32_t axis = 0u; axis < 3u; axis++) {
+        words[RTR_SCENE_QUANT_MIN_WORD + axis] = rtrF32Word(sceneMin[axis]);
+        words[RTR_SCENE_QUANT_MAX_WORD + axis] = rtrF32Word(sceneMax[axis]);
+    }
+}
+
 void rtrScene(uint32_t *words)
 {
     RTRTriangle *triangles = NULL;
     RTRBVHNode *nodes = NULL;
     uint32_t triangleCount = 0u;
     uint32_t nodeCount = 0u;
+    float sceneMin[3];
+    float sceneMax[3];
 
     words[RTR_SCENE_COUNT_WORD] = 0u;
     words[RTR_SCENE_BVH_NODE_COUNT_WORD] = 0u;
@@ -643,12 +707,15 @@ void rtrScene(uint32_t *words)
     }
 
     rtrBuildBVH(triangles, nodes, &nodeCount, 0u, triangleCount);
+    memcpy(sceneMin, nodes[0].boundsMin, sizeof(sceneMin));
+    memcpy(sceneMax, nodes[0].boundsMax, sizeof(sceneMax));
 
     words[RTR_SCENE_COUNT_WORD] = triangleCount;
     words[RTR_SCENE_BVH_NODE_COUNT_WORD] = nodeCount;
+    rtrStoreSceneQuantBounds(words, sceneMin, sceneMax);
 
     for (uint32_t i = 0u; i < triangleCount; i++)
-        rtrStoreTriangle(words, i, triangles + i);
+        rtrStoreTriangle(words, i, triangles + i, sceneMin, sceneMax);
 
     for (uint32_t i = 0u; i < nodeCount; i++)
         rtrStoreBVHNode(words, i, nodes + i);

@@ -5,9 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RTR_CHECK_HEADER_WORDS 24u
+#define RTR_CHECK_HEADER_WORDS 32u
 #define RTR_CHECK_TRIANGLE_CAPACITY 900000u
-#define RTR_CHECK_TRIANGLE_WORDS 9u
+#define RTR_CHECK_TRIANGLE_WORDS 5u
 #define RTR_CHECK_BVH_NODE_COUNT (RTR_CHECK_TRIANGLE_CAPACITY * 2u - 1u)
 #define RTR_CHECK_BVH_NODE_WORDS 8u
 #define RTR_CHECK_BLUE_NOISE_WORDS (64u * 64u)
@@ -19,13 +19,17 @@
 
 #define RTR_CHECK_TRIANGLE_COUNT_WORD 8u
 #define RTR_CHECK_BVH_NODE_COUNT_WORD 15u
-#define RTR_CHECK_TRIANGLE_WORD 24u
+#define RTR_CHECK_SCENE_QUANT_MIN_WORD 24u
+#define RTR_CHECK_SCENE_QUANT_MAX_WORD 27u
+#define RTR_CHECK_TRIANGLE_WORD 32u
 #define RTR_CHECK_BVH_NODE_WORD \
     (RTR_CHECK_TRIANGLE_WORD + RTR_CHECK_TRIANGLE_CAPACITY * RTR_CHECK_TRIANGLE_WORDS)
 #define RTR_CHECK_BVH_INTERNAL_FLAG 0x80000000u
 #define RTR_CHECK_STACK_SIZE 64
 #define RTR_CHECK_EPS 0.0001f
+#define RTR_CHECK_CONTAINMENT_EPS 0.000001f
 #define RTR_CHECK_INF 1.0e20f
+#define RTR_CHECK_TRIANGLE_QUANT_MAX 65535u
 
 void rtrScene(uint32_t *words);
 
@@ -69,6 +73,25 @@ static float rtrCheckLoadF32(const uint32_t *words, uint32_t word)
     return value;
 }
 
+static uint32_t rtrCheckLo16(uint32_t value)
+{
+    return value & 0xffffu;
+}
+
+static uint32_t rtrCheckHi16(uint32_t value)
+{
+    return value >> 16u;
+}
+
+static float rtrCheckDequantizeUnorm(uint32_t value,
+                                     float minValue,
+                                     float maxValue,
+                                     uint32_t maxQuant)
+{
+    return minValue +
+        (maxValue - minValue) * ((float)value / (float)maxQuant);
+}
+
 static RTRCheckVec3 rtrCheckAdd(RTRCheckVec3 a, RTRCheckVec3 b)
 {
     return (RTRCheckVec3){a.x + b.x, a.y + b.y, a.z + b.z};
@@ -82,6 +105,40 @@ static RTRCheckVec3 rtrCheckSub(RTRCheckVec3 a, RTRCheckVec3 b)
 static RTRCheckVec3 rtrCheckMul(RTRCheckVec3 v, float s)
 {
     return (RTRCheckVec3){v.x * s, v.y * s, v.z * s};
+}
+
+static uint32_t rtrCheckVec3Finite(RTRCheckVec3 v)
+{
+    return (uint32_t)(isfinite(v.x) && isfinite(v.y) && isfinite(v.z));
+}
+
+static float rtrCheckPointBoundsSlop(RTRCheckVec3 p,
+                                     RTRCheckVec3 boundsMin,
+                                     RTRCheckVec3 boundsMax)
+{
+    float slop = 0.0f;
+
+    slop = fmaxf(slop, boundsMin.x - p.x);
+    slop = fmaxf(slop, p.x - boundsMax.x);
+    slop = fmaxf(slop, boundsMin.y - p.y);
+    slop = fmaxf(slop, p.y - boundsMax.y);
+    slop = fmaxf(slop, boundsMin.z - p.z);
+    slop = fmaxf(slop, p.z - boundsMax.z);
+
+    return slop;
+}
+
+static float rtrCheckBoundsContainSlop(RTRCheckVec3 outerMin,
+                                       RTRCheckVec3 outerMax,
+                                       RTRCheckVec3 innerMin,
+                                       RTRCheckVec3 innerMax)
+{
+    float slop = 0.0f;
+
+    slop = fmaxf(slop, rtrCheckPointBoundsSlop(innerMin, outerMin, outerMax));
+    slop = fmaxf(slop, rtrCheckPointBoundsSlop(innerMax, outerMin, outerMax));
+
+    return slop;
 }
 
 static float rtrCheckDot(RTRCheckVec3 a, RTRCheckVec3 b)
@@ -105,6 +162,24 @@ static RTRCheckVec3 rtrCheckNormalize(RTRCheckVec3 v)
     return rtrCheckMul(v, invLen);
 }
 
+static RTRCheckVec3 rtrCheckLoadSceneQuantMin(const uint32_t *words)
+{
+    return (RTRCheckVec3){
+        rtrCheckLoadF32(words, RTR_CHECK_SCENE_QUANT_MIN_WORD),
+        rtrCheckLoadF32(words, RTR_CHECK_SCENE_QUANT_MIN_WORD + 1u),
+        rtrCheckLoadF32(words, RTR_CHECK_SCENE_QUANT_MIN_WORD + 2u),
+    };
+}
+
+static RTRCheckVec3 rtrCheckLoadSceneQuantMax(const uint32_t *words)
+{
+    return (RTRCheckVec3){
+        rtrCheckLoadF32(words, RTR_CHECK_SCENE_QUANT_MAX_WORD),
+        rtrCheckLoadF32(words, RTR_CHECK_SCENE_QUANT_MAX_WORD + 1u),
+        rtrCheckLoadF32(words, RTR_CHECK_SCENE_QUANT_MAX_WORD + 2u),
+    };
+}
+
 static RTRCheckVec3 rtrCheckSafeInvDir(RTRCheckVec3 rd)
 {
     const float ax = fabsf(rd.x) > 1.0e-8f ? fabsf(rd.x) : 1.0e-8f;
@@ -118,25 +193,60 @@ static RTRCheckVec3 rtrCheckSafeInvDir(RTRCheckVec3 rd)
     };
 }
 
-static RTRCheckTriangle rtrCheckLoadTriangle(const uint32_t *words, uint32_t i)
+static RTRCheckTriangle rtrCheckLoadTriangle(const uint32_t *words,
+                                             uint32_t i)
 {
     const uint32_t word = RTR_CHECK_TRIANGLE_WORD + i * RTR_CHECK_TRIANGLE_WORDS;
+    const uint32_t w0 = words[word];
+    const uint32_t w1 = words[word + 1u];
+    const uint32_t w2 = words[word + 2u];
+    const uint32_t w3 = words[word + 3u];
+    const uint32_t w4 = words[word + 4u];
+    const RTRCheckVec3 sceneMin = rtrCheckLoadSceneQuantMin(words);
+    const RTRCheckVec3 sceneMax = rtrCheckLoadSceneQuantMax(words);
 
     return (RTRCheckTriangle){
         .v0 = {
-            rtrCheckLoadF32(words, word),
-            rtrCheckLoadF32(words, word + 1u),
-            rtrCheckLoadF32(words, word + 2u),
+            rtrCheckDequantizeUnorm(rtrCheckLo16(w0),
+                                    sceneMin.x,
+                                    sceneMax.x,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
+            rtrCheckDequantizeUnorm(rtrCheckHi16(w0),
+                                    sceneMin.y,
+                                    sceneMax.y,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
+            rtrCheckDequantizeUnorm(rtrCheckLo16(w1),
+                                    sceneMin.z,
+                                    sceneMax.z,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
         },
         .v1 = {
-            rtrCheckLoadF32(words, word + 3u),
-            rtrCheckLoadF32(words, word + 4u),
-            rtrCheckLoadF32(words, word + 5u),
+            rtrCheckDequantizeUnorm(rtrCheckHi16(w1),
+                                    sceneMin.x,
+                                    sceneMax.x,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
+            rtrCheckDequantizeUnorm(rtrCheckLo16(w2),
+                                    sceneMin.y,
+                                    sceneMax.y,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
+            rtrCheckDequantizeUnorm(rtrCheckHi16(w2),
+                                    sceneMin.z,
+                                    sceneMax.z,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
         },
         .v2 = {
-            rtrCheckLoadF32(words, word + 6u),
-            rtrCheckLoadF32(words, word + 7u),
-            rtrCheckLoadF32(words, word + 8u),
+            rtrCheckDequantizeUnorm(rtrCheckLo16(w3),
+                                    sceneMin.x,
+                                    sceneMax.x,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
+            rtrCheckDequantizeUnorm(rtrCheckHi16(w3),
+                                    sceneMin.y,
+                                    sceneMax.y,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
+            rtrCheckDequantizeUnorm(rtrCheckLo16(w4),
+                                    sceneMin.z,
+                                    sceneMax.z,
+                                    RTR_CHECK_TRIANGLE_QUANT_MAX),
         },
     };
 }
@@ -365,6 +475,145 @@ static int rtrCheckSceneGeometry(const RTRCheckTriangle *triangles,
     return 0;
 }
 
+static int rtrCheckBVHContainment(const uint32_t *words,
+                                  const RTRCheckTriangle *triangles,
+                                  uint32_t triangleCount,
+                                  uint32_t nodeCount)
+{
+    uint8_t *triangleRefs =
+        (uint8_t *)calloc((size_t)triangleCount, sizeof(*triangleRefs));
+    uint32_t invalidBounds = 0u;
+    uint32_t invalidLinks = 0u;
+    uint32_t invalidLeaves = 0u;
+    uint32_t outsideTriangles = 0u;
+    uint32_t outsideChildren = 0u;
+    uint32_t duplicateRefs = 0u;
+    uint32_t coveredTriangles = 0u;
+    uint32_t missingTriangles = 0u;
+    uint32_t leafCount = 0u;
+    float maxTriangleSlop = 0.0f;
+    float maxChildSlop = 0.0f;
+
+    if (!triangleRefs) {
+        fprintf(stderr, "correctness: containment allocation failed\n");
+        return 1;
+    }
+
+    for (uint32_t node = 0u; node < nodeCount; node++) {
+        const uint32_t word = RTR_CHECK_BVH_NODE_WORD +
+            node * RTR_CHECK_BVH_NODE_WORDS;
+        const uint32_t leftFirst = words[word + 3u];
+        const uint32_t countRight = words[word + 7u];
+        const RTRCheckVec3 boundsMin = rtrCheckLoadBVHMin(words, node);
+        const RTRCheckVec3 boundsMax = rtrCheckLoadBVHMax(words, node);
+
+        if (!rtrCheckVec3Finite(boundsMin) ||
+            !rtrCheckVec3Finite(boundsMax) ||
+            boundsMin.x > boundsMax.x ||
+            boundsMin.y > boundsMax.y ||
+            boundsMin.z > boundsMax.z) {
+            invalidBounds++;
+            continue;
+        }
+
+        if ((countRight & RTR_CHECK_BVH_INTERNAL_FLAG) != 0u) {
+            const uint32_t left = leftFirst;
+            const uint32_t right = countRight & ~RTR_CHECK_BVH_INTERNAL_FLAG;
+            RTRCheckVec3 childMin;
+            RTRCheckVec3 childMax;
+            float slop;
+
+            if (left >= nodeCount || right >= nodeCount || left == right) {
+                invalidLinks++;
+                continue;
+            }
+
+            childMin = rtrCheckLoadBVHMin(words, left);
+            childMax = rtrCheckLoadBVHMax(words, left);
+            slop = rtrCheckBoundsContainSlop(boundsMin, boundsMax,
+                                             childMin, childMax);
+            if (slop > maxChildSlop)
+                maxChildSlop = slop;
+            if (slop > RTR_CHECK_CONTAINMENT_EPS)
+                outsideChildren++;
+
+            childMin = rtrCheckLoadBVHMin(words, right);
+            childMax = rtrCheckLoadBVHMax(words, right);
+            slop = rtrCheckBoundsContainSlop(boundsMin, boundsMax,
+                                             childMin, childMax);
+            if (slop > maxChildSlop)
+                maxChildSlop = slop;
+            if (slop > RTR_CHECK_CONTAINMENT_EPS)
+                outsideChildren++;
+        } else {
+            if (countRight == 0u ||
+                leftFirst >= triangleCount ||
+                countRight > triangleCount - leftFirst) {
+                invalidLeaves++;
+                continue;
+            }
+
+            leafCount++;
+            for (uint32_t i = 0u; i < countRight; i++) {
+                const uint32_t triangleId = leftFirst + i;
+                const RTRCheckTriangle *tri = triangles + triangleId;
+                const RTRCheckVec3 verts[3] = {tri->v0, tri->v1, tri->v2};
+                float triSlop = 0.0f;
+
+                if (triangleRefs[triangleId]) {
+                    duplicateRefs++;
+                } else {
+                    triangleRefs[triangleId] = 1u;
+                    coveredTriangles++;
+                }
+
+                for (uint32_t v = 0u; v < 3u; v++) {
+                    const float slop =
+                        rtrCheckPointBoundsSlop(verts[v], boundsMin, boundsMax);
+                    if (slop > triSlop)
+                        triSlop = slop;
+                }
+
+                if (triSlop > maxTriangleSlop)
+                    maxTriangleSlop = triSlop;
+                if (triSlop > RTR_CHECK_CONTAINMENT_EPS)
+                    outsideTriangles++;
+            }
+        }
+    }
+
+    for (uint32_t i = 0u; i < triangleCount; i++) {
+        if (!triangleRefs[i])
+            missingTriangles++;
+    }
+
+    free(triangleRefs);
+
+    if (invalidBounds || invalidLinks || invalidLeaves ||
+        outsideTriangles || outsideChildren || duplicateRefs ||
+        missingTriangles) {
+        fprintf(stderr,
+                "correctness: containment failed invalid_bounds=%u invalid_links=%u invalid_leaves=%u outside_tris=%u outside_children=%u duplicate_refs=%u missing_tris=%u max_tri_slop=%g max_child_slop=%g\n",
+                invalidBounds,
+                invalidLinks,
+                invalidLeaves,
+                outsideTriangles,
+                outsideChildren,
+                duplicateRefs,
+                missingTriangles,
+                maxTriangleSlop,
+                maxChildSlop);
+        return 1;
+    }
+
+    printf("containment: ok, %u leaves covered %u triangles max_tri_slop %.3g max_child_slop %.3g\n",
+           leafCount,
+           coveredTriangles,
+           maxTriangleSlop,
+           maxChildSlop);
+    return 0;
+}
+
 static int rtrCheckBVH(const uint32_t *words,
                        const RTRCheckTriangle *triangles,
                        uint32_t triangleCount,
@@ -457,6 +706,7 @@ int main(void)
     rootMax = rtrCheckLoadBVHMax(words, 0u);
 
     failed |= rtrCheckSceneGeometry(triangles, triangleCount, rootMin, rootMax);
+    failed |= rtrCheckBVHContainment(words, triangles, triangleCount, nodeCount);
     failed |= rtrCheckBVH(words, triangles, triangleCount, nodeCount, rootMin, rootMax);
 
     free(words);

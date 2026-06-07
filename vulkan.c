@@ -16,9 +16,9 @@
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
-#define RTR_MEMORY_HEADER_WORDS 24u
+#define RTR_MEMORY_HEADER_WORDS 32u
 #define RTR_SCENE_TRIANGLE_CAPACITY 900000u
-#define RTR_SCENE_TRIANGLE_WORDS 9u
+#define RTR_SCENE_TRIANGLE_WORDS 5u
 #define RTR_SCENE_BVH_NODE_COUNT (RTR_SCENE_TRIANGLE_CAPACITY * 2u - 1u)
 #define RTR_SCENE_BVH_NODE_WORDS 8u
 #define RTR_BLUE_NOISE_SIZE 64u
@@ -406,7 +406,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 11u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 12u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
