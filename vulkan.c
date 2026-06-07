@@ -12,7 +12,11 @@
 #include <string.h>
 #include <time.h>
 
-#include "trace_comp_spv.h"
+#include "trace_primary_comp_spv.h"
+#include "trace_direct_comp_spv.h"
+#include "trace_gi_comp_spv.h"
+#include "trace_gi_shadow_comp_spv.h"
+#include "trace_resolve_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
@@ -25,6 +29,9 @@
 #define RTR_BLUE_NOISE_WORDS (RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE)
 #define RTR_HISTORY_PIXEL_WORDS 7u
 #define RTR_RESTIR_PIXEL_WORDS 12u
+#define RTR_WAVE_PRIMARY_WORDS 15u
+#define RTR_WAVE_GI_SAMPLE_CAP 2u
+#define RTR_WAVE_GI_WORDS 15u
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
      RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS + \
@@ -64,6 +71,7 @@ enum {
 #define RTR_CAMERA_DEFAULT_PITCH 0.473f
 #define RTR_CAMERA_DEFAULT_RADIUS 4.0f
 #define RTR_CAMERA_AUTO_SPEED 0.08f
+#define RTR_CAMERA_STILL_EPS 0.0005f
 #define RTR_FRAME_TIME_CLAMP_SECONDS (1.0 / 20.0)
 
 static const char *const rtrInstanceExts[] = {
@@ -84,6 +92,15 @@ enum {
     RTR_DESCRIPTOR_IMAGE,
     RTR_DESCRIPTOR_MEMORY,
     RTR_DESCRIPTOR_COUNT,
+};
+
+enum {
+    RTR_PIPELINE_PRIMARY,
+    RTR_PIPELINE_DIRECT,
+    RTR_PIPELINE_GI,
+    RTR_PIPELINE_GI_SHADOW,
+    RTR_PIPELINE_RESOLVE,
+    RTR_PIPELINE_COUNT,
 };
 
 static const VkDescriptorSetLayoutBinding rtrDescriptorBindings[RTR_DESCRIPTOR_COUNT] = {
@@ -116,7 +133,7 @@ static VkDescriptorSetLayout rtrDescriptorSetLayout = VK_NULL_HANDLE;
 static VkDescriptorPool rtrDescriptorPool = VK_NULL_HANDLE;
 static VkDescriptorSet rtrDescriptorSets[RTR_MAX_SWAP_IMAGES];
 static VkPipelineLayout rtrPipelineLayout = VK_NULL_HANDLE;
-static VkPipeline rtrPipeline = VK_NULL_HANDLE;
+static VkPipeline rtrPipelines[RTR_PIPELINE_COUNT];
 static VkCommandPool rtrCommandPool = VK_NULL_HANDLE;
 static VkCommandBuffer rtrCommandBuffers[RTR_MAX_SWAP_IMAGES];
 static VkSemaphore rtrImageAvailableSemaphore = VK_NULL_HANDLE;
@@ -165,9 +182,9 @@ static uint32_t rtrShouldResetAccum(float yaw, float pitch, float radius)
     return !rtrAccumCameraReady ||
         rtrAccumWidth != rtrSwapExtent.width ||
         rtrAccumHeight != rtrSwapExtent.height ||
-        fabsf(rtrAccumYaw - yaw) > 0.35f ||
-        fabsf(rtrAccumPitch - pitch) > 0.25f ||
-        fabsf(logf(radius / rtrAccumRadius)) > 0.25f;
+        fabsf(rtrAccumYaw - yaw) > RTR_CAMERA_STILL_EPS ||
+        fabsf(rtrAccumPitch - pitch) > RTR_CAMERA_STILL_EPS ||
+        fabsf(logf(radius / rtrAccumRadius)) > RTR_CAMERA_STILL_EPS;
 }
 
 static void rtrRememberCamera(float yaw, float pitch, float radius)
@@ -373,11 +390,17 @@ static int rtrCreateMemoryBuffer(void)
         rtrPixelCount *
         (VkDeviceSize)RTR_RESTIR_PIXEL_WORDS *
         (VkDeviceSize)2u;
+    const VkDeviceSize rtrWavefrontWords =
+        rtrPixelCount *
+        ((VkDeviceSize)RTR_WAVE_PRIMARY_WORDS +
+         (VkDeviceSize)RTR_WAVE_GI_SAMPLE_CAP *
+         (VkDeviceSize)RTR_WAVE_GI_WORDS);
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
          (VkDeviceSize)RTR_SCENE_WORDS +
          rtrHistoryWords +
-         rtrRestirWords) *
+         rtrRestirWords +
+         rtrWavefrontWords) *
         (VkDeviceSize)sizeof(uint32_t);
     if (rtrPixelCount == 0u) return 1;
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
@@ -476,6 +499,62 @@ static void rtrUpdateMemory(void)
     rtrWindowCamera(&autoOrbit, &cameraYaw, &cameraPitch, &cameraRadius);
     rtrUpdateMemoryWith(rtrFrameSeconds(), mouseX, mouseY,
                         autoOrbit, cameraYaw, cameraPitch, cameraRadius);
+}
+
+static void rtrCmdWavefrontBarrier(VkCommandBuffer commandBuffer)
+{
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0u,
+                         0u,
+                         NULL,
+                         1u,
+                         &(VkBufferMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = rtrMemoryBuffer,
+        .offset = 0u,
+        .size = VK_WHOLE_SIZE,
+    },
+                         0u,
+                         NULL);
+}
+
+static void rtrCmdDispatchWavefront(VkCommandBuffer commandBuffer,
+                                    VkDescriptorSet descriptorSet)
+{
+    const uint32_t groupsX =
+        (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
+    const uint32_t groupsY =
+        (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
+
+    vkCmdBindDescriptorSets(commandBuffer,
+                            VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rtrPipelineLayout,
+                            0u,
+                            1u,
+                            &descriptorSet,
+                            0u,
+                            NULL);
+
+    for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
+        const uint32_t groupsZ =
+            (pipeline == RTR_PIPELINE_GI ||
+             pipeline == RTR_PIPELINE_GI_SHADOW) ?
+            RTR_WAVE_GI_SAMPLE_CAP : 1u;
+
+        vkCmdBindPipeline(commandBuffer,
+                          VK_PIPELINE_BIND_POINT_COMPUTE,
+                          rtrPipelines[pipeline]);
+        vkCmdDispatch(commandBuffer, groupsX, groupsY, groupsZ);
+
+        if (pipeline + 1u < RTR_PIPELINE_COUNT)
+            rtrCmdWavefrontBarrier(commandBuffer);
+    }
 }
 
 static int rtrCreateTimingQueryPool(void)
@@ -813,26 +892,44 @@ int rtrVulkanInit(void *windowSurface)
         .pSetLayouts = &rtrDescriptorSetLayout,
     }, NULL, &rtrPipelineLayout);
 
-    VkShaderModule shaderModule = VK_NULL_HANDLE;
-    vkCreateShaderModule(rtrDevice, &(VkShaderModuleCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = traceCompSpv_len,
-        .pCode = (const uint32_t *)(const void *)traceCompSpv,
-    }, NULL, &shaderModule);
+    const uint32_t *const shaderWords[RTR_PIPELINE_COUNT] = {
+        (const uint32_t *)(const void *)tracePrimaryCompSpv,
+        (const uint32_t *)(const void *)traceDirectCompSpv,
+        (const uint32_t *)(const void *)traceGiCompSpv,
+        (const uint32_t *)(const void *)traceGiShadowCompSpv,
+        (const uint32_t *)(const void *)traceResolveCompSpv,
+    };
+    const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
+        tracePrimaryCompSpv_len,
+        traceDirectCompSpv_len,
+        traceGiCompSpv_len,
+        traceGiShadowCompSpv_len,
+        traceResolveCompSpv_len,
+    };
 
-    vkCreateComputePipelines(rtrDevice, VK_NULL_HANDLE, 1u, &(VkComputePipelineCreateInfo){
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = shaderModule,
-            .pName = "main",
-        },
-        .layout = rtrPipelineLayout,
-        .basePipelineIndex = -1,
-    }, NULL, &rtrPipeline);
+    for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
+        VkShaderModule shaderModule = VK_NULL_HANDLE;
+        vkCreateShaderModule(rtrDevice, &(VkShaderModuleCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = shaderSizes[pipeline],
+            .pCode = shaderWords[pipeline],
+        }, NULL, &shaderModule);
 
-    vkDestroyShaderModule(rtrDevice, shaderModule, NULL);
+        vkCreateComputePipelines(rtrDevice, VK_NULL_HANDLE, 1u,
+            &(VkComputePipelineCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = shaderModule,
+                .pName = "main",
+            },
+            .layout = rtrPipelineLayout,
+            .basePipelineIndex = -1,
+        }, NULL, rtrPipelines + pipeline);
+
+        vkDestroyShaderModule(rtrDevice, shaderModule, NULL);
+    }
 
     vkCreateCommandPool(rtrDevice, &(VkCommandPoolCreateInfo){
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -935,13 +1032,7 @@ int rtrVulkanInit(void *windowSurface)
             .size = VK_WHOLE_SIZE,
         }, 0u, NULL);
 
-        vkCmdBindPipeline(rtrCommandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE, rtrPipeline);
-        vkCmdBindDescriptorSets(rtrCommandBuffers[i], VK_PIPELINE_BIND_POINT_COMPUTE,
-                                rtrPipelineLayout, 0u, 1u, &rtrDescriptorSets[i], 0u, NULL);
-        vkCmdDispatch(rtrCommandBuffers[i],
-                      (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE,
-                      (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE,
-                      1u);
+        rtrCmdDispatchWavefront(rtrCommandBuffers[i], rtrDescriptorSets[i]);
 
         if (rtrTimingSupported) {
             vkCmdWriteTimestamp(rtrCommandBuffers[i],
@@ -1133,13 +1224,7 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
         .size = VK_WHOLE_SIZE,
     }, 0u, NULL);
 
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, rtrPipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rtrPipelineLayout, 0u, 1u, &rtrDescriptorSets[0], 0u, NULL);
-    vkCmdDispatch(commandBuffer,
-                  (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE,
-                  (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE,
-                  1u);
+    rtrCmdDispatchWavefront(commandBuffer, rtrDescriptorSets[0]);
 
     if (rtrTimingSupported) {
         vkCmdWriteTimestamp(commandBuffer,
