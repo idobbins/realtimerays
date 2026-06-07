@@ -3,18 +3,17 @@
 #include <math.h>
 
 #ifndef RTR_BVH_LEAF_SIZE
-#define RTR_BVH_LEAF_SIZE 8u
+#define RTR_BVH_LEAF_SIZE 6u
 #endif
 
 #ifndef RTR_BVH_BIN_COUNT
-#define RTR_BVH_BIN_COUNT 64u
+#define RTR_BVH_BIN_COUNT 32u
 #endif
 
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
-#define RTR_SCENE_PACKED_META_INTERNAL_FLAG 0x80000000u
 #define RTR_SCENE_PI 3.14159265358979323846f
 #define RTR_SCENE_GROUND_Y -1.0f
-#define RTR_SCENE_DISK_RADIUS 2.60f
+#define RTR_SCENE_DISK_RADIUS 26.0f
 #define RTR_SCENE_MIN_SPHERE_RADIUS 0.012f
 #define RTR_SCENE_MAX_SPHERE_RADIUS 0.025f
 #define RTR_SCENE_SPHERE_CLEARANCE 0.0012f
@@ -22,6 +21,9 @@
 #define RTR_SCENE_PLACE_GRID_DIM 128u
 #define RTR_SCENE_PLACE_GRID_CELLS (RTR_SCENE_PLACE_GRID_DIM * RTR_SCENE_PLACE_GRID_DIM)
 #define RTR_SCENE_GRID_EMPTY UINT32_MAX
+#define RTR_SCENE_DENSE_PLACEMENT_THRESHOLD 50000u
+#define RTR_SCENE_DENSE_RADIUS_SCALE 1.0f
+#define RTR_SCENE_GOLDEN_ANGLE 2.39996322972865332f
 #define RTR_SCENE_BLUE_NOISE_SIZE 64u
 #define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
 #define RTR_SCENE_BLUE_NOISE_CANDIDATES 64u
@@ -30,10 +32,10 @@ enum {
     RTR_SCENE_COUNT_WORD = 8,
     RTR_SCENE_BVH_NODE_COUNT_WORD = 15,
     RTR_SCENE_GEOM_WORD = 24,
-    RTR_SCENE_SPHERE_COUNT = 10000,
+    RTR_SCENE_SPHERE_COUNT = 1000000,
     RTR_SCENE_SPHERE_WORDS = 1,
     RTR_SCENE_BVH_WORD = RTR_SCENE_GEOM_WORD + RTR_SCENE_SPHERE_COUNT * RTR_SCENE_SPHERE_WORDS,
-    RTR_SCENE_BVH_NODE_WORDS = 4,
+    RTR_SCENE_BVH_NODE_WORDS = 5,
     RTR_SCENE_BVH_MAX_NODES = RTR_SCENE_SPHERE_COUNT * 2 - 1,
     RTR_SCENE_BLUE_NOISE_WORD = RTR_SCENE_BVH_WORD +
         RTR_SCENE_BVH_MAX_NODES * RTR_SCENE_BVH_NODE_WORDS,
@@ -309,6 +311,22 @@ static uint32_t rtrPlaceSphere(RTRSphere *spheres, RTRPlacementGrid *grid, uint3
     }
 
     return 0u;
+}
+
+static void rtrPlaceDenseSphere(RTRSphere *sphere, uint32_t index)
+{
+    sphere->geom[3] *= RTR_SCENE_DENSE_RADIUS_SCALE;
+
+    const float diskRadius = RTR_SCENE_DISK_RADIUS - sphere->geom[3];
+    const float t = ((float)index + 0.5f) / (float)RTR_SCENE_SPHERE_COUNT;
+    const float angleJitter =
+        (rtrHash01(index * 2246822519u + 0x9e3779b9u) - 0.5f) * 0.035f;
+    const float angle = (float)index * RTR_SCENE_GOLDEN_ANGLE + angleJitter;
+    const float radial = sqrtf(t) * diskRadius;
+
+    sphere->geom[0] = cosf(angle) * radial;
+    sphere->geom[1] = RTR_SCENE_GROUND_Y + sphere->geom[3];
+    sphere->geom[2] = sinf(angle) * radial;
 }
 
 static uint32_t rtrToroidalDistance2(uint32_t a, uint32_t b)
@@ -644,17 +662,8 @@ static void rtrStoreBVHNode(uint32_t *words, uint32_t index, const RTRBVHNode *n
     words[word + 0u] = rtrPack2x16(minX, minZ);
     words[word + 1u] = rtrPack2x16(maxX, maxZ);
     words[word + 2u] = rtrPack2x16(minY, maxY);
-    if ((node->countRight & RTR_SCENE_BVH_INTERNAL_FLAG) != 0u) {
-        const uint32_t right = node->countRight & ~RTR_SCENE_BVH_INTERNAL_FLAG;
-        words[word + 3u] =
-            RTR_SCENE_PACKED_META_INTERNAL_FLAG |
-            (node->leftFirst & 0x7fffu) |
-            ((right & 0x7fffu) << 15u);
-    } else {
-        words[word + 3u] =
-            (node->leftFirst & 0x3fffu) |
-            ((node->countRight & 0x0fu) << 14u);
-    }
+    words[word + 3u] = node->leftFirst;
+    words[word + 4u] = node->countRight;
 }
 
 static void rtrStoreSphereGeom(uint32_t *words, uint32_t index, const RTRSphere *sphere)
@@ -680,12 +689,27 @@ void rtrScene(uint32_t *words)
 {
     words[RTR_SCENE_COUNT_WORD] = RTR_SCENE_SPHERE_COUNT;
 
-    RTRSphere spheres[RTR_SCENE_SPHERE_COUNT];
-    RTRBVHNode nodes[RTR_SCENE_BVH_MAX_NODES];
-    RTRPlacementGrid placementGrid;
+    RTRSphere *spheres =
+        (RTRSphere *)malloc(sizeof(*spheres) * (size_t)RTR_SCENE_SPHERE_COUNT);
+    RTRBVHNode *nodes =
+        (RTRBVHNode *)malloc(sizeof(*nodes) * (size_t)RTR_SCENE_BVH_MAX_NODES);
+    const uint32_t densePlacement =
+        (uint32_t)(RTR_SCENE_SPHERE_COUNT >= RTR_SCENE_DENSE_PLACEMENT_THRESHOLD);
+    RTRPlacementGrid *placementGrid = densePlacement ? NULL :
+        (RTRPlacementGrid *)malloc(sizeof(*placementGrid));
     uint32_t nodeCount = 0u;
 
-    rtrPlacementGridReset(&placementGrid);
+    if (!(spheres && nodes && (densePlacement || placementGrid))) {
+        free(spheres);
+        free(nodes);
+        free(placementGrid);
+        words[RTR_SCENE_COUNT_WORD] = 0u;
+        words[RTR_SCENE_BVH_NODE_COUNT_WORD] = 0u;
+        return;
+    }
+
+    if (!densePlacement)
+        rtrPlacementGridReset(placementGrid);
 
     for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
         const float h = rtrHash01(i * 747796405u + 0x165667b1u);
@@ -698,19 +722,24 @@ void rtrScene(uint32_t *words)
         };
     }
 
-    qsort(spheres, RTR_SCENE_SPHERE_COUNT, sizeof(spheres[0]), rtrCompareSphereByRadiusDesc);
+    if (densePlacement) {
+        for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++)
+            rtrPlaceDenseSphere(spheres + i, i);
+    } else {
+        qsort(spheres, RTR_SCENE_SPHERE_COUNT, sizeof(spheres[0]), rtrCompareSphereByRadiusDesc);
 
-    for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
-        uint32_t placed = rtrPlaceSphere(spheres, &placementGrid, i);
-        for (uint32_t shrink = 0u; !placed && shrink < 24u; shrink++) {
-            spheres[i].geom[3] *= 0.82f;
-            if (spheres[i].geom[3] < 0.001f)
-                spheres[i].geom[3] = 0.001f;
-            placed = rtrPlaceSphere(spheres, &placementGrid, i);
-        }
-        if (!placed) {
-            spheres[i].geom[3] = 0.0005f;
-            placed = rtrPlaceSphere(spheres, &placementGrid, i);
+        for (uint32_t i = 0u; i < RTR_SCENE_SPHERE_COUNT; i++) {
+            uint32_t placed = rtrPlaceSphere(spheres, placementGrid, i);
+            for (uint32_t shrink = 0u; !placed && shrink < 24u; shrink++) {
+                spheres[i].geom[3] *= 0.82f;
+                if (spheres[i].geom[3] < 0.001f)
+                    spheres[i].geom[3] = 0.001f;
+                placed = rtrPlaceSphere(spheres, placementGrid, i);
+            }
+            if (!placed) {
+                spheres[i].geom[3] = 0.0005f;
+                placed = rtrPlaceSphere(spheres, placementGrid, i);
+            }
         }
     }
 
@@ -730,4 +759,8 @@ void rtrScene(uint32_t *words)
     }
 
     rtrStoreBlueNoise(words);
+
+    free(spheres);
+    free(nodes);
+    free(placementGrid);
 }

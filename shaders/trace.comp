@@ -18,19 +18,18 @@ const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
 
-const uint RTR_MAX_SPHERES = 10000u;
+const uint RTR_MAX_SPHERES = 1000000u;
 const uint RTR_MAX_BVH_NODES = RTR_MAX_SPHERES * 2u - 1u;
 const uint RTR_WORKGROUP_SIZE = 64u;
 
 const uint RTR_SPHERE_GEOM_WORD = 24u;
 const uint RTR_SPHERE_WORDS = 1u;
 const uint RTR_BVH_NODE_WORD = RTR_SPHERE_GEOM_WORD + RTR_MAX_SPHERES * RTR_SPHERE_WORDS;
-const uint RTR_BVH_NODE_WORDS = 4u;
+const uint RTR_BVH_NODE_WORDS = 5u;
 const uint RTR_BLUE_NOISE_SIZE = 64u;
 const uint RTR_BLUE_NOISE_WORD =
     RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
 const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
-const uint RTR_PACKED_NODE_INTERNAL_FLAG = 0x80000000u;
 const int RTR_BVH_STACK_SIZE = 64;
 
 #ifndef RTR_RAY_BOUNCES
@@ -58,7 +57,7 @@ const float RTR_EPS = 0.001;
 const float RTR_FOCAL = 1.35;
 const float RTR_BOUNCE_ENERGY = 0.52;
 const float RTR_PLANE_Y = -1.0;
-const float RTR_SCENE_DISK_RADIUS = 2.60;
+const float RTR_SCENE_DISK_RADIUS = 26.0;
 const float RTR_MAX_SPHERE_RADIUS = 0.025;
 const float RTR_UNORM16_SCALE = 1.0 / 65535.0;
 const float RTR_UNORM12_SCALE = 1.0 / 4095.0;
@@ -182,11 +181,7 @@ vec3 rtrLoadBVHMin(uint i)
 
 uint rtrLoadBVHLeftFirst(uint i)
 {
-    uint meta = rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 3u);
-    if ((meta & RTR_PACKED_NODE_INTERNAL_FLAG) != 0u)
-        return meta & 0x7fffu;
-
-    return meta & 0x3fffu;
+    return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 3u);
 }
 
 vec3 rtrLoadBVHMax(uint i)
@@ -200,11 +195,7 @@ vec3 rtrLoadBVHMax(uint i)
 
 uint rtrLoadBVHCountRight(uint i)
 {
-    uint meta = rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 3u);
-    if ((meta & RTR_PACKED_NODE_INTERNAL_FLAG) != 0u)
-        return RTR_BVH_INTERNAL_FLAG | ((meta >> 15u) & 0x7fffu);
-
-    return (meta >> 14u) & 0x0fu;
+    return rtrLoadU32(RTR_BVH_NODE_WORD + i * RTR_BVH_NODE_WORDS + 4u);
 }
 
 vec2 rtrLoadBlueNoise(uvec2 coord, uint seed, int bounce)
