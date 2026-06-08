@@ -16,7 +16,8 @@
 #include "trace_direct_comp_spv.h"
 #include "trace_gi_comp_spv.h"
 #include "trace_gi_shadow_comp_spv.h"
-#include "trace_resolve_comp_spv.h"
+#include "trace_restir_temporal_comp_spv.h"
+#include "trace_restir_spatial_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
@@ -36,6 +37,7 @@
     (RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u)
 #define RTR_HISTORY_PIXEL_WORDS 7u
 #define RTR_RESTIR_PIXEL_WORDS 12u
+#define RTR_RESTIR_PAGE_COUNT 3u
 #define RTR_WAVE_PRIMARY_WORDS 15u
 #define RTR_WAVE_GI_SAMPLE_CAP 2u
 #define RTR_WAVE_GI_WORDS 15u
@@ -109,7 +111,8 @@ enum {
     RTR_PIPELINE_DIRECT,
     RTR_PIPELINE_GI,
     RTR_PIPELINE_GI_SHADOW,
-    RTR_PIPELINE_RESOLVE,
+    RTR_PIPELINE_RESTIR_TEMPORAL,
+    RTR_PIPELINE_RESTIR_SPATIAL,
     RTR_PIPELINE_COUNT,
 };
 
@@ -402,7 +405,7 @@ static int rtrCreateMemoryBuffer(void)
     const VkDeviceSize rtrRestirWords =
         rtrPixelCount *
         (VkDeviceSize)RTR_RESTIR_PIXEL_WORDS *
-        (VkDeviceSize)2u;
+        (VkDeviceSize)RTR_RESTIR_PAGE_COUNT;
     const VkDeviceSize rtrWavefrontWords =
         rtrPixelCount *
         ((VkDeviceSize)RTR_WAVE_PRIMARY_WORDS +
@@ -442,7 +445,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 12u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 15u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
@@ -927,14 +930,16 @@ int rtrVulkanInit(void *windowSurface)
         (const uint32_t *)(const void *)traceDirectCompSpv,
         (const uint32_t *)(const void *)traceGiCompSpv,
         (const uint32_t *)(const void *)traceGiShadowCompSpv,
-        (const uint32_t *)(const void *)traceResolveCompSpv,
+        (const uint32_t *)(const void *)traceRestirTemporalCompSpv,
+        (const uint32_t *)(const void *)traceRestirSpatialCompSpv,
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
         tracePrimaryCompSpv_len,
         traceDirectCompSpv_len,
         traceGiCompSpv_len,
         traceGiShadowCompSpv_len,
-        traceResolveCompSpv_len,
+        traceRestirTemporalCompSpv_len,
+        traceRestirSpatialCompSpv_len,
     };
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {

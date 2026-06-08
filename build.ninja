@@ -62,7 +62,7 @@ rule compdb
   description = COMPDB $out
 
 rule clean
-  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace_primary.comp.spv $build_dir/trace_direct.comp.spv $build_dir/trace_gi.comp.spv $build_dir/trace_gi_shadow.comp.spv $build_dir/trace_resolve.comp.spv $build_dir/trace_primary_comp_spv.h $build_dir/trace_direct_comp_spv.h $build_dir/trace_gi_comp_spv.h $build_dir/trace_gi_shadow_comp_spv.h $build_dir/trace_resolve_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $build_dir/correctness_check.o $build_dir/correctness_check $bin compile_commands.json
+  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace_primary.comp.spv $build_dir/trace_direct.comp.spv $build_dir/trace_gi.comp.spv $build_dir/trace_gi_shadow.comp.spv $build_dir/trace_restir_initial.comp.spv $build_dir/trace_restir_temporal.comp.spv $build_dir/trace_restir_spatial.comp.spv $build_dir/trace_resolve.comp.spv $build_dir/trace_primary_comp_spv.h $build_dir/trace_direct_comp_spv.h $build_dir/trace_gi_comp_spv.h $build_dir/trace_gi_shadow_comp_spv.h $build_dir/trace_restir_initial_comp_spv.h $build_dir/trace_restir_temporal_comp_spv.h $build_dir/trace_restir_spatial_comp_spv.h $build_dir/trace_resolve_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $build_dir/correctness_check.o $build_dir/correctness_check $bin compile_commands.json
   description = CLEAN
 
 build $build_dir/.dir: mkdir
@@ -74,8 +74,10 @@ build $build_dir/trace_gi.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
   stage = 2
 build $build_dir/trace_gi_shadow.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
   stage = 3
-build $build_dir/trace_resolve.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
-  stage = 4
+build $build_dir/trace_restir_temporal.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
+  stage = 5
+build $build_dir/trace_restir_spatial.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
+  stage = 6
 build $build_dir/trace_primary_comp_spv.h: xxd $build_dir/trace_primary.comp.spv || $build_dir/.dir
   name = tracePrimaryCompSpv
 build $build_dir/trace_direct_comp_spv.h: xxd $build_dir/trace_direct.comp.spv || $build_dir/.dir
@@ -84,10 +86,12 @@ build $build_dir/trace_gi_comp_spv.h: xxd $build_dir/trace_gi.comp.spv || $build
   name = traceGiCompSpv
 build $build_dir/trace_gi_shadow_comp_spv.h: xxd $build_dir/trace_gi_shadow.comp.spv || $build_dir/.dir
   name = traceGiShadowCompSpv
-build $build_dir/trace_resolve_comp_spv.h: xxd $build_dir/trace_resolve.comp.spv || $build_dir/.dir
-  name = traceResolveCompSpv
+build $build_dir/trace_restir_temporal_comp_spv.h: xxd $build_dir/trace_restir_temporal.comp.spv || $build_dir/.dir
+  name = traceRestirTemporalCompSpv
+build $build_dir/trace_restir_spatial_comp_spv.h: xxd $build_dir/trace_restir_spatial.comp.spv || $build_dir/.dir
+  name = traceRestirSpatialCompSpv
 build $build_dir/main.o: cc main.c || $build_dir/.dir
-build $build_dir/vulkan.o: cc vulkan.c | $build_dir/trace_primary_comp_spv.h $build_dir/trace_direct_comp_spv.h $build_dir/trace_gi_comp_spv.h $build_dir/trace_gi_shadow_comp_spv.h $build_dir/trace_resolve_comp_spv.h || $build_dir/.dir
+build $build_dir/vulkan.o: cc vulkan.c | $build_dir/trace_primary_comp_spv.h $build_dir/trace_direct_comp_spv.h $build_dir/trace_gi_comp_spv.h $build_dir/trace_gi_shadow_comp_spv.h $build_dir/trace_restir_temporal_comp_spv.h $build_dir/trace_restir_spatial_comp_spv.h || $build_dir/.dir
 build $build_dir/scene.o: cc scene.c || $build_dir/.dir
 build $build_dir/macos.o: objc macos.m || $build_dir/.dir
 build $build_dir/correctness_check.o: cc tools/correctness_check.c || $build_dir/.dir

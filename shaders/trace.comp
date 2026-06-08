@@ -50,6 +50,11 @@ const uint RTR_HISTORY_WORD =
     RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u;
 const uint RTR_HISTORY_PIXEL_WORDS = 7u;
 const uint RTR_RESTIR_PIXEL_WORDS = 12u;
+const uint RTR_RESTIR_PAGE_COUNT = 3u;
+const uint RTR_RESTIR_TEMPORAL_PAGE = 2u;
+const uint RTR_GI_SAMPLE_INVALID = 0u;
+const uint RTR_GI_SAMPLE_ENV = 1u;
+const uint RTR_GI_SAMPLE_SURFACE = 2u;
 const uint RTR_WAVE_PRIMARY_WORDS = 15u;
 const uint RTR_WAVE_GI_SAMPLE_CAP = 2u;
 const uint RTR_WAVE_GI_WORDS = 15u;
@@ -92,6 +97,7 @@ const float RTR_TEMPORAL_NORMAL_DOT = 0.9;
 const float RTR_TEMPORAL_DEPTH_REL = 0.025;
 const float RTR_TEMPORAL_DEPTH_ABS = 0.015;
 const float RTR_TEMPORAL_GI_ALPHA = 0.14;
+const float RTR_TEMPORAL_GI_MOTION_ALPHA = 0.35;
 const float RTR_TEMPORAL_GI_CLAMP_MIN = 0.08;
 const float RTR_TEMPORAL_GI_CLAMP_SCALE = 1.75;
 const float RTR_RESTIR_MIN_TARGET = 1.0e-5;
@@ -866,6 +872,8 @@ struct RTRPrimarySample {
 
 struct RTRGICandidate {
     bool valid;
+    uint kind;
+    vec3 samplePayload;
     vec3 dir;
     vec3 radiance;
     vec3 contribution;
@@ -878,6 +886,8 @@ struct RTRGICandidate {
 #if RTR_RESTIR_REUSE_ENABLED
 struct RTRGIReservoir {
     bool valid;
+    uint kind;
+    vec3 samplePayload;
     vec3 dir;
     vec3 radiance;
     vec3 contribution;
@@ -920,51 +930,23 @@ bool rtrTracePrimary(vec3 ro, vec3 rd, out RTRPrimarySample primary)
     return true;
 }
 
-vec3 rtrIncomingRadiance(vec3 p,
-                         vec3 n,
-                         vec3 wi,
-                         uvec2 coord,
-                         uint frameIndex,
-                         uint sampleIndex,
-                         inout uint rng)
-{
-    RTRHit hit = rtrTrace(p + n * (RTR_EPS * 8.0), wi);
-    if (hit.id == RTR_HIT_NONE)
-        return rtrSkyDiffuse(wi);
-
-    vec3 q = p + n * (RTR_EPS * 8.0) + wi * hit.t;
-    vec3 qn;
-    vec3 qAlbedo;
-    int qSkipId;
-    rtrSurface(hit, q, -wi, qn, qAlbedo, qSkipId);
-
-    return rtrDirectLightSample(q,
-                                qn,
-                                qAlbedo,
-                                qSkipId,
-                                coord,
-                                frameIndex,
-                                sampleIndex,
-                                40u,
-                                rng);
-}
-
 float rtrCandidateTarget(vec3 n, vec3 dir, vec3 contribution)
 {
-    float ndl = dot(n, dir);
-    if (ndl <= 0.0)
+    if (dot(n, dir) <= 0.0)
         return 0.0;
 
     float luminance = rtrLuminance(contribution);
     if (luminance <= RTR_RESTIR_MIN_TARGET)
         return 0.0;
 
-    return max(luminance * clamp(ndl * 4.0, 0.0, 1.0), RTR_RESTIR_MIN_TARGET);
+    return max(luminance, RTR_RESTIR_MIN_TARGET);
 }
 
 void rtrClearCandidate(out RTRGICandidate candidate)
 {
     candidate.valid = false;
+    candidate.kind = RTR_GI_SAMPLE_INVALID;
+    candidate.samplePayload = vec3(0.0);
     candidate.dir = vec3(0.0);
     candidate.radiance = vec3(0.0);
     candidate.contribution = vec3(0.0);
@@ -974,47 +956,12 @@ void rtrClearCandidate(out RTRGICandidate candidate)
     candidate.age = 0u;
 }
 
-void rtrMakeFreshGICandidate(RTRPrimarySample primary,
-                             uvec2 coord,
-                             uint frameIndex,
-                             uint sampleIndex,
-                             inout uint rng,
-                             out RTRGICandidate candidate)
-{
-    rtrClearCandidate(candidate);
-
-    vec3 dir = rtrBounceDirection(primary.point,
-                                  primary.normal,
-                                  frameIndex,
-                                  sampleIndex,
-                                  0,
-                                  rng);
-    vec3 radiance = rtrIncomingRadiance(primary.point,
-                                        primary.normal,
-                                        dir,
-                                        coord,
-                                        frameIndex,
-                                        sampleIndex,
-                                        rng);
-    vec3 contribution = primary.albedo * radiance;
-    float target = rtrCandidateTarget(primary.normal, dir, contribution);
-    if (target <= 0.0)
-        return;
-
-    candidate.valid = true;
-    candidate.dir = dir;
-    candidate.radiance = radiance;
-    candidate.contribution = contribution;
-    candidate.target = target;
-    candidate.weight = target;
-    candidate.m = 1.0;
-    candidate.age = 0u;
-}
-
 #if RTR_RESTIR_REUSE_ENABLED
 void rtrClearReservoir(out RTRGIReservoir reservoir)
 {
     reservoir.valid = false;
+    reservoir.kind = RTR_GI_SAMPLE_INVALID;
+    reservoir.samplePayload = vec3(0.0);
     reservoir.dir = vec3(0.0);
     reservoir.radiance = vec3(0.0);
     reservoir.contribution = vec3(0.0);
@@ -1036,6 +983,8 @@ void rtrUpdateReservoir(inout RTRGIReservoir reservoir,
     float newWeightSum = reservoir.weightSum + candidate.weight;
     if (!reservoir.valid ||
         rtrRandom01(rng) < candidate.weight / max(newWeightSum, RTR_RESTIR_MIN_TARGET)) {
+        reservoir.kind = candidate.kind;
+        reservoir.samplePayload = candidate.samplePayload;
         reservoir.dir = candidate.dir;
         reservoir.radiance = candidate.radiance;
         reservoir.contribution = candidate.contribution;
@@ -1064,9 +1013,71 @@ float rtrReservoirFinalWeight(RTRGIReservoir reservoir)
     return clamp(weight, 0.0, RTR_RESTIR_MAX_WEIGHT);
 }
 
+bool rtrEvaluateGIReservoirSample(RTRGIReservoir source,
+                                  RTRPrimarySample primary,
+                                  out RTRGICandidate candidate)
+{
+    rtrClearCandidate(candidate);
+    if (!primary.hit || !source.valid ||
+        (source.kind != RTR_GI_SAMPLE_ENV &&
+         source.kind != RTR_GI_SAMPLE_SURFACE)) {
+        return false;
+    }
+
+    vec3 dir = vec3(0.0);
+    vec3 radiance = source.radiance;
+
+    if (source.kind == RTR_GI_SAMPLE_ENV) {
+        float sampleLen2 = dot(source.samplePayload, source.samplePayload);
+        if (sampleLen2 <= 1.0e-8)
+            return false;
+        dir = source.samplePayload * inversesqrt(sampleLen2);
+    } else {
+        vec3 toSample = source.samplePayload - primary.point;
+        float dist2 = dot(toSample, toSample);
+        if (dist2 <= RTR_EPS * RTR_EPS)
+            return false;
+
+        float invDist = inversesqrt(dist2);
+        float dist = dist2 * invDist;
+        dir = toSample * invDist;
+        if (dot(primary.normal, dir) <= 0.0)
+            return false;
+
+        float visibility = rtrShadowRay(primary.point + primary.normal * (RTR_EPS * 8.0),
+                                        dir,
+                                        max(dist - RTR_EPS * 16.0, 0.0),
+                                        primary.skipId);
+        if (visibility <= 0.0)
+            return false;
+        radiance *= visibility;
+    }
+
+    vec3 contribution = primary.albedo * radiance;
+    float target = rtrCandidateTarget(primary.normal, dir, contribution);
+    if (target <= 0.0)
+        return false;
+
+    candidate.valid = true;
+    candidate.kind = source.kind;
+    candidate.samplePayload = source.samplePayload;
+    candidate.dir = dir;
+    candidate.radiance = radiance;
+    candidate.contribution = contribution;
+    candidate.target = target;
+    candidate.weight = target;
+    candidate.m = 1.0;
+    candidate.age = 0u;
+    return true;
+}
+
 bool rtrReservoirToCandidate(RTRGIReservoir source,
-                             vec3 n,
-                             vec3 albedo,
+                             RTRPrimarySample primary,
+                             uvec2 coord,
+                             uint frameIndex,
+                             uint sampleIndex,
+                             uint dimension,
+                             inout uint rng,
                              float weightCap,
                              out RTRGICandidate candidate)
 {
@@ -1077,23 +1088,45 @@ bool rtrReservoirToCandidate(RTRGIReservoir source,
         return false;
     }
 
-    vec3 contribution = albedo * source.radiance;
-    float target = rtrCandidateTarget(n, source.dir, contribution);
-    if (target <= 0.0)
+    if (!rtrEvaluateGIReservoirSample(source, primary, candidate)) {
         return false;
+    }
 
     float sourceWeight = source.weightSum / max(source.target, RTR_RESTIR_MIN_TARGET);
     sourceWeight = min(sourceWeight, weightCap);
-
-    candidate.valid = true;
-    candidate.dir = source.dir;
-    candidate.radiance = source.radiance;
-    candidate.contribution = contribution;
-    candidate.target = target;
-    candidate.weight = target * sourceWeight;
+    candidate.weight *= sourceWeight;
     candidate.m = min(source.m, RTR_RESTIR_MAX_M);
     candidate.age = min(source.age + 1u, 255u);
     return true;
+}
+
+bool rtrReservoirContribution(RTRGIReservoir reservoir,
+                              RTRPrimarySample primary,
+                              out vec3 contribution)
+{
+    contribution = vec3(0.0);
+    if (!primary.hit || !reservoir.valid ||
+        (reservoir.kind != RTR_GI_SAMPLE_ENV &&
+         reservoir.kind != RTR_GI_SAMPLE_SURFACE)) {
+        return false;
+    }
+
+    vec3 dir = vec3(0.0);
+    if (reservoir.kind == RTR_GI_SAMPLE_ENV) {
+        float sampleLen2 = dot(reservoir.samplePayload, reservoir.samplePayload);
+        if (sampleLen2 <= 1.0e-8)
+            return false;
+        dir = reservoir.samplePayload * inversesqrt(sampleLen2);
+    } else {
+        vec3 toSample = reservoir.samplePayload - primary.point;
+        float dist2 = dot(toSample, toSample);
+        if (dist2 <= RTR_EPS * RTR_EPS)
+            return false;
+        dir = toSample * inversesqrt(dist2);
+    }
+
+    contribution = primary.albedo * reservoir.radiance;
+    return rtrCandidateTarget(primary.normal, dir, contribution) > 0.0;
 }
 #endif
 
@@ -1245,17 +1278,20 @@ RTRGIReservoir rtrLoadGIReservoir(uvec2 p, uint width, uint height, uint page)
     rtrClearReservoir(reservoir);
 
     uint word = rtrRestirPixelWord(p, width, height, page);
-    uint valid = rtrLoadU32(word + 10u);
-    if (valid == 0u)
+    uint kind = rtrLoadU32(word + 10u);
+    if (kind != RTR_GI_SAMPLE_ENV && kind != RTR_GI_SAMPLE_SURFACE)
         return reservoir;
 
     reservoir.valid = true;
-    reservoir.dir = normalize(vec3(rtrLoadF32(word),
+    reservoir.kind = kind;
+    reservoir.samplePayload = vec3(rtrLoadF32(word),
                                    rtrLoadF32(word + 1u),
-                                   rtrLoadF32(word + 2u)));
+                                   rtrLoadF32(word + 2u));
+    reservoir.dir = kind == RTR_GI_SAMPLE_ENV ? reservoir.samplePayload : vec3(0.0);
     reservoir.radiance = max(vec3(rtrLoadF32(word + 3u),
                                   rtrLoadF32(word + 4u),
                                   rtrLoadF32(word + 5u)), vec3(0.0));
+    reservoir.contribution = vec3(0.0);
     reservoir.target = rtrLoadF32(word + 6u);
     reservoir.weightSum = rtrLoadF32(word + 7u);
     reservoir.m = rtrLoadF32(word + 8u);
@@ -1274,16 +1310,19 @@ void rtrStoreGIReservoir(uvec2 p,
                          RTRGIReservoir reservoir)
 {
     uint word = rtrRestirPixelWord(p, width, height, page);
-    if (!reservoir.valid || reservoir.target <= 0.0 ||
+    if (!reservoir.valid ||
+        (reservoir.kind != RTR_GI_SAMPLE_ENV &&
+         reservoir.kind != RTR_GI_SAMPLE_SURFACE) ||
+        reservoir.target <= 0.0 ||
         reservoir.weightSum <= 0.0 || reservoir.m <= 0.0) {
         for (uint i = 0u; i < RTR_RESTIR_PIXEL_WORDS; i++)
             rtrStoreU32(word + i, 0u);
         return;
     }
 
-    rtrStoreF32(word, reservoir.dir.x);
-    rtrStoreF32(word + 1u, reservoir.dir.y);
-    rtrStoreF32(word + 2u, reservoir.dir.z);
+    rtrStoreF32(word, reservoir.samplePayload.x);
+    rtrStoreF32(word + 1u, reservoir.samplePayload.y);
+    rtrStoreF32(word + 2u, reservoir.samplePayload.z);
     rtrStoreF32(word + 3u, reservoir.radiance.x);
     rtrStoreF32(word + 4u, reservoir.radiance.y);
     rtrStoreF32(word + 5u, reservoir.radiance.z);
@@ -1291,7 +1330,7 @@ void rtrStoreGIReservoir(uvec2 p,
     rtrStoreF32(word + 7u, reservoir.weightSum);
     rtrStoreF32(word + 8u, reservoir.m);
     rtrStoreU32(word + 9u, reservoir.age);
-    rtrStoreU32(word + 10u, 1u);
+    rtrStoreU32(word + 10u, reservoir.kind);
     rtrStoreF32(word + 11u, rtrReservoirFinalWeight(reservoir));
 }
 
@@ -1307,12 +1346,25 @@ ivec2 rtrSpatialOffset(uvec2 coord, uint frameIndex, int tap, inout uint rng)
 
     return offset;
 }
+
+bool rtrSpatialPrimaryAccepts(RTRPrimarySample center, RTRPrimarySample neighbor)
+{
+    if (!center.hit || !neighbor.hit)
+        return false;
+
+    if (dot(center.normal, neighbor.normal) < RTR_TEMPORAL_NORMAL_DOT)
+        return false;
+
+    float depthTolerance =
+        max(RTR_TEMPORAL_DEPTH_ABS * 4.0, center.depth * RTR_TEMPORAL_DEPTH_REL * 4.0);
+    return abs(center.depth - neighbor.depth) <= depthTolerance;
+}
 #endif
 
 struct RTRWaveGI {
     uint state;
     vec3 dir;
-    vec3 contribution;
+    vec3 radiance;
     vec3 shadowOrigin;
     vec3 shadowDir;
     float shadowMaxT;
@@ -1328,14 +1380,19 @@ bool rtrWaveGIToCandidate(RTRWaveGI gi,
     if (gi.state != 1u)
         return false;
 
-    float target = rtrCandidateTarget(primary.normal, gi.dir, gi.contribution);
+    uint kind = gi.shadowMaxT > 0.0 ? RTR_GI_SAMPLE_SURFACE : RTR_GI_SAMPLE_ENV;
+    vec3 samplePayload = kind == RTR_GI_SAMPLE_SURFACE ? gi.shadowOrigin : gi.dir;
+    vec3 contribution = primary.albedo * gi.radiance;
+    float target = rtrCandidateTarget(primary.normal, gi.dir, contribution);
     if (target <= 0.0)
         return false;
 
     candidate.valid = true;
+    candidate.kind = kind;
+    candidate.samplePayload = samplePayload;
     candidate.dir = gi.dir;
-    candidate.radiance = gi.contribution / max(primary.albedo, vec3(0.05));
-    candidate.contribution = gi.contribution;
+    candidate.radiance = gi.radiance;
+    candidate.contribution = contribution;
     candidate.target = target;
     candidate.weight = target;
     candidate.m = 1.0;
@@ -1350,7 +1407,7 @@ uint rtrWavefrontWord(uint width, uint height)
 
     return RTR_HISTORY_WORD +
         2u * pixelCount * RTR_HISTORY_PIXEL_WORDS +
-        2u * pixelCount * RTR_RESTIR_PIXEL_WORDS;
+        RTR_RESTIR_PAGE_COUNT * pixelCount * RTR_RESTIR_PIXEL_WORDS;
 }
 
 uint rtrWavePrimaryWord(uvec2 p, uint width, uint height)
@@ -1429,9 +1486,9 @@ void rtrStoreGI(uvec2 p,
     rtrStoreF32(word + 1u, gi.dir.x);
     rtrStoreF32(word + 2u, gi.dir.y);
     rtrStoreF32(word + 3u, gi.dir.z);
-    rtrStoreF32(word + 4u, gi.contribution.x);
-    rtrStoreF32(word + 5u, gi.contribution.y);
-    rtrStoreF32(word + 6u, gi.contribution.z);
+    rtrStoreF32(word + 4u, gi.radiance.x);
+    rtrStoreF32(word + 5u, gi.radiance.y);
+    rtrStoreF32(word + 6u, gi.radiance.z);
     rtrStoreF32(word + 7u, gi.shadowOrigin.x);
     rtrStoreF32(word + 8u, gi.shadowOrigin.y);
     rtrStoreF32(word + 9u, gi.shadowOrigin.z);
@@ -1451,9 +1508,9 @@ RTRWaveGI rtrLoadGI(uvec2 p, uint width, uint height, uint sampleIndex)
     gi.dir = vec3(rtrLoadF32(word + 1u),
                   rtrLoadF32(word + 2u),
                   rtrLoadF32(word + 3u));
-    gi.contribution = vec3(rtrLoadF32(word + 4u),
-                           rtrLoadF32(word + 5u),
-                           rtrLoadF32(word + 6u));
+    gi.radiance = vec3(rtrLoadF32(word + 4u),
+                       rtrLoadF32(word + 5u),
+                       rtrLoadF32(word + 6u));
     gi.shadowOrigin = vec3(rtrLoadF32(word + 7u),
                            rtrLoadF32(word + 8u),
                            rtrLoadF32(word + 9u));
@@ -1472,7 +1529,7 @@ RTRWaveGI rtrInvalidGI()
 
     gi.state = 0u;
     gi.dir = vec3(0.0);
-    gi.contribution = vec3(0.0);
+    gi.radiance = vec3(0.0);
     gi.shadowOrigin = vec3(0.0);
     gi.shadowDir = vec3(0.0, 1.0, 0.0);
     gi.shadowMaxT = 0.0;
@@ -1631,11 +1688,12 @@ void main()
                                   rng);
     RTRHit hit = rtrTrace(primary.point + primary.normal * (RTR_EPS * 8.0), dir);
     if (hit.id == RTR_HIT_NONE) {
-        vec3 contribution = primary.albedo * rtrSkyDiffuse(dir);
+        vec3 radiance = rtrSkyDiffuse(dir);
+        vec3 contribution = primary.albedo * radiance;
         if (rtrCandidateTarget(primary.normal, dir, contribution) > 0.0) {
             gi.state = 1u;
             gi.dir = dir;
-            gi.contribution = contribution;
+            gi.radiance = radiance;
         }
         rtrStoreGI(uvec2(p), width, height, sampleIndex, gi);
         return;
@@ -1668,7 +1726,7 @@ void main()
         if (rtrCandidateTarget(primary.normal, dir, contribution) > 0.0) {
             gi.state = 2u;
             gi.dir = dir;
-            gi.contribution = contribution;
+            gi.radiance = radiance;
             gi.shadowOrigin = offsetP + qn * (RTR_EPS * 4.0);
             gi.shadowDir = l;
             gi.shadowMaxT = lightDist2 * invLightDist - RTR_EPS * 4.0;
@@ -1707,10 +1765,10 @@ void main()
                                 gi.shadowMaxT,
                                 gi.shadowSkipId);
     gi.state = 1u;
-    gi.contribution *= shadow;
+    gi.radiance *= shadow;
     rtrStoreGI(uvec2(p), width, height, sampleIndex, gi);
 }
-#elif RTR_WAVEFRONT_STAGE == 4
+#elif RTR_WAVEFRONT_STAGE == 5
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -1728,59 +1786,30 @@ void main()
     uint width = uint(sz.x);
     uint height = uint(sz.y);
     uint frameIndex = rtrLoadU32(RTR_FRAME_WORD);
-    uint accumCount = rtrLoadU32(RTR_ACCUM_COUNT_WORD);
-    uint currentPage = frameIndex & 1u;
     uint previousPage = (frameIndex + 1u) & 1u;
+    RTRPrimarySample primary = rtrLoadPrimary(uvec2(p), width, height);
 #if RTR_RESTIR_REUSE_ENABLED
-    uint restirCurrentPage = currentPage;
-    uint restirPreviousPage = previousPage;
-    uint rng = rtrSeedPath(uvec2(p), frameIndex, 73u);
     RTRGIReservoir reservoir;
     RTRGICandidate candidate;
+    uint rng = rtrSeedPath(uvec2(p), frameIndex, 97u);
     rtrClearReservoir(reservoir);
-#endif
-    RTRPrimarySample primary = rtrLoadPrimary(uvec2(p), width, height);
 
     if (!primary.hit) {
-        rtrStoreHistoryPixel(uvec2(p),
-                             width,
-                             height,
-                             currentPage,
-                             0.0,
-                             vec3(0.0),
-                             vec3(0.0));
-#if RTR_RESTIR_REUSE_ENABLED
         RTRGIReservoir invalidReservoir;
         rtrClearReservoir(invalidReservoir);
         rtrStoreGIReservoir(uvec2(p), width, height,
-                            restirCurrentPage, invalidReservoir);
-#endif
-        imageStore(rtrOutImage, p, vec4(rtrTonemap(primary.color), 1.0));
+                            RTR_RESTIR_TEMPORAL_PAGE, invalidReservoir);
         return;
     }
 
-    vec3 freshIndirect = vec3(0.0);
-    float freshCount = 0.0;
-
     for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++) {
         RTRWaveGI gi = rtrLoadGI(uvec2(p), width, height, sampleIndex);
-        if (gi.state == 1u &&
-            rtrCandidateTarget(primary.normal, gi.dir, gi.contribution) > 0.0) {
-            freshIndirect += gi.contribution;
-            freshCount += 1.0;
-#if RTR_RESTIR_REUSE_ENABLED
+        if (gi.state == 1u) {
             if (rtrWaveGIToCandidate(gi, primary, candidate))
                 rtrUpdateReservoir(reservoir, candidate, rng);
-#endif
         }
     }
 
-    if (freshCount > 0.0)
-        freshIndirect /= freshCount;
-
-    vec3 indirect = freshCount > 0.0 ? freshIndirect : vec3(0.0);
-
-#if RTR_RESTIR_REUSE_ENABLED
     if (frameIndex > 0u) {
         float prevCameraYaw = rtrLoadF32(RTR_PREV_CAMERA_YAW_WORD);
         float prevCameraPitch = rtrLoadF32(RTR_PREV_CAMERA_PITCH_WORD);
@@ -1802,38 +1831,15 @@ void main()
                                   reprojectedDepth,
                                   primary.normal)) {
                 RTRGIReservoir previousReservoir =
-                    rtrLoadGIReservoir(historyP, width, height, restirPreviousPage);
+                    rtrLoadGIReservoir(historyP, width, height, previousPage);
                 if (rtrReservoirToCandidate(previousReservoir,
-                                            primary.normal,
-                                            primary.albedo,
+                                            primary,
+                                            uvec2(p),
+                                            frameIndex,
+                                            0u,
+                                            64u,
+                                            rng,
                                             RTR_RESTIR_TEMPORAL_WEIGHT_CAP,
-                                            candidate)) {
-                    rtrUpdateReservoir(reservoir, candidate, rng);
-                }
-            }
-
-            for (int tap = 0; tap < RTR_RESTIR_SPATIAL_TAPS; tap++) {
-                ivec2 q = ivec2(historyP) +
-                    rtrSpatialOffset(uvec2(p), frameIndex, tap, rng);
-                if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y)
-                    continue;
-
-                uvec2 neighborP = uvec2(q);
-                if (!rtrHistoryAccepts(neighborP,
-                                       width,
-                                       height,
-                                       previousPage,
-                                       reprojectedDepth,
-                                       primary.normal)) {
-                    continue;
-                }
-
-                RTRGIReservoir neighborReservoir =
-                    rtrLoadGIReservoir(neighborP, width, height, restirPreviousPage);
-                if (rtrReservoirToCandidate(neighborReservoir,
-                                            primary.normal,
-                                            primary.albedo,
-                                            RTR_RESTIR_SPATIAL_WEIGHT_CAP,
                                             candidate)) {
                     rtrUpdateReservoir(reservoir, candidate, rng);
                 }
@@ -1841,21 +1847,113 @@ void main()
         }
     }
 
-    vec3 restirIndirect = reservoir.valid ?
-        reservoir.contribution * rtrReservoirFinalWeight(reservoir) : vec3(0.0);
-    if (freshCount > 0.0) {
-        restirIndirect = clamp(restirIndirect,
-                               freshIndirect * RTR_RESTIR_CURRENT_CLAMP_MIN,
-                               freshIndirect * RTR_RESTIR_CURRENT_CLAMP_MAX +
-                                   vec3(RTR_TEMPORAL_GI_CLAMP_MIN));
-        indirect = mix(freshIndirect, restirIndirect, RTR_RESTIR_REUSE_BLEND);
-    } else {
-        indirect = restirIndirect;
-    }
-    rtrStoreGIReservoir(uvec2(p), width, height, restirCurrentPage, reservoir);
+    rtrStoreGIReservoir(uvec2(p), width, height,
+                        RTR_RESTIR_TEMPORAL_PAGE, reservoir);
 #endif
+}
+#elif RTR_WAVEFRONT_STAGE == 6
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(rtrOutImage);
+    vec2 szf = vec2(sz);
 
-    if (accumCount > 0u) {
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared(szf);
+
+    barrier();
+
+    if (any(greaterThanEqual(p, sz)))
+        return;
+
+    uint width = uint(sz.x);
+    uint height = uint(sz.y);
+    uint frameIndex = rtrLoadU32(RTR_FRAME_WORD);
+    uint accumCount = rtrLoadU32(RTR_ACCUM_COUNT_WORD);
+    uint currentPage = frameIndex & 1u;
+    uint previousPage = (frameIndex + 1u) & 1u;
+    RTRPrimarySample primary = rtrLoadPrimary(uvec2(p), width, height);
+#if RTR_RESTIR_REUSE_ENABLED
+    RTRGIReservoir reservoir =
+        rtrLoadGIReservoir(uvec2(p), width, height, RTR_RESTIR_TEMPORAL_PAGE);
+    RTRGICandidate candidate;
+    uint rng = rtrSeedPath(uvec2(p), frameIndex, 113u);
+
+    if (!primary.hit) {
+        RTRGIReservoir invalidReservoir;
+        rtrClearReservoir(invalidReservoir);
+        rtrStoreGIReservoir(uvec2(p), width, height,
+                            currentPage, invalidReservoir);
+        rtrStoreHistoryPixel(uvec2(p),
+                             width,
+                             height,
+                             currentPage,
+                             0.0,
+                             vec3(0.0),
+                             vec3(0.0));
+        imageStore(rtrOutImage, p, vec4(rtrTonemap(primary.color), 1.0));
+        return;
+    }
+
+    for (int tap = 0; tap < RTR_RESTIR_SPATIAL_TAPS; tap++) {
+        ivec2 q = ivec2(p) + rtrSpatialOffset(uvec2(p), frameIndex, tap, rng);
+        if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y)
+            continue;
+
+        uvec2 neighborP = uvec2(q);
+        RTRPrimarySample neighborPrimary = rtrLoadPrimary(neighborP, width, height);
+        if (!rtrSpatialPrimaryAccepts(primary, neighborPrimary))
+            continue;
+
+        RTRGIReservoir neighborReservoir =
+            rtrLoadGIReservoir(neighborP, width, height, RTR_RESTIR_TEMPORAL_PAGE);
+        if (rtrReservoirToCandidate(neighborReservoir,
+                                    primary,
+                                    uvec2(p),
+                                    frameIndex,
+                                    uint(tap + 1),
+                                    80u + uint(tap),
+                                    rng,
+                                    RTR_RESTIR_SPATIAL_WEIGHT_CAP,
+                                    candidate)) {
+            rtrUpdateReservoir(reservoir, candidate, rng);
+        }
+    }
+
+    rtrStoreGIReservoir(uvec2(p), width, height, currentPage, reservoir);
+
+    vec3 indirect = vec3(0.0);
+    vec3 freshIndirect = vec3(0.0);
+    float freshCount = 0.0;
+    for (uint sampleIndex = 0u; sampleIndex < shSampleCount; sampleIndex++) {
+        RTRWaveGI gi = rtrLoadGI(uvec2(p), width, height, sampleIndex);
+        vec3 contribution = primary.albedo * gi.radiance;
+        if (gi.state == 1u &&
+            rtrCandidateTarget(primary.normal, gi.dir, contribution) > 0.0) {
+            freshIndirect += contribution;
+            freshCount += 1.0;
+        }
+    }
+    if (freshCount > 0.0)
+        freshIndirect /= freshCount;
+
+    vec3 reservoirContribution;
+    bool reservoirUsable =
+        rtrReservoirContribution(reservoir, primary, reservoirContribution);
+    if (reservoirUsable)
+        indirect = reservoirContribution * rtrReservoirFinalWeight(reservoir);
+    if (freshCount > 0.0) {
+        if (reservoirUsable) {
+            indirect = clamp(indirect,
+                             freshIndirect * RTR_RESTIR_CURRENT_CLAMP_MIN,
+                             freshIndirect * RTR_RESTIR_CURRENT_CLAMP_MAX +
+                                 vec3(RTR_TEMPORAL_GI_CLAMP_MIN));
+        } else {
+            indirect = freshIndirect;
+        }
+    }
+
+    if (frameIndex > 0u) {
         float prevCameraYaw = rtrLoadF32(RTR_PREV_CAMERA_YAW_WORD);
         float prevCameraPitch = rtrLoadF32(RTR_PREV_CAMERA_PITCH_WORD);
         float prevCameraRadius = rtrLoadF32(RTR_PREV_CAMERA_RADIUS_WORD);
@@ -1878,7 +1976,9 @@ void main()
             vec3 historyIndirect = rtrClampTemporalGI(
                 rtrLoadHistoryIndirect(historyP, width, height, previousPage),
                 indirect);
-            float alpha = max(1.0 / float(accumCount + 1u), RTR_TEMPORAL_GI_ALPHA);
+            float alpha = accumCount > 0u ?
+                max(1.0 / float(accumCount + 1u), RTR_TEMPORAL_GI_ALPHA) :
+                RTR_TEMPORAL_GI_MOTION_ALPHA;
             indirect = mix(historyIndirect, indirect, alpha);
         }
     }
@@ -1893,5 +1993,6 @@ void main()
                          primary.normal,
                          indirect);
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+#endif
 }
 #endif
