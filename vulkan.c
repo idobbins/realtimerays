@@ -39,7 +39,7 @@
 #define RTR_RESTIR_PIXEL_WORDS 12u
 #define RTR_RESTIR_PAGE_COUNT 3u
 #define RTR_WAVE_PRIMARY_WORDS 15u
-#define RTR_WAVE_GI_SAMPLE_CAP 2u
+#define RTR_WAVE_GI_SAMPLE_CAP 3u
 #define RTR_WAVE_GI_WORDS 15u
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
@@ -445,7 +445,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 15u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 16u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);

@@ -5,15 +5,15 @@
 #include <math.h>
 
 #ifndef RTR_BVH_LEAF_SIZE
-#define RTR_BVH_LEAF_SIZE 4u
+#define RTR_BVH_LEAF_SIZE 2u
 #endif
 
 #ifndef RTR_BVH_BIN_COUNT
-#define RTR_BVH_BIN_COUNT 32u
+#define RTR_BVH_BIN_COUNT 8u
 #endif
 
-#ifndef RTR_SCENE_DRAGON_PATH
-#define RTR_SCENE_DRAGON_PATH "assets/dragon/dragon_recon/dragon_vrip.ply"
+#ifndef RTR_SCENE_MESH_PATH
+#define RTR_SCENE_MESH_PATH "assets/castles/castle6.ply"
 #endif
 
 #ifndef RTR_SCENE_HDRI_PATH
@@ -26,7 +26,7 @@
 
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
 #define RTR_SCENE_PLANE_Y -1.0f
-#define RTR_SCENE_DRAGON_HEIGHT 1.75f
+#define RTR_SCENE_MESH_HEIGHT 1.75f
 #define RTR_SCENE_BOUNDS_EPS 0.0001f
 #define RTR_SCENE_BLUE_NOISE_SIZE 64u
 #define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
@@ -584,7 +584,7 @@ static int rtrReadLine(FILE *file, char *line, size_t lineSize)
     return fgets(line, (int)lineSize, file) != NULL;
 }
 
-static int rtrParseDragonHeader(FILE *file, uint32_t *vertexCount, uint32_t *faceCount)
+static int rtrParsePlyHeader(FILE *file, uint32_t *vertexCount, uint32_t *faceCount)
 {
     char line[256];
 
@@ -614,9 +614,9 @@ static int rtrParseDragonHeader(FILE *file, uint32_t *vertexCount, uint32_t *fac
     return 1;
 }
 
-static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTriangleCount)
+static int rtrLoadMeshTriangles(RTRTriangle **outTriangles, uint32_t *outTriangleCount)
 {
-    FILE *file = fopen(RTR_SCENE_DRAGON_PATH, "r");
+    FILE *file = fopen(RTR_SCENE_MESH_PATH, "r");
     uint32_t vertexCount = 0u;
     uint32_t faceCount = 0u;
     RTRVec3 *vertices = NULL;
@@ -630,19 +630,19 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
     *outTriangleCount = 0u;
 
     if (!file) {
-        fprintf(stderr, "scene: failed to open %s\n", RTR_SCENE_DRAGON_PATH);
+        fprintf(stderr, "scene: failed to open %s\n", RTR_SCENE_MESH_PATH);
         return 1;
     }
 
-    if (rtrParseDragonHeader(file, &vertexCount, &faceCount)) {
-        fprintf(stderr, "scene: failed to parse dragon PLY header\n");
+    if (rtrParsePlyHeader(file, &vertexCount, &faceCount)) {
+        fprintf(stderr, "scene: failed to parse mesh PLY header\n");
         fclose(file);
         return 1;
     }
 
     if (faceCount > RTR_SCENE_TRIANGLE_CAPACITY) {
         fprintf(stderr,
-                "scene: dragon has %u faces but capacity is %u\n",
+                "scene: mesh has %u faces but capacity is %u\n",
                 faceCount,
                 (uint32_t)RTR_SCENE_TRIANGLE_CAPACITY);
         fclose(file);
@@ -652,7 +652,7 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
     vertices = (RTRVec3 *)malloc(sizeof(*vertices) * (size_t)vertexCount);
     triangles = (RTRTriangle *)malloc(sizeof(*triangles) * (size_t)faceCount);
     if (!(vertices && triangles)) {
-        fprintf(stderr, "scene: dragon allocation failed\n");
+        fprintf(stderr, "scene: mesh allocation failed\n");
         free(vertices);
         free(triangles);
         fclose(file);
@@ -664,7 +664,7 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
         RTRVec3 v;
         if (!rtrReadLine(file, line, sizeof(line)) ||
             sscanf(line, "%f %f %f", &v.x, &v.y, &v.z) != 3) {
-            fprintf(stderr, "scene: failed to read dragon vertex %u\n", i);
+            fprintf(stderr, "scene: failed to read mesh vertex %u\n", i);
             free(vertices);
             free(triangles);
             fclose(file);
@@ -679,7 +679,7 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
         const float centerX = (sourceMin[0] + sourceMax[0]) * 0.5f;
         const float centerZ = (sourceMin[2] + sourceMax[2]) * 0.5f;
         const float height = sourceMax[1] - sourceMin[1];
-        const float scale = height > 0.0f ? RTR_SCENE_DRAGON_HEIGHT / height : 1.0f;
+        const float scale = height > 0.0f ? RTR_SCENE_MESH_HEIGHT / height : 1.0f;
 
         for (uint32_t i = 0u; i < vertexCount; i++) {
             vertices[i].x = (vertices[i].x - centerX) * scale;
@@ -696,7 +696,7 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
 
         if (!rtrReadLine(file, line, sizeof(line)) ||
             sscanf(line, "%u %u %u %u", &corners, &i0, &i1, &i2) != 4) {
-            fprintf(stderr, "scene: failed to read dragon face %u\n", face);
+            fprintf(stderr, "scene: failed to read mesh face %u\n", face);
             free(vertices);
             free(triangles);
             fclose(file);
@@ -705,7 +705,7 @@ static int rtrLoadDragonTriangles(RTRTriangle **outTriangles, uint32_t *outTrian
 
         if (corners != 3u ||
             i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
-            fprintf(stderr, "scene: invalid dragon face %u\n", face);
+            fprintf(stderr, "scene: invalid mesh face %u\n", face);
             free(vertices);
             free(triangles);
             fclose(file);
@@ -807,7 +807,7 @@ void rtrScene(uint32_t *words)
     words[RTR_SCENE_COUNT_WORD] = 0u;
     words[RTR_SCENE_BVH_NODE_COUNT_WORD] = 0u;
 
-    if (rtrLoadDragonTriangles(&triangles, &triangleCount) || triangleCount == 0u) {
+    if (rtrLoadMeshTriangles(&triangles, &triangleCount) || triangleCount == 0u) {
         rtrStoreBlueNoise(words);
         rtrStoreEnvironment(words);
         free(triangles);
