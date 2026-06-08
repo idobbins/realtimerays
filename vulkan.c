@@ -12,11 +12,17 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef RTR_RESTIR_MODE
+#define RTR_RESTIR_MODE 1
+#endif
+
 #include "trace_primary_comp_spv.h"
 #include "trace_direct_comp_spv.h"
 #include "trace_gi_comp_spv.h"
 #include "trace_gi_shadow_comp_spv.h"
+#if RTR_RESTIR_MODE > 0
 #include "trace_restir_temporal_comp_spv.h"
+#endif
 #include "trace_restir_spatial_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
@@ -37,7 +43,11 @@
     (RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u)
 #define RTR_HISTORY_PIXEL_WORDS 7u
 #define RTR_RESTIR_PIXEL_WORDS 12u
+#if RTR_RESTIR_MODE > 0
 #define RTR_RESTIR_PAGE_COUNT 3u
+#else
+#define RTR_RESTIR_PAGE_COUNT 0u
+#endif
 #define RTR_WAVE_PRIMARY_WORDS 15u
 #define RTR_WAVE_GI_SAMPLE_CAP 3u
 #define RTR_WAVE_GI_WORDS 15u
@@ -111,7 +121,9 @@ enum {
     RTR_PIPELINE_DIRECT,
     RTR_PIPELINE_GI,
     RTR_PIPELINE_GI_SHADOW,
+#if RTR_RESTIR_MODE > 0
     RTR_PIPELINE_RESTIR_TEMPORAL,
+#endif
     RTR_PIPELINE_RESTIR_SPATIAL,
     RTR_PIPELINE_COUNT,
 };
@@ -445,7 +457,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 16u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 17u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
@@ -930,7 +942,9 @@ int rtrVulkanInit(void *windowSurface)
         (const uint32_t *)(const void *)traceDirectCompSpv,
         (const uint32_t *)(const void *)traceGiCompSpv,
         (const uint32_t *)(const void *)traceGiShadowCompSpv,
+#if RTR_RESTIR_MODE > 0
         (const uint32_t *)(const void *)traceRestirTemporalCompSpv,
+#endif
         (const uint32_t *)(const void *)traceRestirSpatialCompSpv,
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
@@ -938,7 +952,9 @@ int rtrVulkanInit(void *windowSurface)
         traceDirectCompSpv_len,
         traceGiCompSpv_len,
         traceGiShadowCompSpv_len,
+#if RTR_RESTIR_MODE > 0
         traceRestirTemporalCompSpv_len,
+#endif
         traceRestirSpatialCompSpv_len,
     };
 
