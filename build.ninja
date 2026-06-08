@@ -5,8 +5,9 @@ builddir = $build_dir
 bin = $build_dir/realtimerays
 
 restir_mode = 0
+simple_render = 1
 cc = cc
-cflags = -std=c99 -Wall -Wextra -pedantic -O2 -DRTR_RESTIR_MODE=$restir_mode
+cflags = -std=c99 -Wall -Wextra -pedantic -O2 -DRTR_RESTIR_MODE=$restir_mode -DRTR_SIMPLE_RENDER=$simple_render
 vulkan_cflags = -I/usr/local/include
 ldflags = -framework AppKit -framework QuartzCore -L/usr/local/lib -Wl,-rpath,/usr/local/lib -lvulkan
 glslc = glslc
@@ -16,7 +17,7 @@ rule mkdir
   description = MKDIR $build_dir
 
 rule glslc
-  command = $glslc -DRTR_WAVEFRONT_STAGE=$stage -DRTR_RESTIR_MODE=$restir_mode $in -o $out
+  command = $glslc -DRTR_WAVEFRONT_STAGE=$stage -DRTR_RESTIR_MODE=$restir_mode -DRTR_SIMPLE_RENDER=$simple_render $in -o $out
   description = GLSLC $in
 
 rule xxd

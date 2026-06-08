@@ -12,6 +12,10 @@ layout(std430, binding = 1) buffer RTRMemory {
 #define RTR_RESTIR_MODE 1
 #endif
 
+#ifndef RTR_SIMPLE_RENDER
+#define RTR_SIMPLE_RENDER 1
+#endif
+
 const uint RTR_MOUSE_X_WORD = 5u;
 const uint RTR_MOUSE_Y_WORD = 6u;
 const uint RTR_TIME_WORD = 7u;
@@ -67,6 +71,7 @@ const uint RTR_GI_SAMPLE_SURFACE = 2u;
 const uint RTR_WAVE_PRIMARY_WORDS = 15u;
 const uint RTR_WAVE_GI_SAMPLE_CAP = 3u;
 const uint RTR_WAVE_GI_WORDS = 15u;
+const uint RTR_SIMPLE_PIXEL_WORDS = 15u;
 const uint RTR_BVH_INTERNAL_FLAG = 0x80000000u;
 const int RTR_BVH_STACK_SIZE = 64;
 
@@ -132,12 +137,13 @@ const int RTR_RESTIR_SPATIAL_TAPS = 2;
 #else
 const int RTR_RESTIR_SPATIAL_TAPS = 0;
 #endif
-const float RTR_PLANE_Y = -1.0;
-const float RTR_SCENE_DISK_RADIUS = 26.0;
+const float RTR_FLOOR_Y = -1.0;
+const float RTR_FLOOR_HALF_EXTENT = 26.0;
 const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
 
 const int RTR_HIT_NONE = -1;
-const int RTR_HIT_PLANE = -2;
+const int RTR_HIT_FLOOR_0 = -2;
+const int RTR_HIT_FLOOR_1 = -3;
 
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
@@ -308,11 +314,26 @@ RTRTriangle rtrLoadTriangle(uint i)
     return tri;
 }
 
+vec3 rtrFloorAlbedo(vec3 p)
+{
+    ivec2 cell = ivec2(floor(p.xz));
+    float check = float((cell.x ^ cell.y) & 1);
+    vec2 cellUv = fract(p.xz);
+    float edge = min(min(cellUv.x, 1.0 - cellUv.x),
+                     min(cellUv.y, 1.0 - cellUv.y));
+    float grout = 1.0 - smoothstep(0.012, 0.04, edge);
+    vec3 dark = vec3(0.42, 0.44, 0.42);
+    vec3 light = vec3(0.62, 0.64, 0.60);
+    vec3 base = mix(dark, light, check);
+
+    return base * (1.0 - grout * 0.18);
+}
+
 vec3 rtrTriangleAlbedo(uint i, vec3 p, vec3 n)
 {
     float h = float(rtrHashU32(i * 2246822519u + 3266489917u) & 0xffffu) /
               65535.0;
-    float height = clamp((p.y - RTR_PLANE_Y) * 0.55, 0.0, 1.0);
+    float height = clamp((p.y - RTR_FLOOR_Y) * 0.55, 0.0, 1.0);
     float top = max(n.y, 0.0);
     vec3 stone = mix(vec3(0.28, 0.29, 0.36), vec3(0.48, 0.49, 0.56), height);
     vec3 cap = vec3(0.62, 0.59, 0.50);
@@ -523,6 +544,42 @@ vec3 rtrTriangleNormal(RTRTriangle tri)
     return len2 > 1.0e-20 ? n * inversesqrt(len2) : vec3(0.0, 1.0, 0.0);
 }
 
+RTRTriangle rtrFloorTriangle(uint i)
+{
+    float r = RTR_FLOOR_HALF_EXTENT;
+    float y = RTR_FLOOR_Y;
+    vec3 v00 = vec3(-r, y, -r);
+    vec3 v01 = vec3(-r, y,  r);
+    vec3 v10 = vec3( r, y, -r);
+    vec3 v11 = vec3( r, y,  r);
+    RTRTriangle tri;
+
+    if (i == 0u) {
+        tri.v0 = v00;
+        tri.v1 = v01;
+        tri.v2 = v10;
+    } else {
+        tri.v0 = v01;
+        tri.v1 = v11;
+        tri.v2 = v10;
+    }
+
+    return tri;
+}
+
+void rtrTraceFloorMesh(vec3 ro, vec3 rd, inout RTRHit hit)
+{
+    for (uint i = 0u; i < 2u; i++) {
+        float t;
+        RTRTriangle tri = rtrFloorTriangle(i);
+        if (rtrTriangleHit(ro, rd, tri, hit.t, t)) {
+            hit.t = t;
+            hit.id = i == 0u ? RTR_HIT_FLOOR_0 : RTR_HIT_FLOOR_1;
+            hit.normal = rtrTriangleNormal(tri);
+        }
+    }
+}
+
 void rtrTraceTriangle(vec3 ro,
                       vec3 rd,
                       uint i,
@@ -556,13 +613,7 @@ RTRHit rtrTrace(vec3 ro, vec3 rd)
     hit.normal = vec3(0.0, 1.0, 0.0);
     vec3 invRd = rtrSafeInvDir(rd);
 
-    if (rd.y < -0.00001) {
-        float t = (RTR_PLANE_Y - ro.y) / rd.y;
-        if (t > RTR_EPS) {
-            hit.t = t;
-            hit.id = RTR_HIT_PLANE;
-        }
-    }
+    rtrTraceFloorMesh(ro, rd, hit);
 
     if (shBVHNodeCount == 0u || !rtrSceneBoxHit(ro, invRd, hit.t))
         return hit;
@@ -737,20 +788,20 @@ void rtrSurface(RTRHit hit,
 {
     skipId = RTR_HIT_NONE;
 
-    if (hit.id == RTR_HIT_PLANE) {
+    if (hit.id == RTR_HIT_FLOOR_0 || hit.id == RTR_HIT_FLOOR_1) {
         n = vec3(0.0, 1.0, 0.0);
-
-        ivec2 cell = ivec2(floor(p.xz));
-        float check = float((cell.x ^ cell.y) & 1);
-
-        albedo = vec3(0.52, 0.54, 0.49) * mix(0.78, 1.0, check);
-    } else {
-        uint id = uint(hit.id);
-
-        n = hit.normal;
-        albedo = rtrTriangleAlbedo(id, p, n);
+        albedo = rtrFloorAlbedo(p);
         skipId = hit.id;
+        if (dot(n, rd) > 0.0)
+            n = -n;
+        return;
     }
+
+    uint id = uint(hit.id);
+
+    n = hit.normal;
+    albedo = rtrTriangleAlbedo(id, p, n);
+    skipId = hit.id;
 
     if (dot(n, rd) > 0.0)
         n = -n;
@@ -1560,6 +1611,205 @@ RTRWaveGI rtrInvalidGI()
     return gi;
 }
 
+struct RTRSimplePixel {
+    bool hit;
+    float depth;
+    vec3 normal;
+    vec3 albedo;
+    vec3 direct;
+    vec3 indirect;
+    float variance;
+};
+
+uint rtrSimplePixelWord(uvec2 p, uint width)
+{
+    return RTR_HISTORY_WORD +
+        rtrPixelIndex(p, width) * RTR_SIMPLE_PIXEL_WORDS;
+}
+
+RTRSimplePixel rtrClearSimplePixel()
+{
+    RTRSimplePixel pixel;
+
+    pixel.hit = false;
+    pixel.depth = 0.0;
+    pixel.normal = vec3(0.0, 1.0, 0.0);
+    pixel.albedo = vec3(0.0);
+    pixel.direct = vec3(0.0);
+    pixel.indirect = vec3(0.0);
+    pixel.variance = 0.0;
+
+    return pixel;
+}
+
+void rtrStoreSimplePixel(uvec2 p, uint width, RTRSimplePixel pixel)
+{
+    uint word = rtrSimplePixelWord(p, width);
+
+    rtrStoreU32(word, pixel.hit ? 1u : 0u);
+    rtrStoreF32(word + 1u, pixel.depth);
+    rtrStoreF32(word + 2u, pixel.normal.x);
+    rtrStoreF32(word + 3u, pixel.normal.y);
+    rtrStoreF32(word + 4u, pixel.normal.z);
+    rtrStoreF32(word + 5u, pixel.albedo.x);
+    rtrStoreF32(word + 6u, pixel.albedo.y);
+    rtrStoreF32(word + 7u, pixel.albedo.z);
+    rtrStoreF32(word + 8u, pixel.direct.x);
+    rtrStoreF32(word + 9u, pixel.direct.y);
+    rtrStoreF32(word + 10u, pixel.direct.z);
+    rtrStoreF32(word + 11u, pixel.indirect.x);
+    rtrStoreF32(word + 12u, pixel.indirect.y);
+    rtrStoreF32(word + 13u, pixel.indirect.z);
+    rtrStoreF32(word + 14u, pixel.variance);
+}
+
+RTRSimplePixel rtrLoadSimplePixel(uvec2 p, uint width)
+{
+    uint word = rtrSimplePixelWord(p, width);
+    RTRSimplePixel pixel;
+
+    pixel.hit = rtrLoadU32(word) != 0u;
+    pixel.depth = rtrLoadF32(word + 1u);
+    pixel.normal = vec3(rtrLoadF32(word + 2u),
+                        rtrLoadF32(word + 3u),
+                        rtrLoadF32(word + 4u));
+    pixel.albedo = vec3(rtrLoadF32(word + 5u),
+                        rtrLoadF32(word + 6u),
+                        rtrLoadF32(word + 7u));
+    pixel.direct = vec3(rtrLoadF32(word + 8u),
+                        rtrLoadF32(word + 9u),
+                        rtrLoadF32(word + 10u));
+    pixel.indirect = vec3(rtrLoadF32(word + 11u),
+                          rtrLoadF32(word + 12u),
+                          rtrLoadF32(word + 13u));
+    pixel.variance = rtrLoadF32(word + 14u);
+
+    return pixel;
+}
+
+vec3 rtrPathTraceGISample(RTRPrimarySample primary,
+                          uvec2 coord,
+                          uint frameIndex,
+                          uint sampleIndex,
+                          inout uint rng)
+{
+    vec3 dir = rtrBounceDirection(primary.point,
+                                  primary.normal,
+                                  frameIndex,
+                                  sampleIndex,
+                                  0,
+                                  rng);
+    RTRHit hit = rtrTrace(primary.point + primary.normal * (RTR_EPS * 8.0), dir);
+    if (hit.id == RTR_HIT_NONE)
+        return primary.albedo * rtrSkyDiffuse(dir);
+
+    vec3 q = primary.point + primary.normal * (RTR_EPS * 8.0) + dir * hit.t;
+    vec3 qn;
+    vec3 qAlbedo;
+    int qSkipId;
+    rtrSurface(hit, q, -dir, qn, qAlbedo, qSkipId);
+
+    vec3 radiance = rtrDirectLightSample(q,
+                                         qn,
+                                         qAlbedo,
+                                         qSkipId,
+                                         coord,
+                                         frameIndex,
+                                         sampleIndex,
+                                         40u,
+                                         rng);
+    return primary.albedo * radiance;
+}
+
+float rtrAtrousKernel1D(int offset)
+{
+    int a = abs(offset);
+
+    if (a == 0)
+        return 0.375;
+    if (a == 1)
+        return 0.25;
+    return 0.0625;
+}
+
+void rtrAccumulateSimpleDenoise(RTRSimplePixel center,
+                                uvec2 centerP,
+                                uint width,
+                                ivec2 sz,
+                                int stride,
+                                int radius,
+                                float passWeight,
+                                inout vec3 directSum,
+                                inout vec3 indirectSum,
+                                inout float weightSum)
+{
+    float centerLum = rtrLuminance(center.indirect);
+    float centerStddev = sqrt(max(center.variance, 0.0));
+    float depthTolerance =
+        max(RTR_TEMPORAL_DEPTH_ABS * (8.0 + float(stride) * 2.0),
+            center.depth * RTR_TEMPORAL_DEPTH_REL *
+                (8.0 + float(stride) * 2.0));
+    float lumaTolerance =
+        max(0.18, centerLum * 1.8 + centerStddev * 5.0 + 0.08);
+
+    for (int dy = -2; dy <= 2; dy++) {
+        if (abs(dy) > radius)
+            continue;
+
+        for (int dx = -2; dx <= 2; dx++) {
+            if (abs(dx) > radius)
+                continue;
+
+            ivec2 q = ivec2(centerP) + ivec2(dx * stride, dy * stride);
+            if (q.x < 0 || q.y < 0 || q.x >= sz.x || q.y >= sz.y)
+                continue;
+
+            RTRSimplePixel neighbor = rtrLoadSimplePixel(uvec2(q), width);
+            if (!neighbor.hit)
+                continue;
+
+            float normalDot = dot(center.normal, neighbor.normal);
+            if (normalDot < 0.72)
+                continue;
+
+            float depthDelta = abs(neighbor.depth - center.depth);
+            if (depthDelta > depthTolerance)
+                continue;
+
+            vec3 albedoDelta = neighbor.albedo - center.albedo;
+            float neighborLum = rtrLuminance(neighbor.indirect);
+            float lumaDelta = abs(neighborLum - centerLum);
+            bool isCenter = dx == 0 && dy == 0;
+
+            float kernelWeight =
+                rtrAtrousKernel1D(dx) * rtrAtrousKernel1D(dy);
+            float normalWeight = smoothstep(0.72, 1.0, normalDot);
+            float depthWeight =
+                1.0 - smoothstep(depthTolerance * 0.2,
+                                  depthTolerance,
+                                  depthDelta);
+            float albedoWeight =
+                1.0 / (1.0 + dot(albedoDelta, albedoDelta) * 16.0);
+            float lumaWeight =
+                1.0 / (1.0 + (lumaDelta * lumaDelta) /
+                       max(lumaTolerance * lumaTolerance, 1.0e-5));
+            float varianceWeight = isCenter ? 1.0 :
+                1.0 / (1.0 + sqrt(max(neighbor.variance, 0.0)) * 0.35);
+            float weight = passWeight *
+                           kernelWeight *
+                           normalWeight *
+                           max(depthWeight, 0.02) *
+                           albedoWeight *
+                           lumaWeight *
+                           varianceWeight;
+
+            directSum += neighbor.direct * weight;
+            indirectSum += neighbor.indirect * weight;
+            weightSum += weight;
+        }
+    }
+}
+
 void rtrInitShared(vec2 szf)
 {
     shTriangleCount = min(rtrLoadU32(RTR_TRIANGLE_COUNT_WORD), RTR_MAX_TRIANGLES);
@@ -1603,6 +1853,132 @@ void rtrInitShared(vec2 szf)
     shRayDy = up * (-2.0 * invH);
 }
 
+#if RTR_SIMPLE_RENDER
+#if RTR_WAVEFRONT_STAGE == 0
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(rtrOutImage);
+    vec2 szf = vec2(sz);
+
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared(szf);
+
+    barrier();
+
+    if (any(greaterThanEqual(p, sz)))
+        return;
+
+    uint width = uint(sz.x);
+    uint frameIndex = rtrLoadU32(RTR_FRAME_WORD);
+    uvec2 coord = uvec2(p);
+    uint rng = rtrSeedPath(coord, frameIndex, 0u);
+    vec2 jitter = rtrPrimaryJitter(coord, frameIndex, 0u, rng);
+    vec3 ray = shRayBase +
+               shRayDx * (float(p.x) + jitter.x - 0.5) +
+               shRayDy * (float(p.y) + jitter.y - 0.5);
+    vec3 rd = ray * inversesqrt(dot(ray, ray));
+
+    RTRPrimarySample primary;
+    rtrTracePrimary(shRo, rd, primary);
+
+    RTRSimplePixel pixel = rtrClearSimplePixel();
+    pixel.hit = primary.hit;
+    if (!primary.hit) {
+        pixel.direct = primary.color;
+        rtrStoreSimplePixel(coord, width, pixel);
+        return;
+    }
+
+    pixel.depth = primary.depth;
+    pixel.normal = primary.normal;
+    pixel.albedo = primary.albedo;
+    pixel.direct = rtrDirectLight(primary.point,
+                                  primary.normal,
+                                  primary.albedo,
+                                  primary.skipId,
+                                  coord,
+                                  frameIndex,
+                                  RTR_PRIMARY_DIRECT_LIGHT_SAMPLES,
+                                  16u,
+                                  rng);
+
+    uint count = max(shSampleCount, 1u);
+    float lumaSum = 0.0;
+    float lumaSqSum = 0.0;
+    for (uint sampleIndex = 0u; sampleIndex < count; sampleIndex++) {
+        uint sampleRng = rtrSeedPath(coord, frameIndex, sampleIndex + 1u);
+        vec3 sampleIndirect = rtrPathTraceGISample(primary,
+                                                   coord,
+                                                   frameIndex,
+                                                   sampleIndex,
+                                                   sampleRng);
+        float sampleLuma = rtrLuminance(sampleIndirect);
+        pixel.indirect += sampleIndirect;
+        lumaSum += sampleLuma;
+        lumaSqSum += sampleLuma * sampleLuma;
+    }
+    pixel.indirect /= float(count);
+    float meanLuma = lumaSum / float(count);
+    pixel.variance = max(lumaSqSum / float(count) - meanLuma * meanLuma, 0.0);
+
+    rtrStoreSimplePixel(coord, width, pixel);
+}
+#elif RTR_WAVEFRONT_STAGE == 1
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(rtrOutImage);
+
+    if (any(greaterThanEqual(p, sz)))
+        return;
+
+    uint width = uint(sz.x);
+    RTRSimplePixel center = rtrLoadSimplePixel(uvec2(p), width);
+
+    if (!center.hit) {
+        imageStore(rtrOutImage, p, vec4(rtrTonemap(center.direct), 1.0));
+        return;
+    }
+
+    float centerLum = rtrLuminance(center.indirect);
+    float centerStddev = sqrt(max(center.variance, 0.0));
+    float varianceStrength =
+        clamp(centerStddev / (centerLum + 0.08), 0.0, 1.0);
+    vec3 directSum = vec3(0.0);
+    vec3 indirectSum = vec3(0.0);
+    float weightSum = 0.0;
+
+    rtrAccumulateSimpleDenoise(center,
+                               uvec2(p),
+                               width,
+                               sz,
+                               1,
+                               1,
+                               1.0,
+                               directSum,
+                               indirectSum,
+                               weightSum);
+    vec3 denoisedDirect = weightSum > 0.0 ?
+        directSum / weightSum :
+        center.direct;
+    vec3 denoisedIndirect = weightSum > 0.0 ?
+        indirectSum / weightSum :
+        center.indirect;
+    float directBlend = clamp(0.32 + varianceStrength * 0.2, 0.32, 0.52);
+    float denoiseBlend = clamp(0.78 + varianceStrength * 0.2, 0.78, 0.98);
+    vec3 direct = mix(center.direct, denoisedDirect, directBlend);
+    vec3 indirect = mix(center.indirect, denoisedIndirect, denoiseBlend);
+    vec3 color = direct + indirect;
+
+    imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+}
+#else
+void main()
+{
+}
+#endif
+#else
 #if RTR_WAVEFRONT_STAGE == 0
 void main()
 {
@@ -2022,4 +2398,5 @@ void main()
                          indirect);
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }
+#endif
 #endif

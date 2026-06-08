@@ -25,7 +25,7 @@
 #endif
 
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
-#define RTR_SCENE_PLANE_Y -1.0f
+#define RTR_SCENE_FLOOR_Y -1.0f
 #define RTR_SCENE_MESH_HEIGHT 1.75f
 #define RTR_SCENE_BOUNDS_EPS 0.0001f
 #define RTR_SCENE_BLUE_NOISE_SIZE 64u
@@ -683,7 +683,7 @@ static int rtrLoadMeshTriangles(RTRTriangle **outTriangles, uint32_t *outTriangl
 
         for (uint32_t i = 0u; i < vertexCount; i++) {
             vertices[i].x = (vertices[i].x - centerX) * scale;
-            vertices[i].y = (vertices[i].y - sourceMin[1]) * scale + RTR_SCENE_PLANE_Y;
+            vertices[i].y = (vertices[i].y - sourceMin[1]) * scale + RTR_SCENE_FLOOR_Y;
             vertices[i].z = (vertices[i].z - centerZ) * scale;
         }
     }

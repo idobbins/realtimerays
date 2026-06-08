@@ -16,14 +16,20 @@
 #define RTR_RESTIR_MODE 1
 #endif
 
+#ifndef RTR_SIMPLE_RENDER
+#define RTR_SIMPLE_RENDER 1
+#endif
+
 #include "trace_primary_comp_spv.h"
 #include "trace_direct_comp_spv.h"
+#if !RTR_SIMPLE_RENDER
 #include "trace_gi_comp_spv.h"
 #include "trace_gi_shadow_comp_spv.h"
 #if RTR_RESTIR_MODE > 0
 #include "trace_restir_temporal_comp_spv.h"
 #endif
 #include "trace_restir_spatial_comp_spv.h"
+#endif
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
@@ -51,6 +57,7 @@
 #define RTR_WAVE_PRIMARY_WORDS 15u
 #define RTR_WAVE_GI_SAMPLE_CAP 3u
 #define RTR_WAVE_GI_WORDS 15u
+#define RTR_SIMPLE_PIXEL_WORDS 15u
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
      RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS + \
@@ -117,6 +124,10 @@ enum {
 };
 
 enum {
+#if RTR_SIMPLE_RENDER
+    RTR_PIPELINE_SIMPLE_TRACE,
+    RTR_PIPELINE_SIMPLE_RESOLVE,
+#else
     RTR_PIPELINE_PRIMARY,
     RTR_PIPELINE_DIRECT,
     RTR_PIPELINE_GI,
@@ -125,6 +136,7 @@ enum {
     RTR_PIPELINE_RESTIR_TEMPORAL,
 #endif
     RTR_PIPELINE_RESTIR_SPATIAL,
+#endif
     RTR_PIPELINE_COUNT,
 };
 
@@ -410,6 +422,11 @@ static int rtrCreateMemoryBuffer(void)
     const VkDeviceSize rtrPixelCount =
         (VkDeviceSize)rtrSwapExtent.width *
         (VkDeviceSize)rtrSwapExtent.height;
+#if RTR_SIMPLE_RENDER
+    const VkDeviceSize rtrPathTraceWords =
+        rtrPixelCount *
+        (VkDeviceSize)RTR_SIMPLE_PIXEL_WORDS;
+#else
     const VkDeviceSize rtrHistoryWords =
         rtrPixelCount *
         (VkDeviceSize)RTR_HISTORY_PIXEL_WORDS *
@@ -423,12 +440,17 @@ static int rtrCreateMemoryBuffer(void)
         ((VkDeviceSize)RTR_WAVE_PRIMARY_WORDS +
          (VkDeviceSize)RTR_WAVE_GI_SAMPLE_CAP *
          (VkDeviceSize)RTR_WAVE_GI_WORDS);
+#endif
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
          (VkDeviceSize)RTR_SCENE_WORDS +
+#if RTR_SIMPLE_RENDER
+         rtrPathTraceWords) *
+#else
          rtrHistoryWords +
          rtrRestirWords +
          rtrWavefrontWords) *
+#endif
         (VkDeviceSize)sizeof(uint32_t);
     if (rtrPixelCount == 0u) return 1;
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
@@ -457,7 +479,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 17u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 20u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
@@ -584,10 +606,14 @@ static void rtrCmdDispatchWavefront(VkCommandBuffer commandBuffer,
                             NULL);
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
+#if RTR_SIMPLE_RENDER
+        const uint32_t groupsZ = 1u;
+#else
         const uint32_t groupsZ =
             (pipeline == RTR_PIPELINE_GI ||
              pipeline == RTR_PIPELINE_GI_SHADOW) ?
             RTR_WAVE_GI_SAMPLE_CAP : 1u;
+#endif
 
         vkCmdBindPipeline(commandBuffer,
                           VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -940,22 +966,26 @@ int rtrVulkanInit(void *windowSurface)
     const uint32_t *const shaderWords[RTR_PIPELINE_COUNT] = {
         (const uint32_t *)(const void *)tracePrimaryCompSpv,
         (const uint32_t *)(const void *)traceDirectCompSpv,
+#if !RTR_SIMPLE_RENDER
         (const uint32_t *)(const void *)traceGiCompSpv,
         (const uint32_t *)(const void *)traceGiShadowCompSpv,
 #if RTR_RESTIR_MODE > 0
         (const uint32_t *)(const void *)traceRestirTemporalCompSpv,
 #endif
         (const uint32_t *)(const void *)traceRestirSpatialCompSpv,
+#endif
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
         tracePrimaryCompSpv_len,
         traceDirectCompSpv_len,
+#if !RTR_SIMPLE_RENDER
         traceGiCompSpv_len,
         traceGiShadowCompSpv_len,
 #if RTR_RESTIR_MODE > 0
         traceRestirTemporalCompSpv_len,
 #endif
         traceRestirSpatialCompSpv_len,
+#endif
     };
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
