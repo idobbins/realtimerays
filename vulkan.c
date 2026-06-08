@@ -79,7 +79,7 @@ enum {
 
 #define RTR_CAMERA_DEFAULT_YAW 0.35f
 #define RTR_CAMERA_DEFAULT_PITCH 0.473f
-#define RTR_CAMERA_DEFAULT_RADIUS 4.0f
+#define RTR_CAMERA_DEFAULT_RADIUS 2.35f
 #define RTR_CAMERA_AUTO_SPEED 0.08f
 #define RTR_CAMERA_STILL_EPS 0.0005f
 #define RTR_FRAME_TIME_CLAMP_SECONDS (1.0 / 20.0)
@@ -491,9 +491,10 @@ static void rtrUpdateMemoryWith(float time,
         rtrWindowSetCameraYaw(activeCameraYaw);
     rtrCameraAutoWasEnabled = autoOrbit;
 
-    const float prevCameraYaw = rtrAccumCameraReady ? rtrAccumYaw : activeCameraYaw;
-    const float prevCameraPitch = rtrAccumCameraReady ? rtrAccumPitch : cameraPitch;
-    const float prevCameraRadius = rtrAccumCameraReady ? rtrAccumRadius : cameraRadius;
+    const uint32_t hadPreviousCamera = rtrAccumCameraReady;
+    const float prevCameraYaw = hadPreviousCamera ? rtrAccumYaw : activeCameraYaw;
+    const float prevCameraPitch = hadPreviousCamera ? rtrAccumPitch : cameraPitch;
+    const float prevCameraRadius = hadPreviousCamera ? rtrAccumRadius : cameraRadius;
 
     if (rtrShouldResetAccum(activeCameraYaw, cameraPitch, cameraRadius))
         rtrAccumFrameCount = 0u;
@@ -504,11 +505,11 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(cameraPitch);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(cameraRadius);
     rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_YAW_WORD] = rtrF32Word(
-        rtrAccumFrameCount ? prevCameraYaw : activeCameraYaw);
+        hadPreviousCamera ? prevCameraYaw : activeCameraYaw);
     rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_PITCH_WORD] = rtrF32Word(
-        rtrAccumFrameCount ? prevCameraPitch : cameraPitch);
+        hadPreviousCamera ? prevCameraPitch : cameraPitch);
     rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_RADIUS_WORD] = rtrF32Word(
-        rtrAccumFrameCount ? prevCameraRadius : cameraRadius);
+        hadPreviousCamera ? prevCameraRadius : cameraRadius);
     rtrMemoryWords[RTR_MEMORY_ACCUM_COUNT_WORD] = rtrAccumFrameCount;
 }
 

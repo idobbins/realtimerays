@@ -15,7 +15,7 @@ rule mkdir
   description = MKDIR $build_dir
 
 rule glslc
-  command = $glslc -DRTR_WAVEFRONT_STAGE=$stage $in -o $out
+  command = $glslc -DRTR_WAVEFRONT_STAGE=$stage -DRTR_RESTIR_REUSE_ENABLED=1 $in -o $out
   description = GLSLC $in
 
 rule xxd
