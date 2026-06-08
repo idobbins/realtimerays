@@ -37,7 +37,17 @@ const uint RTR_BVH_NODE_WORDS = 8u;
 const uint RTR_BLUE_NOISE_SIZE = 64u;
 const uint RTR_BLUE_NOISE_WORD =
     RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
-const uint RTR_HISTORY_WORD = RTR_BLUE_NOISE_WORD + RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE;
+const uint RTR_ENVMAP_WIDTH = 1024u;
+const uint RTR_ENVMAP_HEIGHT = 512u;
+const uint RTR_ENVMAP_WORD =
+    RTR_BLUE_NOISE_WORD + RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE;
+const uint RTR_ENVMAP_DIFFUSE_WIDTH = 32u;
+const uint RTR_ENVMAP_DIFFUSE_HEIGHT = 16u;
+const uint RTR_ENVMAP_DIFFUSE_WORD =
+    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_HISTORY_WORD =
+    RTR_ENVMAP_DIFFUSE_WORD +
+    RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u;
 const uint RTR_HISTORY_PIXEL_WORDS = 7u;
 const uint RTR_RESTIR_PIXEL_WORDS = 12u;
 const uint RTR_WAVE_PRIMARY_WORDS = 15u;
@@ -74,6 +84,10 @@ const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
 const float RTR_FOCAL = 1.35;
 const float RTR_INV_PI = 0.31830988618;
+const float RTR_ENVMAP_LUMINANCE_CAP = 12.0;
+const float RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP = 2.0;
+const float RTR_ENVMAP_DIFFUSE_EXPOSURE = 0.7;
+const vec3 RTR_ENVMAP_AVERAGE = vec3(0.489, 0.549, 0.574);
 const float RTR_TEMPORAL_NORMAL_DOT = 0.9;
 const float RTR_TEMPORAL_DEPTH_REL = 0.025;
 const float RTR_TEMPORAL_DEPTH_ABS = 0.015;
@@ -204,6 +218,42 @@ vec2 rtrBlueNoise2(uvec2 coord,
     return fract(noise + offset);
 }
 
+uint rtrPathHash(vec3 p, vec3 n, uint dimension)
+{
+    return rtrHashU32(floatBitsToUint(p.x * 17.0 + n.x * 0.13) ^
+                      floatBitsToUint(p.y * 29.0 + n.y * 0.17) ^
+                      floatBitsToUint(p.z * 43.0 + n.z * 0.19) ^
+                      dimension * 0xc2b2ae35u);
+}
+
+vec2 rtrPathBlueNoise2(vec3 p,
+                       vec3 n,
+                       uint frameIndex,
+                       uint sampleIndex,
+                       uint dimension,
+                       inout uint rng)
+{
+    uint pathHash = rtrPathHash(p, n, dimension);
+    uint frameHash = rtrHashU32(pathHash ^
+                                frameIndex * 0x9e3779b9u ^
+                                sampleIndex * 0x85ebca6bu);
+    uvec2 coord = uvec2(pathHash, pathHash >> 16u) +
+        uvec2(frameHash, frameHash >> 16u) +
+        uvec2(dimension * 17u, dimension * 31u);
+    coord &= uvec2(RTR_BLUE_NOISE_SIZE - 1u);
+
+    uint word = rtrLoadU32(RTR_BLUE_NOISE_WORD +
+                           coord.y * RTR_BLUE_NOISE_SIZE + coord.x);
+    vec2 noise = vec2(uvec2(word & 0xffffu, word >> 16u)) *
+        (1.0 / 65536.0);
+    uint offsetWord = rtrHashU32(frameHash ^ 0x27d4eb2du);
+    vec2 offset = vec2(uvec2(offsetWord & 0xffffu, offsetWord >> 16u)) *
+        (1.0 / 65536.0);
+    rng ^= offsetWord;
+
+    return fract(noise + offset);
+}
+
 struct RTRTriangle {
     vec3 v0;
     vec3 v1;
@@ -288,10 +338,68 @@ vec2 rtrPrimaryJitter(uvec2 coord,
     return rtrBlueNoise2(coord, frameIndex, sampleIndex, 0u, rng);
 }
 
+vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
+{
+    const float invTwoPi = 0.15915494309;
+    const float invPi = 0.31830988618;
+    float u = fract(atan(rd.z, rd.x) * invTwoPi + 0.5);
+    float v = clamp(acos(clamp(rd.y, -1.0, 1.0)) * invPi, 0.0, 1.0);
+    float x = u * float(mapWidth) - 0.5;
+    float y = v * float(mapHeight) - 0.5;
+    int x0i = int(floor(x));
+    int y0i = int(floor(y));
+    int width = int(mapWidth);
+    int height = int(mapHeight);
+    uint x0 = uint((x0i % width + width) % width);
+    uint x1 = uint(((x0i + 1) % width + width) % width);
+    uint y0 = uint(clamp(y0i, 0, height - 1));
+    uint y1 = uint(clamp(y0i + 1, 0, height - 1));
+    float tx = fract(x);
+    float ty = fract(y);
+    uint row0 = y0 * mapWidth;
+    uint row1 = y1 * mapWidth;
+    uint word00 = baseWord + (row0 + x0) * 2u;
+    uint word10 = baseWord + (row0 + x1) * 2u;
+    uint word01 = baseWord + (row1 + x0) * 2u;
+    uint word11 = baseWord + (row1 + x1) * 2u;
+    vec2 rg00 = unpackHalf2x16(rtrLoadU32(word00));
+    vec2 ba00 = unpackHalf2x16(rtrLoadU32(word00 + 1u));
+    vec2 rg10 = unpackHalf2x16(rtrLoadU32(word10));
+    vec2 ba10 = unpackHalf2x16(rtrLoadU32(word10 + 1u));
+    vec2 rg01 = unpackHalf2x16(rtrLoadU32(word01));
+    vec2 ba01 = unpackHalf2x16(rtrLoadU32(word01 + 1u));
+    vec2 rg11 = unpackHalf2x16(rtrLoadU32(word11));
+    vec2 ba11 = unpackHalf2x16(rtrLoadU32(word11 + 1u));
+    vec3 c00 = vec3(rg00, ba00.x);
+    vec3 c10 = vec3(rg10, ba10.x);
+    vec3 c01 = vec3(rg01, ba01.x);
+    vec3 c11 = vec3(rg11, ba11.x);
+    vec3 color = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    float luminance = dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    if (luminance > cap)
+        color *= cap / luminance;
+
+    return color;
+}
+
 vec3 rtrSky(vec3 rd)
 {
-    float h = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3(0.58, 0.62, 0.68), vec3(0.10, 0.15, 0.22), h);
+    return rtrEnvironmentSample(rd,
+                                RTR_ENVMAP_WORD,
+                                RTR_ENVMAP_WIDTH,
+                                RTR_ENVMAP_HEIGHT,
+                                RTR_ENVMAP_LUMINANCE_CAP);
+}
+
+vec3 rtrSkyDiffuse(vec3 rd)
+{
+    vec3 color = rtrEnvironmentSample(rd,
+                                      RTR_ENVMAP_DIFFUSE_WORD,
+                                      RTR_ENVMAP_DIFFUSE_WIDTH,
+                                      RTR_ENVMAP_DIFFUSE_HEIGHT,
+                                      RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP);
+
+    return mix(color, RTR_ENVMAP_AVERAGE, 0.45) * RTR_ENVMAP_DIFFUSE_EXPOSURE;
 }
 
 void rtrCamera(float cameraYaw,
@@ -619,7 +727,7 @@ void rtrSurface(RTRHit hit,
 }
 
 vec3 rtrSampleLightPoint(vec3 p,
-                         uvec2 coord,
+                         vec3 n,
                          uint frameIndex,
                          uint sampleIndex,
                          uint dimension,
@@ -631,7 +739,12 @@ vec3 rtrSampleLightPoint(vec3 p,
                                                vec3(1.0, 0.0, 0.0);
     vec3 tangent = normalize(cross(helper, lightForward));
     vec3 bitangent = cross(lightForward, tangent);
-    vec2 noise = rtrBlueNoise2(coord, frameIndex, sampleIndex, dimension, rng);
+    vec2 noise = rtrPathBlueNoise2(p,
+                                   n,
+                                   frameIndex,
+                                   sampleIndex,
+                                   dimension,
+                                   rng);
     float angle = noise.x * 6.2831853;
     float radius = sqrt(noise.y) * RTR_LIGHT_RADIUS;
 
@@ -652,7 +765,7 @@ vec3 rtrDirectLightSample(vec3 p,
 {
     vec3 offsetP = p + n * (RTR_EPS * 4.0);
     vec3 lightP = rtrSampleLightPoint(offsetP,
-                                      coord,
+                                      n,
                                       frameIndex,
                                       sampleIndex,
                                       dimension,
@@ -701,8 +814,8 @@ vec3 rtrDirectLight(vec3 p,
     return direct / float(count);
 }
 
-vec3 rtrBounceDirection(vec3 n,
-                        uvec2 coord,
+vec3 rtrBounceDirection(vec3 p,
+                        vec3 n,
                         uint frameIndex,
                         uint sampleIndex,
                         int bounce,
@@ -711,11 +824,12 @@ vec3 rtrBounceDirection(vec3 n,
     vec3 helper = abs(n.y) < 0.97 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 tangent = normalize(cross(helper, n));
     vec3 bitangent = cross(n, tangent);
-    vec2 noise = rtrBlueNoise2(coord,
-                               frameIndex,
-                               sampleIndex,
-                               2u + uint(bounce),
-                               rng);
+    vec2 noise = rtrPathBlueNoise2(p,
+                                   n,
+                                   frameIndex,
+                                   sampleIndex,
+                                   2u + uint(bounce),
+                                   rng);
     float angle = noise.x * 6.2831853;
     float radius = sqrt(noise.y);
     vec3 diffuse = normalize(tangent * (cos(angle) * radius) +
@@ -814,7 +928,7 @@ vec3 rtrIncomingRadiance(vec3 p,
 {
     RTRHit hit = rtrTrace(p + n * (RTR_EPS * 8.0), wi);
     if (hit.id == RTR_HIT_NONE)
-        return rtrSky(wi);
+        return rtrSkyDiffuse(wi);
 
     vec3 q = p + n * (RTR_EPS * 8.0) + wi * hit.t;
     vec3 qn;
@@ -867,7 +981,12 @@ void rtrMakeFreshGICandidate(RTRPrimarySample primary,
 {
     rtrClearCandidate(candidate);
 
-    vec3 dir = rtrBounceDirection(primary.normal, coord, frameIndex, sampleIndex, 0, rng);
+    vec3 dir = rtrBounceDirection(primary.point,
+                                  primary.normal,
+                                  frameIndex,
+                                  sampleIndex,
+                                  0,
+                                  rng);
     vec3 radiance = rtrIncomingRadiance(primary.point,
                                         primary.normal,
                                         dir,
@@ -1477,15 +1596,15 @@ void main()
         return;
     }
 
-    vec3 dir = rtrBounceDirection(primary.normal,
-                                  uvec2(p),
+    vec3 dir = rtrBounceDirection(primary.point,
+                                  primary.normal,
                                   frameIndex,
                                   sampleIndex,
                                   0,
                                   rng);
     RTRHit hit = rtrTrace(primary.point + primary.normal * (RTR_EPS * 8.0), dir);
     if (hit.id == RTR_HIT_NONE) {
-        vec3 contribution = primary.albedo * rtrSky(dir);
+        vec3 contribution = primary.albedo * rtrSkyDiffuse(dir);
         if (rtrCandidateTarget(primary.normal, dir, contribution) > 0.0) {
             gi.state = 1u;
             gi.dir = dir;
@@ -1503,7 +1622,7 @@ void main()
 
     vec3 offsetP = q + qn * (RTR_EPS * 4.0);
     vec3 lightP = rtrSampleLightPoint(offsetP,
-                                      uvec2(p),
+                                      qn,
                                       frameIndex,
                                       sampleIndex,
                                       40u,

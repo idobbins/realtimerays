@@ -15,3 +15,8 @@
 # Large local mesh assets
 /assets/dragon/dragon_recon/*.ply
 /assets/dragon/*.tar.gz
+
+# Large local HDRI sources
+/assets/hdri/*.exr
+/assets/hdri/*.hdr
+/assets/hdri/*.raw

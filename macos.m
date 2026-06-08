@@ -10,7 +10,6 @@
 #define RTR_CAMERA_MAX_PITCH 1.15f
 #define RTR_CAMERA_MIN_RADIUS 1.2f
 #define RTR_CAMERA_MAX_RADIUS 9.0f
-#define RTR_CAMERA_AUTO_SPEED 0.08f
 
 static NSWindow *rtrWindowHandle = nil;
 static void *rtrSurfaceLayer = NULL;
@@ -20,10 +19,8 @@ static float rtrMouseY = -1.0f;
 static float rtrCameraYaw = RTR_CAMERA_DEFAULT_YAW;
 static float rtrCameraPitch = RTR_CAMERA_DEFAULT_PITCH;
 static float rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
-static float rtrAutoYawBase = RTR_CAMERA_DEFAULT_YAW;
 static uint32_t rtrAutoOrbit = 1u;
 static uint32_t rtrMouseDragging = 0u;
-static double rtrWindowStartTime = 0.0;
 
 static float rtrClamp(float value, float lo, float hi)
 {
@@ -32,17 +29,8 @@ static float rtrClamp(float value, float lo, float hi)
     return value;
 }
 
-static float rtrAutoOrbitYaw(void)
-{
-    return rtrAutoYawBase +
-           (float)(CACurrentMediaTime() - rtrWindowStartTime) * RTR_CAMERA_AUTO_SPEED;
-}
-
 static void rtrEnterManualOrbit(void)
 {
-    if (!rtrAutoOrbit) return;
-
-    rtrCameraYaw = rtrAutoOrbitYaw();
     rtrAutoOrbit = 0u;
 }
 
@@ -93,10 +81,8 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     rtrCameraYaw = RTR_CAMERA_DEFAULT_YAW;
     rtrCameraPitch = RTR_CAMERA_DEFAULT_PITCH;
     rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
-    rtrAutoYawBase = RTR_CAMERA_DEFAULT_YAW;
     rtrAutoOrbit = 1u;
     rtrMouseDragging = 0u;
-    rtrWindowStartTime = CACurrentMediaTime();
     return 0;
 }
 
@@ -119,9 +105,14 @@ void rtrWindowMouse(float *x, float *y)
 void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius)
 {
     if (autoOrbit) *autoOrbit = rtrAutoOrbit;
-    if (yaw) *yaw = rtrAutoOrbit ? rtrAutoYawBase : rtrCameraYaw;
+    if (yaw) *yaw = rtrCameraYaw;
     if (pitch) *pitch = rtrCameraPitch;
     if (radius) *radius = rtrCameraRadius;
+}
+
+void rtrWindowSetCameraYaw(float yaw)
+{
+    rtrCameraYaw = yaw;
 }
 
 int rtrPumpEventsOnce(void)
@@ -180,14 +171,7 @@ int rtrPumpEventsOnce(void)
             }
 
             if (rtrIsSpace && ![event isARepeat]) {
-                if (rtrAutoOrbit) {
-                    rtrEnterManualOrbit();
-                } else {
-                    rtrAutoYawBase = rtrCameraYaw -
-                        (float)(CACurrentMediaTime() - rtrWindowStartTime) *
-                        RTR_CAMERA_AUTO_SPEED;
-                    rtrAutoOrbit = 1u;
-                }
+                rtrAutoOrbit = rtrAutoOrbit ? 0u : 1u;
             }
             rtrShouldQuit |= rtrIsEscape;
             if (!(rtrIsEscape || rtrIsSpace)) [NSApp sendEvent:event];

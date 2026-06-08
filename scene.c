@@ -16,6 +16,14 @@
 #define RTR_SCENE_DRAGON_PATH "assets/dragon/dragon_recon/dragon_vrip.ply"
 #endif
 
+#ifndef RTR_SCENE_HDRI_PATH
+#define RTR_SCENE_HDRI_PATH "assets/hdri/spaichingen_hill_1024x512_rgba16f.bin"
+#endif
+
+#ifndef RTR_SCENE_HDRI_DIFFUSE_PATH
+#define RTR_SCENE_HDRI_DIFFUSE_PATH "assets/hdri/spaichingen_hill_diffuse_32x16_rgba16f.bin"
+#endif
+
 #define RTR_SCENE_BVH_INTERNAL_FLAG 0x80000000u
 #define RTR_SCENE_PLANE_Y -1.0f
 #define RTR_SCENE_DRAGON_HEIGHT 1.75f
@@ -24,6 +32,13 @@
 #define RTR_SCENE_BLUE_NOISE_TEXELS (RTR_SCENE_BLUE_NOISE_SIZE * RTR_SCENE_BLUE_NOISE_SIZE)
 #define RTR_SCENE_BLUE_NOISE_CANDIDATES 64u
 #define RTR_SCENE_TRIANGLE_QUANT_MAX 65535u
+#define RTR_SCENE_ENVMAP_WIDTH 1024u
+#define RTR_SCENE_ENVMAP_HEIGHT 512u
+#define RTR_SCENE_ENVMAP_WORDS (RTR_SCENE_ENVMAP_WIDTH * RTR_SCENE_ENVMAP_HEIGHT * 2u)
+#define RTR_SCENE_ENVMAP_DIFFUSE_WIDTH 32u
+#define RTR_SCENE_ENVMAP_DIFFUSE_HEIGHT 16u
+#define RTR_SCENE_ENVMAP_DIFFUSE_WORDS \
+    (RTR_SCENE_ENVMAP_DIFFUSE_WIDTH * RTR_SCENE_ENVMAP_DIFFUSE_HEIGHT * 2u)
 
 enum {
     RTR_SCENE_COUNT_WORD = 8,
@@ -39,6 +54,10 @@ enum {
     RTR_SCENE_BVH_MAX_NODES = RTR_SCENE_TRIANGLE_CAPACITY * 2 - 1,
     RTR_SCENE_BLUE_NOISE_WORD = RTR_SCENE_BVH_WORD +
         RTR_SCENE_BVH_MAX_NODES * RTR_SCENE_BVH_NODE_WORDS,
+    RTR_SCENE_ENVMAP_WORD = RTR_SCENE_BLUE_NOISE_WORD +
+        RTR_SCENE_BLUE_NOISE_TEXELS,
+    RTR_SCENE_ENVMAP_DIFFUSE_WORD = RTR_SCENE_ENVMAP_WORD +
+        RTR_SCENE_ENVMAP_WORDS,
 };
 
 typedef struct RTRVec3 {
@@ -198,6 +217,103 @@ static void rtrStoreBlueNoise(uint32_t *words)
         words[RTR_SCENE_BLUE_NOISE_WORD + i] =
             (uint32_t)channel0[i] | ((uint32_t)channel1[i] << 16u);
     }
+}
+
+static uint32_t rtrF32ToF16Word(float value)
+{
+    uint32_t bits = 0u;
+    uint32_t sign;
+    int32_t exponent;
+    uint32_t mantissa;
+
+    if (!(value > 0.0f))
+        return 0u;
+    if (value > 65504.0f)
+        value = 65504.0f;
+
+    memcpy(&bits, &value, sizeof(bits));
+    sign = (bits >> 16u) & 0x8000u;
+    exponent = (int32_t)((bits >> 23u) & 0xffu) - 127 + 15;
+    mantissa = bits & 0x7fffffu;
+
+    if (exponent <= 0)
+        return sign;
+    if (exponent >= 31)
+        return sign | 0x7bffu;
+
+    return sign | ((uint32_t)exponent << 10u) | (mantissa >> 13u);
+}
+
+static uint32_t rtrPackF16x2(float lo, float hi)
+{
+    return rtrF32ToF16Word(lo) | (rtrF32ToF16Word(hi) << 16u);
+}
+
+static void rtrStoreFallbackEnvironment(uint32_t *words,
+                                        uint32_t startWord,
+                                        uint32_t width,
+                                        uint32_t height)
+{
+    for (uint32_t y = 0u; y < height; y++) {
+        const float v = ((float)y + 0.5f) / (float)height;
+        const float rdY = cosf(v * 3.14159265f);
+        const float h = fmaxf(0.0f, fminf(1.0f, rdY * 0.5f + 0.5f));
+        const float r = 0.58f * (1.0f - h) + 0.10f * h;
+        const float g = 0.62f * (1.0f - h) + 0.15f * h;
+        const float b = 0.68f * (1.0f - h) + 0.22f * h;
+
+        for (uint32_t x = 0u; x < width; x++) {
+            const uint32_t word = startWord + (y * width + x) * 2u;
+            words[word] = rtrPackF16x2(r, g);
+            words[word + 1u] = rtrPackF16x2(b, 1.0f);
+        }
+    }
+}
+
+static void rtrStoreEnvironmentFile(uint32_t *words,
+                                    const char *path,
+                                    uint32_t startWord,
+                                    uint32_t width,
+                                    uint32_t height,
+                                    uint32_t wordCount)
+{
+    FILE *file = fopen(path, "rb");
+    size_t readCount = 0u;
+
+    if (!file) {
+        fprintf(stderr, "scene: failed to open %s, using fallback sky\n",
+                path);
+        rtrStoreFallbackEnvironment(words, startWord, width, height);
+        return;
+    }
+
+    readCount = fread(words + startWord,
+                      sizeof(uint32_t),
+                      wordCount,
+                      file);
+    fclose(file);
+
+    if (readCount != wordCount) {
+        fprintf(stderr, "scene: failed to read %s, using fallback sky\n",
+                path);
+        rtrStoreFallbackEnvironment(words, startWord, width, height);
+    }
+}
+
+static void rtrStoreEnvironment(uint32_t *words)
+{
+    rtrStoreEnvironmentFile(words,
+                            RTR_SCENE_HDRI_PATH,
+                            RTR_SCENE_ENVMAP_WORD,
+                            RTR_SCENE_ENVMAP_WIDTH,
+                            RTR_SCENE_ENVMAP_HEIGHT,
+                            RTR_SCENE_ENVMAP_WORDS);
+    rtrStoreEnvironmentFile(words,
+                            RTR_SCENE_HDRI_DIFFUSE_PATH,
+                            RTR_SCENE_ENVMAP_DIFFUSE_WORD,
+                            RTR_SCENE_ENVMAP_DIFFUSE_WIDTH,
+                            RTR_SCENE_ENVMAP_DIFFUSE_HEIGHT,
+                            RTR_SCENE_ENVMAP_DIFFUSE_WORDS);
 }
 
 static void rtrBoundsReset(float boundsMin[3], float boundsMax[3])
@@ -693,6 +809,7 @@ void rtrScene(uint32_t *words)
 
     if (rtrLoadDragonTriangles(&triangles, &triangleCount) || triangleCount == 0u) {
         rtrStoreBlueNoise(words);
+        rtrStoreEnvironment(words);
         free(triangles);
         return;
     }
@@ -702,6 +819,7 @@ void rtrScene(uint32_t *words)
     if (!nodes) {
         fprintf(stderr, "scene: BVH allocation failed\n");
         rtrStoreBlueNoise(words);
+        rtrStoreEnvironment(words);
         free(triangles);
         return;
     }
@@ -721,6 +839,7 @@ void rtrScene(uint32_t *words)
         rtrStoreBVHNode(words, i, nodes + i);
 
     rtrStoreBlueNoise(words);
+    rtrStoreEnvironment(words);
 
     free(triangles);
     free(nodes);

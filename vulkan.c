@@ -27,6 +27,13 @@
 #define RTR_SCENE_BVH_NODE_WORDS 8u
 #define RTR_BLUE_NOISE_SIZE 64u
 #define RTR_BLUE_NOISE_WORDS (RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE)
+#define RTR_ENVMAP_WIDTH 1024u
+#define RTR_ENVMAP_HEIGHT 512u
+#define RTR_ENVMAP_WORDS (RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u)
+#define RTR_ENVMAP_DIFFUSE_WIDTH 32u
+#define RTR_ENVMAP_DIFFUSE_HEIGHT 16u
+#define RTR_ENVMAP_DIFFUSE_WORDS \
+    (RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u)
 #define RTR_HISTORY_PIXEL_WORDS 7u
 #define RTR_RESTIR_PIXEL_WORDS 12u
 #define RTR_WAVE_PRIMARY_WORDS 15u
@@ -35,12 +42,15 @@
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
      RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS + \
-     RTR_BLUE_NOISE_WORDS)
+     RTR_BLUE_NOISE_WORDS + \
+     RTR_ENVMAP_WORDS + \
+     RTR_ENVMAP_DIFFUSE_WORDS)
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
 void rtrWindowMouse(float *x, float *y);
 void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius);
+void rtrWindowSetCameraYaw(float yaw);
 void rtrScene(uint32_t *words);
 
 enum {
@@ -169,6 +179,9 @@ static uint32_t rtrAccumHeight = 0u;
 static float rtrAccumYaw = 0.0f;
 static float rtrAccumPitch = 0.0f;
 static float rtrAccumRadius = 0.0f;
+static uint32_t rtrCameraAutoReady = 0u;
+static uint32_t rtrCameraAutoWasEnabled = 0u;
+static float rtrCameraAutoBase = RTR_CAMERA_DEFAULT_YAW;
 
 static uint32_t rtrF32Word(float value)
 {
@@ -463,8 +476,21 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(mouseX);
     rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(mouseY);
     rtrMemoryWords[RTR_MEMORY_TIME_WORD] = rtrF32Word(time);
-    const float activeCameraYaw =
-        autoOrbit ? cameraYaw + time * RTR_CAMERA_AUTO_SPEED : cameraYaw;
+    if (!rtrCameraAutoReady) {
+        rtrCameraAutoBase = cameraYaw -
+            (autoOrbit ? time * RTR_CAMERA_AUTO_SPEED : 0.0f);
+        rtrCameraAutoWasEnabled = autoOrbit;
+        rtrCameraAutoReady = 1u;
+    } else if (autoOrbit && !rtrCameraAutoWasEnabled) {
+        rtrCameraAutoBase = cameraYaw - time * RTR_CAMERA_AUTO_SPEED;
+    }
+
+    const float activeCameraYaw = autoOrbit ?
+        rtrCameraAutoBase + time * RTR_CAMERA_AUTO_SPEED : cameraYaw;
+    if (autoOrbit)
+        rtrWindowSetCameraYaw(activeCameraYaw);
+    rtrCameraAutoWasEnabled = autoOrbit;
+
     const float prevCameraYaw = rtrAccumCameraReady ? rtrAccumYaw : activeCameraYaw;
     const float prevCameraPitch = rtrAccumCameraReady ? rtrAccumPitch : cameraPitch;
     const float prevCameraRadius = rtrAccumCameraReady ? rtrAccumRadius : cameraRadius;
@@ -721,6 +747,9 @@ int rtrVulkanInit(void *windowSurface)
     rtrFrameClockSeconds = 0.0;
     rtrFrameClockLastSeconds = 0.0;
     rtrFrameClockReady = 0u;
+    rtrCameraAutoReady = 0u;
+    rtrCameraAutoWasEnabled = 0u;
+    rtrCameraAutoBase = RTR_CAMERA_DEFAULT_YAW;
 
     vkCreateInstance(&(VkInstanceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
