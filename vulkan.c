@@ -12,24 +12,8 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef RTR_RESTIR_MODE
-#define RTR_RESTIR_MODE 1
-#endif
-
-#ifndef RTR_SIMPLE_RENDER
-#define RTR_SIMPLE_RENDER 1
-#endif
-
-#include "trace_primary_comp_spv.h"
-#include "trace_direct_comp_spv.h"
-#if !RTR_SIMPLE_RENDER
-#include "trace_gi_comp_spv.h"
-#include "trace_gi_shadow_comp_spv.h"
-#if RTR_RESTIR_MODE > 0
-#include "trace_restir_temporal_comp_spv.h"
-#endif
-#include "trace_restir_spatial_comp_spv.h"
-#endif
+#include "trace_path_comp_spv.h"
+#include "trace_resolve_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
@@ -47,16 +31,6 @@
 #define RTR_ENVMAP_DIFFUSE_HEIGHT 16u
 #define RTR_ENVMAP_DIFFUSE_WORDS \
     (RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u)
-#define RTR_HISTORY_PIXEL_WORDS 7u
-#define RTR_RESTIR_PIXEL_WORDS 12u
-#if RTR_RESTIR_MODE > 0
-#define RTR_RESTIR_PAGE_COUNT 3u
-#else
-#define RTR_RESTIR_PAGE_COUNT 0u
-#endif
-#define RTR_WAVE_PRIMARY_WORDS 15u
-#define RTR_WAVE_GI_SAMPLE_CAP 3u
-#define RTR_WAVE_GI_WORDS 15u
 #define RTR_SIMPLE_PIXEL_WORDS 15u
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
@@ -67,7 +41,6 @@
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
-void rtrWindowMouse(float *x, float *y);
 void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius);
 void rtrWindowSetCameraYaw(float yaw);
 void rtrScene(uint32_t *words);
@@ -78,18 +51,10 @@ enum {
     RTR_MEMORY_WIDTH_WORD = 2,
     RTR_MEMORY_HEIGHT_WORD = 3,
     RTR_MEMORY_FRAME_WORD = 4,
-    RTR_MEMORY_MOUSE_X_WORD = 5,
-    RTR_MEMORY_MOUSE_Y_WORD = 6,
-    RTR_MEMORY_TIME_WORD = 7,
     RTR_MEMORY_TRIANGLE_COUNT_WORD = 8,
-    RTR_MEMORY_CAMERA_AUTO_WORD = 16,
     RTR_MEMORY_CAMERA_YAW_WORD = 17,
     RTR_MEMORY_CAMERA_PITCH_WORD = 18,
     RTR_MEMORY_CAMERA_RADIUS_WORD = 19,
-    RTR_MEMORY_ACCUM_COUNT_WORD = 20,
-    RTR_MEMORY_PREV_CAMERA_YAW_WORD = 21,
-    RTR_MEMORY_PREV_CAMERA_PITCH_WORD = 22,
-    RTR_MEMORY_PREV_CAMERA_RADIUS_WORD = 23,
 };
 
 enum {
@@ -100,7 +65,6 @@ enum {
 #define RTR_CAMERA_DEFAULT_PITCH 0.473f
 #define RTR_CAMERA_DEFAULT_RADIUS 2.35f
 #define RTR_CAMERA_AUTO_SPEED 0.08f
-#define RTR_CAMERA_STILL_EPS 0.0005f
 #define RTR_FRAME_TIME_CLAMP_SECONDS (1.0 / 20.0)
 
 static const char *const rtrInstanceExts[] = {
@@ -124,19 +88,8 @@ enum {
 };
 
 enum {
-#if RTR_SIMPLE_RENDER
-    RTR_PIPELINE_SIMPLE_TRACE,
-    RTR_PIPELINE_SIMPLE_RESOLVE,
-#else
-    RTR_PIPELINE_PRIMARY,
-    RTR_PIPELINE_DIRECT,
-    RTR_PIPELINE_GI,
-    RTR_PIPELINE_GI_SHADOW,
-#if RTR_RESTIR_MODE > 0
-    RTR_PIPELINE_RESTIR_TEMPORAL,
-#endif
-    RTR_PIPELINE_RESTIR_SPATIAL,
-#endif
+    RTR_PIPELINE_TRACE,
+    RTR_PIPELINE_RESOLVE,
     RTR_PIPELINE_COUNT,
 };
 
@@ -199,13 +152,6 @@ static struct timespec rtrStartTime;
 static double rtrFrameClockSeconds = 0.0;
 static double rtrFrameClockLastSeconds = 0.0;
 static uint32_t rtrFrameClockReady = 0u;
-static uint32_t rtrAccumFrameCount = 0u;
-static uint32_t rtrAccumCameraReady = 0u;
-static uint32_t rtrAccumWidth = 0u;
-static uint32_t rtrAccumHeight = 0u;
-static float rtrAccumYaw = 0.0f;
-static float rtrAccumPitch = 0.0f;
-static float rtrAccumRadius = 0.0f;
 static uint32_t rtrCameraAutoReady = 0u;
 static uint32_t rtrCameraAutoWasEnabled = 0u;
 static float rtrCameraAutoBase = RTR_CAMERA_DEFAULT_YAW;
@@ -215,32 +161,6 @@ static uint32_t rtrF32Word(float value)
     uint32_t word = 0u;
     memcpy(&word, &value, sizeof(word));
     return word;
-}
-
-static uint32_t rtrShouldResetAccum(float yaw, float pitch, float radius)
-{
-    return !rtrAccumCameraReady ||
-        rtrAccumWidth != rtrSwapExtent.width ||
-        rtrAccumHeight != rtrSwapExtent.height ||
-        fabsf(rtrAccumYaw - yaw) > RTR_CAMERA_STILL_EPS ||
-        fabsf(rtrAccumPitch - pitch) > RTR_CAMERA_STILL_EPS ||
-        fabsf(logf(radius / rtrAccumRadius)) > RTR_CAMERA_STILL_EPS;
-}
-
-static void rtrRememberCamera(float yaw, float pitch, float radius)
-{
-    rtrAccumCameraReady = 1u;
-    rtrAccumWidth = rtrSwapExtent.width;
-    rtrAccumHeight = rtrSwapExtent.height;
-    rtrAccumYaw = yaw;
-    rtrAccumPitch = pitch;
-    rtrAccumRadius = radius;
-}
-
-static void rtrAdvanceAccumFrame(void)
-{
-    if (rtrAccumFrameCount < UINT32_MAX)
-        rtrAccumFrameCount++;
 }
 
 static float rtrEnvF32(const char *name, float fallback)
@@ -422,35 +342,13 @@ static int rtrCreateMemoryBuffer(void)
     const VkDeviceSize rtrPixelCount =
         (VkDeviceSize)rtrSwapExtent.width *
         (VkDeviceSize)rtrSwapExtent.height;
-#if RTR_SIMPLE_RENDER
     const VkDeviceSize rtrPathTraceWords =
         rtrPixelCount *
         (VkDeviceSize)RTR_SIMPLE_PIXEL_WORDS;
-#else
-    const VkDeviceSize rtrHistoryWords =
-        rtrPixelCount *
-        (VkDeviceSize)RTR_HISTORY_PIXEL_WORDS *
-        (VkDeviceSize)2u;
-    const VkDeviceSize rtrRestirWords =
-        rtrPixelCount *
-        (VkDeviceSize)RTR_RESTIR_PIXEL_WORDS *
-        (VkDeviceSize)RTR_RESTIR_PAGE_COUNT;
-    const VkDeviceSize rtrWavefrontWords =
-        rtrPixelCount *
-        ((VkDeviceSize)RTR_WAVE_PRIMARY_WORDS +
-         (VkDeviceSize)RTR_WAVE_GI_SAMPLE_CAP *
-         (VkDeviceSize)RTR_WAVE_GI_WORDS);
-#endif
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
          (VkDeviceSize)RTR_SCENE_WORDS +
-#if RTR_SIMPLE_RENDER
          rtrPathTraceWords) *
-#else
-         rtrHistoryWords +
-         rtrRestirWords +
-         rtrWavefrontWords) *
-#endif
         (VkDeviceSize)sizeof(uint32_t);
     if (rtrPixelCount == 0u) return 1;
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
@@ -482,26 +380,15 @@ static int rtrCreateMemoryBuffer(void)
     rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 20u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
-    rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(-1.0f);
-    rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(-1.0f);
-    rtrMemoryWords[RTR_MEMORY_CAMERA_AUTO_WORD] = RTR_CAMERA_AUTO_DEFAULT;
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
-    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
-    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
-    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
-    rtrMemoryWords[RTR_MEMORY_ACCUM_COUNT_WORD] = 0u;
-    rtrAccumFrameCount = 0u;
-    rtrAccumCameraReady = 0u;
     rtrScene(rtrMemoryWords);
 
     return 0;
 }
 
 static void rtrUpdateMemoryWith(float time,
-                                float mouseX,
-                                float mouseY,
                                 uint32_t autoOrbit,
                                 float cameraYaw,
                                 float cameraPitch,
@@ -510,9 +397,6 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_FRAME_WORD] = rtrFrameIndex;
-    rtrMemoryWords[RTR_MEMORY_MOUSE_X_WORD] = rtrF32Word(mouseX);
-    rtrMemoryWords[RTR_MEMORY_MOUSE_Y_WORD] = rtrF32Word(mouseY);
-    rtrMemoryWords[RTR_MEMORY_TIME_WORD] = rtrF32Word(time);
     if (!rtrCameraAutoReady) {
         rtrCameraAutoBase = cameraYaw -
             (autoOrbit ? time * RTR_CAMERA_AUTO_SPEED : 0.0f);
@@ -528,44 +412,24 @@ static void rtrUpdateMemoryWith(float time,
         rtrWindowSetCameraYaw(activeCameraYaw);
     rtrCameraAutoWasEnabled = autoOrbit;
 
-    const uint32_t hadPreviousCamera = rtrAccumCameraReady;
-    const float prevCameraYaw = hadPreviousCamera ? rtrAccumYaw : activeCameraYaw;
-    const float prevCameraPitch = hadPreviousCamera ? rtrAccumPitch : cameraPitch;
-    const float prevCameraRadius = hadPreviousCamera ? rtrAccumRadius : cameraRadius;
-
-    if (rtrShouldResetAccum(activeCameraYaw, cameraPitch, cameraRadius))
-        rtrAccumFrameCount = 0u;
-    rtrRememberCamera(activeCameraYaw, cameraPitch, cameraRadius);
-
-    rtrMemoryWords[RTR_MEMORY_CAMERA_AUTO_WORD] = autoOrbit;
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(activeCameraYaw);
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(cameraPitch);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(cameraRadius);
-    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_YAW_WORD] = rtrF32Word(
-        hadPreviousCamera ? prevCameraYaw : activeCameraYaw);
-    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_PITCH_WORD] = rtrF32Word(
-        hadPreviousCamera ? prevCameraPitch : cameraPitch);
-    rtrMemoryWords[RTR_MEMORY_PREV_CAMERA_RADIUS_WORD] = rtrF32Word(
-        hadPreviousCamera ? prevCameraRadius : cameraRadius);
-    rtrMemoryWords[RTR_MEMORY_ACCUM_COUNT_WORD] = rtrAccumFrameCount;
 }
 
 static void rtrUpdateMemory(void)
 {
-    float mouseX = -1.0f;
-    float mouseY = -1.0f;
     uint32_t autoOrbit = RTR_CAMERA_AUTO_DEFAULT;
     float cameraYaw = RTR_CAMERA_DEFAULT_YAW;
     float cameraPitch = RTR_CAMERA_DEFAULT_PITCH;
     float cameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
 
-    rtrWindowMouse(&mouseX, &mouseY);
     rtrWindowCamera(&autoOrbit, &cameraYaw, &cameraPitch, &cameraRadius);
-    rtrUpdateMemoryWith(rtrFrameSeconds(), mouseX, mouseY,
+    rtrUpdateMemoryWith(rtrFrameSeconds(),
                         autoOrbit, cameraYaw, cameraPitch, cameraRadius);
 }
 
-static void rtrCmdWavefrontBarrier(VkCommandBuffer commandBuffer)
+static void rtrCmdRenderBarrier(VkCommandBuffer commandBuffer)
 {
     vkCmdPipelineBarrier(commandBuffer,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -588,8 +452,8 @@ static void rtrCmdWavefrontBarrier(VkCommandBuffer commandBuffer)
                          NULL);
 }
 
-static void rtrCmdDispatchWavefront(VkCommandBuffer commandBuffer,
-                                    VkDescriptorSet descriptorSet)
+static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
+                                 VkDescriptorSet descriptorSet)
 {
     const uint32_t groupsX =
         (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
@@ -606,14 +470,7 @@ static void rtrCmdDispatchWavefront(VkCommandBuffer commandBuffer,
                             NULL);
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
-#if RTR_SIMPLE_RENDER
         const uint32_t groupsZ = 1u;
-#else
-        const uint32_t groupsZ =
-            (pipeline == RTR_PIPELINE_GI ||
-             pipeline == RTR_PIPELINE_GI_SHADOW) ?
-            RTR_WAVE_GI_SAMPLE_CAP : 1u;
-#endif
 
         vkCmdBindPipeline(commandBuffer,
                           VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -621,7 +478,7 @@ static void rtrCmdDispatchWavefront(VkCommandBuffer commandBuffer,
         vkCmdDispatch(commandBuffer, groupsX, groupsY, groupsZ);
 
         if (pipeline + 1u < RTR_PIPELINE_COUNT)
-            rtrCmdWavefrontBarrier(commandBuffer);
+            rtrCmdRenderBarrier(commandBuffer);
     }
 }
 
@@ -964,28 +821,12 @@ int rtrVulkanInit(void *windowSurface)
     }, NULL, &rtrPipelineLayout);
 
     const uint32_t *const shaderWords[RTR_PIPELINE_COUNT] = {
-        (const uint32_t *)(const void *)tracePrimaryCompSpv,
-        (const uint32_t *)(const void *)traceDirectCompSpv,
-#if !RTR_SIMPLE_RENDER
-        (const uint32_t *)(const void *)traceGiCompSpv,
-        (const uint32_t *)(const void *)traceGiShadowCompSpv,
-#if RTR_RESTIR_MODE > 0
-        (const uint32_t *)(const void *)traceRestirTemporalCompSpv,
-#endif
-        (const uint32_t *)(const void *)traceRestirSpatialCompSpv,
-#endif
+        (const uint32_t *)(const void *)tracePathCompSpv,
+        (const uint32_t *)(const void *)traceResolveCompSpv,
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
-        tracePrimaryCompSpv_len,
-        traceDirectCompSpv_len,
-#if !RTR_SIMPLE_RENDER
-        traceGiCompSpv_len,
-        traceGiShadowCompSpv_len,
-#if RTR_RESTIR_MODE > 0
-        traceRestirTemporalCompSpv_len,
-#endif
-        traceRestirSpatialCompSpv_len,
-#endif
+        tracePathCompSpv_len,
+        traceResolveCompSpv_len,
     };
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
@@ -1113,7 +954,7 @@ int rtrVulkanInit(void *windowSurface)
             .size = VK_WHOLE_SIZE,
         }, 0u, NULL);
 
-        rtrCmdDispatchWavefront(rtrCommandBuffers[i], rtrDescriptorSets[i]);
+        rtrCmdDispatchRender(rtrCommandBuffers[i], rtrDescriptorSets[i]);
 
         if (rtrTimingSupported) {
             vkCmdWriteTimestamp(rtrCommandBuffers[i],
@@ -1239,7 +1080,6 @@ void rtrVulkanFrame(void)
     });
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) return;
 
-    rtrAdvanceAccumFrame();
     if (rtrTimingSupported) {
         rtrTimingPending = 1u;
         rtrTimingImageIndex = imageIndex;
@@ -1305,7 +1145,7 @@ static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
         .size = VK_WHOLE_SIZE,
     }, 0u, NULL);
 
-    rtrCmdDispatchWavefront(commandBuffer, rtrDescriptorSets[0]);
+    rtrCmdDispatchRender(commandBuffer, rtrDescriptorSets[0]);
 
     if (rtrTimingSupported) {
         vkCmdWriteTimestamp(commandBuffer,
@@ -1365,7 +1205,7 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
 
     VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (uint32_t frame = 0u; frame < frames; frame++) {
-        rtrUpdateMemoryWith((float)frame / (float)fps, -1.0f, -1.0f,
+        rtrUpdateMemoryWith((float)frame / (float)fps,
                             autoOrbit,
                             cameraYaw,
                             cameraPitch,
@@ -1388,8 +1228,6 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
         vkWaitForFences(rtrDevice, 1u, &rtrInFlightFence, VK_TRUE, UINT64_MAX);
         rtrReportGpuTiming();
         vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
-        rtrAdvanceAccumFrame();
-
         fwrite(rtrExportStagingPixels, 1u, (size_t)rtrExportImageBytes, out);
         rtrFrameIndex++;
     }

@@ -96,12 +96,6 @@ void *rtrWindowSurface(void)
     return rtrSurfaceLayer;
 }
 
-void rtrWindowMouse(float *x, float *y)
-{
-    if (x) *x = rtrMouseX;
-    if (y) *y = rtrMouseY;
-}
-
 void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius)
 {
     if (autoOrbit) *autoOrbit = rtrAutoOrbit;
