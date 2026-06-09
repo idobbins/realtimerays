@@ -1,21 +1,29 @@
 #version 460
 
+#ifndef RTR_BOUNCES
+#define RTR_BOUNCES 3
+#endif
+
+#ifndef RTR_HEMI_JITTER_R
+#define RTR_HEMI_JITTER_R 0.25
+#endif
+
+#ifndef RTR_HEMI_JITTER_PHI
+#define RTR_HEMI_JITTER_PHI 0.25
+#endif
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
 
-layout(std430, binding = 1) restrict buffer RTRMemory {
+layout(std430, binding = 1) restrict readonly buffer RTRMemory {
     uint rtrMem[];
 };
 
-const uint RTR_BRICK_COUNT_WORD = 8u;
-const uint RTR_FRAME_WORD = 4u;
+const uint RTR_SPP_WORD = 4u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
-const uint RTR_CAMERA_PREV_YAW_WORD = 20u;
-const uint RTR_CAMERA_PREV_PITCH_WORD = 21u;
-const uint RTR_CAMERA_PREV_RADIUS_WORD = 22u;
 
 const uint RTR_BRICK_SIZE = 4u;
 const uint RTR_BRICK_GRID_X = 32u;
@@ -28,14 +36,14 @@ const uint RTR_BRICK_CAPACITY = RTR_BRICK_GRID_X * RTR_BRICK_GRID_Y * RTR_BRICK_
 const uint RTR_BRICK_WORDS = 2u;
 const uint RTR_SCENE_MIN_WORD = 24u;
 const uint RTR_SCENE_MAX_WORD = 27u;
-const uint RTR_VOXEL_MAP_WORD = 32u;
-const uint RTR_VOXEL_BRICK_WORD = RTR_VOXEL_MAP_WORD + RTR_BRICK_CAPACITY;
+const uint RTR_DISTANCE_WORDS = RTR_BRICK_CAPACITY / 8u;
+const uint RTR_DISTANCE_WORD = 32u;
+const uint RTR_VOXEL_BRICK_WORD = RTR_DISTANCE_WORD + RTR_DISTANCE_WORDS;
+const uint RTR_BRICK_BOUNDS_WORD =
+    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
 const uint RTR_ENVMAP_WIDTH = 1024u;
 const uint RTR_ENVMAP_HEIGHT = 512u;
-const uint RTR_ENVMAP_WORD =
-    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
-const uint RTR_HISTORY_WORD =
-    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_ENVMAP_WORD = RTR_BRICK_BOUNDS_WORD + RTR_BRICK_CAPACITY;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
@@ -48,23 +56,20 @@ const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
 const float RTR_LIGHT_RADIUS = 0.7;
 const float RTR_TWO_PI = 6.28318530718;
-const uint RTR_PATH_BOUNCES = 3u;
-const uint RTR_SAMPLES_PER_PIXEL = 1u;
-const uint RTR_HISTORY_PIXEL_WORDS = 3u;
-const float RTR_HISTORY_MAX_FRAMES = 64.0;
-const float RTR_HISTORY_SKY_T = 60000.0;
+const uint RTR_PATH_BOUNCES = uint(RTR_BOUNCES);
 const float RTR_INDIRECT_LUMINANCE_CAP = 3.0;
+/* Indirect rays stop after this distance and shade as sky: grazing rays
+ * otherwise dominate traversal cost while carrying the least
+ * cosine-weighted energy. */
+#ifndef RTR_INDIRECT_MAX_T
+#define RTR_INDIRECT_MAX_T 3.0
+#endif
 
-shared uint shBrickCount;
-shared uint shFrameIndex;
+shared uint shSpp;
 shared vec3 shRo;
 shared vec3 shForward;
 shared vec3 shRight;
 shared vec3 shUp;
-shared vec3 shPrevRo;
-shared vec3 shPrevForward;
-shared vec3 shPrevRight;
-shared vec3 shPrevUp;
 shared vec3 shSceneMin;
 shared vec3 shSceneMax;
 shared vec3 shSceneExtent;
@@ -75,8 +80,6 @@ shared vec3 shInvBrickSize;
 shared vec3 shRayBase;
 shared vec3 shRayDx;
 shared vec3 shRayDy;
-shared vec2 shJitter;
-shared vec2 shPrevJitter;
 
 struct RTRVoxelHit {
     bool hit;
@@ -88,11 +91,6 @@ struct RTRVoxelHit {
 uint rtrLoadU32(uint word)
 {
     return rtrMem[word];
-}
-
-void rtrStoreU32(uint word, uint value)
-{
-    rtrMem[word] = value;
 }
 
 float rtrLoadF32(uint word)
@@ -111,46 +109,14 @@ uint rtrHashU32(uint value)
     return value;
 }
 
-uint rtrSeedPath(uvec2 coord, uint frameIndex, uint sampleIndex)
-{
-    uint seed = coord.x * 1973u ^
-                coord.y * 9277u ^
-                frameIndex * 26699u ^
-                sampleIndex * 31847u ^
-                0x9e3779b9u;
-
-    return rtrHashU32(seed) | 1u;
-}
-
-uint rtrRandomU32(inout uint state)
-{
-    state = state * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-float rtrRandom01(inout uint state)
-{
-    return float(rtrRandomU32(state) & 0x00ffffffu) * (1.0 / 16777216.0);
-}
-
-float rtrHaltonBase2(uint i)
+float rtrRadicalInverse2(uint i)
 {
     return float(bitfieldReverse(i)) * 2.3283064365386963e-10;
 }
 
-float rtrHaltonBase3(uint i)
+vec2 rtrHashToUnit2(uint h)
 {
-    float f = 1.0;
-    float r = 0.0;
-
-    while (i > 0u) {
-        f *= 1.0 / 3.0;
-        r += f * float(i % 3u);
-        i /= 3u;
-    }
-
-    return r;
+    return vec2(float(h & 0xffffu), float(h >> 16u)) * (1.0 / 65536.0);
 }
 
 vec3 rtrClampLuminance(vec3 color, float cap)
@@ -168,14 +134,17 @@ uint rtrBrickMapIndex(ivec3 brick)
                 int(RTR_BRICK_GRID_X) + brick.x);
 }
 
-uint rtrBrickMap(ivec3 brick)
+/* Chebyshev distance (in bricks) to the nearest occupied brick; zero means
+ * this brick has voxels. */
+uint rtrBrickDistance(uint brickIndex)
 {
-    return rtrLoadU32(RTR_VOXEL_MAP_WORD + rtrBrickMapIndex(brick));
+    return (rtrLoadU32(RTR_DISTANCE_WORD + (brickIndex >> 3u)) >>
+            ((brickIndex & 7u) * 4u)) & 0xfu;
 }
 
-uvec2 rtrBrickMask(uint brickRef)
+uvec2 rtrBrickMask(uint brickIndex)
 {
-    uint word = RTR_VOXEL_BRICK_WORD + (brickRef - 1u) * RTR_BRICK_WORDS;
+    uint word = RTR_VOXEL_BRICK_WORD + brickIndex * RTR_BRICK_WORDS;
     return uvec2(rtrLoadU32(word), rtrLoadU32(word + 1u));
 }
 
@@ -265,20 +234,10 @@ void rtrInitShared(vec2 szf)
     float cameraRadius = rtrLoadF32(RTR_CAMERA_RADIUS_WORD);
     float invH = 1.0 / max(szf.y, 1.0);
 
-    shFrameIndex = rtrLoadU32(RTR_FRAME_WORD);
-    shBrickCount = min(rtrLoadU32(RTR_BRICK_COUNT_WORD), RTR_BRICK_CAPACITY);
+    shSpp = clamp(rtrLoadU32(RTR_SPP_WORD), 1u, 256u);
 
-    uint jitterIndex = shFrameIndex % 256u + 1u;
-    uint prevJitterIndex = (shFrameIndex + 255u) % 256u + 1u;
-    shJitter = vec2(rtrHaltonBase2(jitterIndex), rtrHaltonBase3(jitterIndex));
-    shPrevJitter = vec2(rtrHaltonBase2(prevJitterIndex),
-                        rtrHaltonBase3(prevJitterIndex));
     rtrCamera(cameraYaw, cameraPitch, cameraRadius,
               shRo, shForward, shRight, shUp);
-    rtrCamera(rtrLoadF32(RTR_CAMERA_PREV_YAW_WORD),
-              rtrLoadF32(RTR_CAMERA_PREV_PITCH_WORD),
-              rtrLoadF32(RTR_CAMERA_PREV_RADIUS_WORD),
-              shPrevRo, shPrevForward, shPrevRight, shPrevUp);
 
     shSceneMin = vec3(rtrLoadF32(RTR_SCENE_MIN_WORD),
                       rtrLoadF32(RTR_SCENE_MIN_WORD + 1u),
@@ -327,80 +286,74 @@ bool rtrBoxHit(vec3 ro, vec3 invRd, vec3 bmin, vec3 bmax, out float t0, out floa
     return t0 <= t1;
 }
 
-void rtrDDASetup(vec3 ro,
-                 vec3 invRd,
-                 vec3 origin,
-                 vec3 cellSize,
-                 ivec3 cell,
-                 out ivec3 stepDir,
-                 out vec3 tMax,
-                 out vec3 tDelta)
-{
-    stepDir = ivec3(invRd.x >= 0.0 ? 1 : -1,
-                    invRd.y >= 0.0 ? 1 : -1,
-                    invRd.z >= 0.0 ? 1 : -1);
-    vec3 nextCell = vec3(cell) + max(vec3(stepDir), vec3(0.0));
-    vec3 boundary = origin + nextCell * cellSize;
-
-    tMax = (boundary - ro) * invRd;
-    tDelta = cellSize * abs(invRd);
-}
-
+/* DDA steps are select-based rather than branch-based: divergent rays in a
+ * SIMD group would otherwise serialize the three axis branches every step.
+ * The stepped axis is carried as a 0/1 mask and the normal is derived from
+ * it only at a hit. The ray is first clipped to the brick's occupied-voxel
+ * AABB, so rays that merely graze a brick (e.g. skimming above the floor
+ * layer) never start the voxel walk at all. */
 bool rtrTraceBrick(vec3 ro,
                    vec3 rd,
                    vec3 invRd,
+                   ivec3 stepDir,
+                   vec3 tDelta,
                    ivec3 brick,
-                   uvec2 mask,
+                   uint brickIndex,
                    float startT,
                    float endT,
-                   vec3 entryNormal,
+                   vec3 entrySel,
                    out RTRVoxelHit hit)
 {
+    uint bounds = rtrLoadU32(RTR_BRICK_BOUNDS_WORD + brickIndex);
+    vec3 boundsMin = vec3(uvec3(bounds, bounds >> 2u, bounds >> 4u) & 3u);
+    vec3 boundsMax = vec3((uvec3(bounds >> 6u, bounds >> 8u, bounds >> 10u)
+                           & 3u)) + 1.0;
     vec3 brickMin = shSceneMin + vec3(brick) * shBrickSize;
-    vec3 localP = clamp(ro + rd * (startT + RTR_EPS),
+    vec3 a = (brickMin + boundsMin * shVoxelSize - ro) * invRd;
+    vec3 b = (brickMin + boundsMax * shVoxelSize - ro) * invRd;
+    vec3 tLo = min(a, b);
+    vec3 tHi = max(a, b);
+    float t0 = max(max(tLo.x, tLo.y), max(tLo.z, startT));
+    float t1 = min(min(tHi.x, tHi.y), min(tHi.z, endT));
+
+    if (t0 > t1)
+        return false;
+
+    uvec2 mask = rtrBrickMask(brickIndex);
+    vec3 localP = clamp(ro + rd * (t0 + RTR_EPS),
                         brickMin,
                         brickMin + shBrickSize - shVoxelSize * 0.001);
-    ivec3 voxel = ivec3(floor((localP - brickMin) * shInvVoxelSize));
-    ivec3 stepDir;
-    vec3 tMax;
-    vec3 tDelta;
-    vec3 normal = entryNormal;
-    float t = startT;
+    ivec3 voxel = clamp(ivec3(floor((localP - brickMin) * shInvVoxelSize)),
+                        ivec3(0), ivec3(3));
+    vec3 nextCell = vec3(voxel) + max(vec3(stepDir), vec3(0.0));
+    vec3 tMax = (brickMin + nextCell * shVoxelSize - ro) * invRd;
+    vec3 sel = entrySel;
+    float t = t0;
 
-    voxel = clamp(voxel, ivec3(0), ivec3(3));
-    rtrDDASetup(ro, invRd, brickMin, shVoxelSize, voxel, stepDir, tMax, tDelta);
+    if (t0 > startT) {
+        bool ax = tLo.x >= tLo.y && tLo.x >= tLo.z;
+        bool ay = !ax && tLo.y >= tLo.z;
+        sel = vec3(ax, ay, !(ax || ay));
+    }
 
     for (uint i = 0u; i < 16u; i++) {
-        if (any(lessThan(voxel, ivec3(0))) ||
-            any(greaterThanEqual(voxel, ivec3(4))) ||
-            t > endT) {
+        if (any(greaterThanEqual(uvec3(voxel), uvec3(4u))) || t > t1)
             break;
-        }
 
         if (rtrMaskBit(mask, voxel)) {
             hit.hit = true;
             hit.t = t;
             hit.voxel = brick * int(RTR_BRICK_SIZE) + voxel;
-            hit.normal = normal;
+            hit.normal = vec3(-stepDir) * sel;
             return true;
         }
 
-        if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-            t = tMax.x;
-            tMax.x += tDelta.x;
-            voxel.x += stepDir.x;
-            normal = vec3(-float(stepDir.x), 0.0, 0.0);
-        } else if (tMax.y <= tMax.z) {
-            t = tMax.y;
-            tMax.y += tDelta.y;
-            voxel.y += stepDir.y;
-            normal = vec3(0.0, -float(stepDir.y), 0.0);
-        } else {
-            t = tMax.z;
-            tMax.z += tDelta.z;
-            voxel.z += stepDir.z;
-            normal = vec3(0.0, 0.0, -float(stepDir.z));
-        }
+        bool sx = tMax.x <= tMax.y && tMax.x <= tMax.z;
+        bool sy = !sx && tMax.y <= tMax.z;
+        sel = vec3(sx, sy, !(sx || sy));
+        t = sx ? tMax.x : (sy ? tMax.y : tMax.z);
+        tMax += sel * tDelta;
+        voxel += ivec3(sel) * stepDir;
     }
 
     return false;
@@ -419,52 +372,63 @@ bool rtrTraceVoxels(vec3 ro, vec3 rd, float maxT, out RTRVoxelHit hit)
     vec3 p = clamp(ro + rd * (tEnter + RTR_EPS),
                    shSceneMin,
                    shSceneMax - shBrickSize * 0.001);
-    ivec3 brick = ivec3(floor((p - shSceneMin) * shInvBrickSize));
-    ivec3 stepDir;
-    vec3 tMax;
-    vec3 tDelta;
-    vec3 normal = vec3(0.0, 1.0, 0.0);
+    ivec3 brick = clamp(ivec3(floor((p - shSceneMin) * shInvBrickSize)),
+                        ivec3(0), ivec3(RTR_BRICK_GRID_X - 1u,
+                                        RTR_BRICK_GRID_Y - 1u,
+                                        RTR_BRICK_GRID_Z - 1u));
+    ivec3 stepDir = ivec3(mix(ivec3(-1), ivec3(1),
+                              greaterThanEqual(invRd, vec3(0.0))));
+    vec3 tDeltaBrick = shBrickSize * abs(invRd);
+    vec3 tDeltaVoxel = shVoxelSize * abs(invRd);
+    vec3 nextCell = vec3(brick) + max(vec3(stepDir), vec3(0.0));
+    vec3 tMax = (shSceneMin + nextCell * shBrickSize - ro) * invRd;
+    vec3 sel = vec3(0.0, 1.0, 0.0);
     float t = tEnter;
 
-    brick = clamp(brick, ivec3(0), ivec3(RTR_BRICK_GRID_X - 1u,
-                                         RTR_BRICK_GRID_Y - 1u,
-                                         RTR_BRICK_GRID_Z - 1u));
-    rtrDDASetup(ro, invRd, shSceneMin, shBrickSize, brick, stepDir, tMax, tDelta);
-
     for (uint i = 0u; i < 96u; i++) {
-        if (any(lessThan(brick, ivec3(0))) ||
-            brick.x >= int(RTR_BRICK_GRID_X) ||
-            brick.y >= int(RTR_BRICK_GRID_Y) ||
-            brick.z >= int(RTR_BRICK_GRID_Z) ||
+        if (any(greaterThanEqual(uvec3(brick),
+                                 uvec3(RTR_BRICK_GRID_X,
+                                       RTR_BRICK_GRID_Y,
+                                       RTR_BRICK_GRID_Z))) ||
             t > tExit) {
             break;
         }
 
-        float nextT = min(min(tMax.x, tMax.y), tMax.z);
-        uint brickRef = rtrBrickMap(brick);
-        if (brickRef != 0u && brickRef <= shBrickCount) {
-            if (rtrTraceBrick(ro, rd, invRd, brick, rtrBrickMask(brickRef),
-                              t, min(nextT, tExit), normal, hit)) {
+        uint brickIndex = rtrBrickMapIndex(brick);
+        uint dist = rtrBrickDistance(brickIndex);
+        if (dist == 0u) {
+            float nextT = min(min(tMax.x, tMax.y), tMax.z);
+            if (rtrTraceBrick(ro, rd, invRd, stepDir, tDeltaVoxel, brick,
+                              brickIndex,
+                              t, min(nextT, tExit), sel, hit)) {
                 return true;
             }
+        } else if (dist > 1u) {
+            /* All bricks within Chebyshev radius dist-1 are empty, so the
+             * ray can jump to the exit of that box and re-enter the DDA
+             * there. */
+            float r = float(dist - 1u);
+            vec3 boxMin = shSceneMin + (vec3(brick) - r) * shBrickSize;
+            vec3 boxMax = shSceneMin + (vec3(brick) + (r + 1.0)) * shBrickSize;
+            vec3 tFar = max((boxMin - ro) * invRd, (boxMax - ro) * invRd);
+            bool jx = tFar.x <= tFar.y && tFar.x <= tFar.z;
+            bool jy = !jx && tFar.y <= tFar.z;
+
+            sel = vec3(jx, jy, !(jx || jy));
+            t = (jx ? tFar.x : (jy ? tFar.y : tFar.z)) + RTR_EPS;
+            brick = ivec3(floor((ro + rd * t - shSceneMin) * shInvBrickSize));
+            tMax = (shSceneMin +
+                    (vec3(brick) + max(vec3(stepDir), vec3(0.0))) * shBrickSize -
+                    ro) * invRd;
+            continue;
         }
 
-        if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-            t = tMax.x;
-            tMax.x += tDelta.x;
-            brick.x += stepDir.x;
-            normal = vec3(-float(stepDir.x), 0.0, 0.0);
-        } else if (tMax.y <= tMax.z) {
-            t = tMax.y;
-            tMax.y += tDelta.y;
-            brick.y += stepDir.y;
-            normal = vec3(0.0, -float(stepDir.y), 0.0);
-        } else {
-            t = tMax.z;
-            tMax.z += tDelta.z;
-            brick.z += stepDir.z;
-            normal = vec3(0.0, 0.0, -float(stepDir.z));
-        }
+        bool sx = tMax.x <= tMax.y && tMax.x <= tMax.z;
+        bool sy = !sx && tMax.y <= tMax.z;
+        sel = vec3(sx, sy, !(sx || sy));
+        t = sx ? tMax.x : (sy ? tMax.y : tMax.z);
+        tMax += sel * tDeltaBrick;
+        brick += ivec3(sel) * stepDir;
     }
 
     return false;
@@ -514,21 +478,19 @@ vec3 rtrTonemap(vec3 color)
     return sqrt(clamp(color, vec3(0.0), vec3(1.0)));
 }
 
-vec3 rtrRandomUnitVector(inout uint rng)
+vec3 rtrSphereDirection(vec2 u)
 {
-    float z = 1.0 - 2.0 * rtrRandom01(rng);
+    float z = 1.0 - 2.0 * u.x;
     float r = sqrt(max(0.0, 1.0 - z * z));
-    float phi = RTR_TWO_PI * rtrRandom01(rng);
+    float phi = RTR_TWO_PI * u.y;
 
     return vec3(cos(phi) * r, z, sin(phi) * r);
 }
 
-vec3 rtrCosineHemisphere(vec3 n, inout uint rng)
+vec3 rtrCosineHemisphere(vec3 n, vec2 u)
 {
-    float u0 = rtrRandom01(rng);
-    float u1 = rtrRandom01(rng);
-    float r = sqrt(u0);
-    float phi = RTR_TWO_PI * u1;
+    float r = sqrt(u.x);
+    float phi = RTR_TWO_PI * u.y;
     vec3 tangent = normalize(abs(n.y) < 0.999 ?
                              cross(vec3(0.0, 1.0, 0.0), n) :
                              cross(vec3(1.0, 0.0, 0.0), n));
@@ -536,7 +498,7 @@ vec3 rtrCosineHemisphere(vec3 n, inout uint rng)
 
     return normalize(tangent * (cos(phi) * r) +
                      bitangent * (sin(phi) * r) +
-                     n * sqrt(max(0.0, 1.0 - u0)));
+                     n * sqrt(max(0.0, 1.0 - u.x)));
 }
 
 float rtrVisibility(vec3 ro, vec3 rd, float maxT)
@@ -545,9 +507,9 @@ float rtrVisibility(vec3 ro, vec3 rd, float maxT)
     return rtrTraceVoxels(ro, rd, maxT - RTR_EPS * 8.0, blocker) ? 0.0 : 1.0;
 }
 
-vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, inout uint rng)
+vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, vec2 u)
 {
-    vec3 lightPoint = RTR_LIGHT_POS + rtrRandomUnitVector(rng) * RTR_LIGHT_RADIUS;
+    vec3 lightPoint = RTR_LIGHT_POS + rtrSphereDirection(u) * RTR_LIGHT_RADIUS;
     vec3 toLight = lightPoint - p;
     float lightDist2 = max(dot(toLight, toLight), 0.001);
     float lightDist = sqrt(lightDist2);
@@ -563,16 +525,19 @@ vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, inout uint rng)
     return albedo * RTR_LIGHT_COLOR * (ndl / lightDist2) * RTR_INV_PI * visibility;
 }
 
-vec3 rtrTracePath(vec3 ro, vec3 rd, inout uint rng, out float primaryT)
+/* Deeper bounces reuse the sample's base point with fixed per-bounce
+ * shifts instead of white noise: every lane in a SIMD group then follows
+ * the same relative path, which keeps secondary traversal coherent. */
+vec3 rtrTracePath(vec3 ro, vec3 rd, vec2 ham, vec2 uLight, vec2 uHemi)
 {
+    const vec2 bounceShift = vec2(0.7548777, 0.5698403);
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
 
-    primaryT = RTR_INF;
-
     for (uint bounce = 0u; bounce < RTR_PATH_BOUNCES; bounce++) {
         RTRVoxelHit hit;
-        if (!rtrTraceVoxels(ro, rd, RTR_INF, hit)) {
+        float maxT = bounce == 0u ? RTR_INF : float(RTR_INDIRECT_MAX_T);
+        if (!rtrTraceVoxels(ro, rd, maxT, hit)) {
             vec3 skyContribution = throughput * rtrSky(rd);
             if (bounce > 0u)
                 skyContribution = rtrClampLuminance(skyContribution,
@@ -581,13 +546,12 @@ vec3 rtrTracePath(vec3 ro, vec3 rd, inout uint rng, out float primaryT)
             break;
         }
 
-        if (bounce == 0u)
-            primaryT = hit.t;
-
         vec3 hitP = ro + rd * hit.t;
         vec3 n = dot(hit.normal, rd) < 0.0 ? hit.normal : -hit.normal;
         vec3 albedo = rtrVoxelAlbedo(hit.voxel, hitP, n);
-        vec3 directContribution = throughput * rtrDirectLight(hitP, n, albedo, rng);
+        vec2 uL = bounce == 0u ?
+            uLight : fract(ham + bounceShift * float(bounce));
+        vec3 directContribution = throughput * rtrDirectLight(hitP, n, albedo, uL);
 
         if (bounce > 0u)
             directContribution = rtrClampLuminance(directContribution,
@@ -598,174 +562,45 @@ vec3 rtrTracePath(vec3 ro, vec3 rd, inout uint rng, out float primaryT)
         if (bounce + 1u == RTR_PATH_BOUNCES)
             break;
 
+        vec2 uH = bounce == 0u ?
+            uHemi : fract(uHemi + bounceShift * float(bounce));
         ro = hitP + n * RTR_EPS * 8.0;
-        rd = rtrCosineHemisphere(n, rng);
+        rd = rtrCosineHemisphere(n, uH);
     }
 
     return radiance;
 }
 
-vec3 rtrRenderPixel(ivec2 p, out vec3 primaryRd, out float primaryT)
+/* Stratified, frame-independent sampling: every sample's Hammersley point
+ * is shifted by a per-pixel Cranley-Patterson rotation, so neighboring
+ * pixels decorrelate (banding becomes fine grain) while the image stays a
+ * pure function of camera pose and scene. The hemisphere rotation is
+ * deliberately scaled down: clustered bounce directions keep secondary
+ * rays coherent across a SIMD group, which is worth more than 2x in
+ * traversal time, while still breaking face-wide bias into grain. */
+vec3 rtrRenderPixel(ivec2 p)
 {
+    const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
+    float invSpp = 1.0 / float(shSpp);
+    uint h0 = rtrHashU32(uint(p.x) * 1973u ^ uint(p.y) * 9277u ^ 0x9e3779b9u);
+    uint h1 = rtrHashU32(h0);
+    uint h2 = rtrHashU32(h1);
+    vec2 rotPixel = rtrHashToUnit2(h0);
+    vec2 rotLight = rtrHashToUnit2(h1);
+    vec2 rotHemi = rtrHashToUnit2(h2) * hemiJitter;
     vec3 color = vec3(0.0);
 
-    primaryRd = rtrRayForPixel(vec2(p) + shJitter);
-    primaryT = RTR_INF;
+    for (uint sampleIndex = 0u; sampleIndex < shSpp; sampleIndex++) {
+        vec2 ham = vec2((float(sampleIndex) + 0.5) * invSpp,
+                        rtrRadicalInverse2(sampleIndex));
+        vec3 rd = rtrRayForPixel(vec2(p) + fract(ham + rotPixel));
 
-    for (uint sampleIndex = 0u;
-         sampleIndex < RTR_SAMPLES_PER_PIXEL;
-         sampleIndex++) {
-        uint rng = rtrSeedPath(uvec2(p), shFrameIndex, sampleIndex);
-        float t;
-        color += rtrTracePath(shRo, primaryRd, rng, t);
-        if (sampleIndex == 0u)
-            primaryT = t;
+        color += rtrTracePath(shRo, rd, ham,
+                              fract(ham + rotLight),
+                              fract(ham + rotHemi));
     }
 
-    return color / float(RTR_SAMPLES_PER_PIXEL);
-}
-
-/* History is stored Karis tonemapped (c / (1 + luma)): outliers are
- * compressed before they enter the running average, and values stay in
- * [0, 1) where fp16 keeps enough precision for small blend increments. */
-vec3 rtrHistoryEncode(vec3 color)
-{
-    return color / (1.0 + dot(color, vec3(0.2126, 0.7152, 0.0722)));
-}
-
-vec3 rtrHistoryDecode(vec3 color)
-{
-    return color / max(1.0 - dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.05);
-}
-
-vec4 rtrCatmullRomWeights(float t)
-{
-    float t2 = t * t;
-    float t3 = t2 * t;
-
-    return vec4(0.5 * (-t3 + 2.0 * t2 - t),
-                0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
-                0.5 * (-3.0 * t3 + 4.0 * t2 + t),
-                0.5 * (t3 - t2));
-}
-
-vec3 rtrResolveHistory(vec3 color,
-                       ivec2 p,
-                       ivec2 sz,
-                       vec3 primaryRd,
-                       float primaryT)
-{
-    uint pixelWords = uint(sz.x * sz.y) * RTR_HISTORY_PIXEL_WORDS;
-    uint parity = shFrameIndex & 1u;
-    uint dstBase = RTR_HISTORY_WORD + parity * pixelWords;
-    uint srcBase = RTR_HISTORY_WORD + (parity ^ 1u) * pixelWords;
-    bool sky = primaryT >= RTR_INF * 0.5;
-    vec3 history = vec3(0.0);
-    float historyFrames = 0.0;
-    float historyWeight = 0.0;
-
-    if (shFrameIndex > 0u) {
-        vec3 prevDir = sky ? primaryRd
-                           : shRo + primaryRd * primaryT - shPrevRo;
-        float fwd = dot(prevDir, shPrevForward);
-        if (fwd > 0.0) {
-            vec2 szf = vec2(sz);
-            float a = RTR_FOCAL * dot(prevDir, shPrevRight) / fwd;
-            float b = RTR_FOCAL * dot(prevDir, shPrevUp) / fwd;
-            /* The previous frame sampled pixel q through q + prevJitter,
-             * so subtracting the jitter puts texel q's sample exactly at
-             * integer coordinate q for the filtered fetch. */
-            vec2 q = vec2(0.5 * (a * szf.y - 1.0 + szf.x),
-                          0.5 * (szf.y - 1.0 - b * szf.y)) - shPrevJitter;
-            ivec2 q0 = ivec2(floor(q));
-            vec2 qf = q - vec2(q0);
-            float prevDist = length(prevDir);
-            vec4 wx = rtrCatmullRomWeights(qf.x);
-            vec4 wy = rtrCatmullRomWeights(qf.y);
-            vec3 sharp = vec3(0.0);
-            vec3 innerMin = vec3(1.0e9);
-            vec3 innerMax = vec3(-1.0e9);
-            vec3 anyHistory = vec3(0.0);
-            float anyFrames = 0.0;
-            float anyCount = 0.0;
-            bool allValid = true;
-
-            /* 4x4 neighborhood: the inner 2x2 builds a per-tap validated
-             * bilinear average; when every tap is valid the full
-             * Catmull-Rom kernel is used instead, which stays sharp under
-             * repeated per-frame resampling where bilinear blurs. */
-            for (int tap = 0; tap < 16; tap++) {
-                ivec2 offset = ivec2(tap & 3, tap >> 2);
-                ivec2 qt = q0 + offset - 1;
-                bool valid = all(greaterThanEqual(qt, ivec2(0))) &&
-                             all(lessThan(qt, sz));
-
-                if (valid) {
-                    uint src = srcBase +
-                               uint(qt.y * sz.x + qt.x) *
-                                   RTR_HISTORY_PIXEL_WORDS;
-                    vec2 rg = unpackHalf2x16(rtrLoadU32(src));
-                    vec2 bt = unpackHalf2x16(rtrLoadU32(src + 1u));
-                    float tapFrames = uintBitsToFloat(rtrLoadU32(src + 2u));
-                    valid = sky ?
-                        bt.y > RTR_HISTORY_SKY_T * 0.5 :
-                        abs(bt.y - prevDist) < prevDist * 0.05 + 0.02;
-
-                    if (valid) {
-                        vec3 c = vec3(rg, bt.x);
-                        sharp += c * (wx[offset.x] * wy[offset.y]);
-                        anyHistory += c;
-                        anyFrames += tapFrames;
-                        anyCount += 1.0;
-                        if (offset.x >= 1 && offset.x <= 2 &&
-                            offset.y >= 1 && offset.y <= 2) {
-                            float w = (offset.x == 2 ? qf.x : 1.0 - qf.x) *
-                                      (offset.y == 2 ? qf.y : 1.0 - qf.y);
-                            history += c * w;
-                            historyFrames += tapFrames * w;
-                            historyWeight += w;
-                            innerMin = min(innerMin, c);
-                            innerMax = max(innerMax, c);
-                        }
-                    }
-                }
-
-                allValid = allValid && valid;
-            }
-
-            /* Catmull-Rom lobes can over/undershoot; clamping to the
-             * bilinear footprint's range keeps the sharpness without
-             * letting the encoded color escape the valid history range. */
-            if (allValid) {
-                history = clamp(sharp, innerMin, innerMax) * historyWeight;
-            } else if (historyWeight <= 0.01 && anyCount > 0.0) {
-                /* The bilinear footprint missed (jitter pushed this
-                 * pixel's sample onto its minority surface), but the
-                 * wider 4x4 holds validated history for the same
-                 * surface; borrowing it beats a raw 1-spp sample. */
-                history = anyHistory;
-                historyFrames = anyFrames;
-                historyWeight = anyCount;
-            }
-        }
-    }
-
-    vec3 encoded = rtrHistoryEncode(color);
-    float frames = 1.0;
-    if (historyWeight > 0.01) {
-        history /= historyWeight;
-        frames = min(historyFrames / historyWeight + 1.0,
-                     RTR_HISTORY_MAX_FRAMES);
-        encoded = mix(history, encoded, 1.0 / frames);
-    }
-
-    uint dst = dstBase + uint(p.y * sz.x + p.x) * RTR_HISTORY_PIXEL_WORDS;
-    rtrStoreU32(dst, packHalf2x16(encoded.rg));
-    rtrStoreU32(dst + 1u, packHalf2x16(vec2(encoded.b,
-                                            sky ? RTR_HISTORY_SKY_T : primaryT)));
-    rtrStoreU32(dst + 2u, floatBitsToUint(frames));
-
-    return rtrHistoryDecode(encoded);
+    return color * invSpp;
 }
 
 void main()
@@ -781,10 +616,5 @@ void main()
     if (any(greaterThanEqual(p, sz)))
         return;
 
-    vec3 primaryRd;
-    float primaryT;
-    vec3 color = rtrRenderPixel(p, primaryRd, primaryT);
-
-    color = rtrResolveHistory(color, p, sz, primaryRd, primaryT);
-    imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+    imageStore(rtrOutImage, p, vec4(rtrTonemap(rtrRenderPixel(p)), 1.0));
 }

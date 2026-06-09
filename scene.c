@@ -20,6 +20,8 @@
 #define RTR_SCENE_BRICK_CAPACITY \
     (RTR_SCENE_BRICK_GRID_X * RTR_SCENE_BRICK_GRID_Y * RTR_SCENE_BRICK_GRID_Z)
 #define RTR_SCENE_BRICK_WORDS 2u
+#define RTR_SCENE_DISTANCE_WORDS (RTR_SCENE_BRICK_CAPACITY / 8u)
+#define RTR_SCENE_DISTANCE_MAX 15u
 #define RTR_SCENE_VOXEL_SIZE 0.055f
 #define RTR_SCENE_FLOOR_Y -1.0f
 #define RTR_SCENE_CASTLE_OFFSET_X \
@@ -37,12 +39,14 @@ enum {
     RTR_SCENE_BRICK_GRID_Z_WORD = 11,
     RTR_SCENE_QUANT_MIN_WORD = 24,
     RTR_SCENE_QUANT_MAX_WORD = 27,
-    RTR_SCENE_VOXEL_MAP_WORD = 32,
+    RTR_SCENE_DISTANCE_WORD = 32,
     RTR_SCENE_VOXEL_BRICK_WORD =
-        RTR_SCENE_VOXEL_MAP_WORD + RTR_SCENE_BRICK_CAPACITY,
-    RTR_SCENE_ENVMAP_WORD =
+        RTR_SCENE_DISTANCE_WORD + RTR_SCENE_DISTANCE_WORDS,
+    RTR_SCENE_BRICK_BOUNDS_WORD =
         RTR_SCENE_VOXEL_BRICK_WORD +
         RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS,
+    RTR_SCENE_ENVMAP_WORD =
+        RTR_SCENE_BRICK_BOUNDS_WORD + RTR_SCENE_BRICK_CAPACITY,
 };
 
 static uint32_t rtrF32Word(float value)
@@ -329,22 +333,116 @@ static void rtrStoreSceneBounds(uint32_t *words)
     }
 }
 
+/* Two-pass 26-neighbor chamfer computes the exact Chebyshev distance from
+ * every empty brick to the nearest occupied one; the shader uses it to
+ * jump rays across guaranteed-empty boxes instead of stepping brick by
+ * brick. */
+static void rtrStoreBrickDistance(uint32_t *words, const uint8_t *dist0)
+{
+    uint8_t *dist = (uint8_t *)malloc(RTR_SCENE_BRICK_CAPACITY);
+
+    if (!dist) {
+        fprintf(stderr, "scene: distance allocation failed\n");
+        memset(words + RTR_SCENE_DISTANCE_WORD,
+               0,
+               RTR_SCENE_DISTANCE_WORDS * sizeof(uint32_t));
+        return;
+    }
+
+    memcpy(dist, dist0, RTR_SCENE_BRICK_CAPACITY);
+
+    for (uint32_t pass = 0u; pass < 2u; pass++) {
+        const int32_t dir = pass == 0u ? 1 : -1;
+
+        for (int32_t sy = 0; sy < (int32_t)RTR_SCENE_BRICK_GRID_Y; sy++) {
+            for (int32_t sz = 0; sz < (int32_t)RTR_SCENE_BRICK_GRID_Z; sz++) {
+                for (int32_t sx = 0; sx < (int32_t)RTR_SCENE_BRICK_GRID_X; sx++) {
+                    const int32_t by = pass == 0u ?
+                        sy : (int32_t)RTR_SCENE_BRICK_GRID_Y - 1 - sy;
+                    const int32_t bz = pass == 0u ?
+                        sz : (int32_t)RTR_SCENE_BRICK_GRID_Z - 1 - sz;
+                    const int32_t bx = pass == 0u ?
+                        sx : (int32_t)RTR_SCENE_BRICK_GRID_X - 1 - sx;
+                    uint8_t best = dist[rtrBrickIndex((uint32_t)bx,
+                                                      (uint32_t)by,
+                                                      (uint32_t)bz)];
+
+                    for (int32_t ny = -1; ny <= 1; ny++) {
+                        for (int32_t nz = -1; nz <= 1; nz++) {
+                            for (int32_t nx = -1; nx <= 1; nx++) {
+                                const int32_t scan =
+                                    (ny * (int32_t)RTR_SCENE_BRICK_GRID_Z + nz) *
+                                    (int32_t)RTR_SCENE_BRICK_GRID_X + nx;
+                                const int32_t qx = bx + nx * dir;
+                                const int32_t qy = by + ny * dir;
+                                const int32_t qz = bz + nz * dir;
+
+                                if (scan >= 0) continue;
+                                if (qx < 0 || qy < 0 || qz < 0 ||
+                                    qx >= (int32_t)RTR_SCENE_BRICK_GRID_X ||
+                                    qy >= (int32_t)RTR_SCENE_BRICK_GRID_Y ||
+                                    qz >= (int32_t)RTR_SCENE_BRICK_GRID_Z) {
+                                    continue;
+                                }
+
+                                const uint8_t candidate =
+                                    dist[rtrBrickIndex((uint32_t)qx,
+                                                       (uint32_t)qy,
+                                                       (uint32_t)qz)];
+                                if (candidate < 255u &&
+                                    (uint8_t)(candidate + 1u) < best)
+                                    best = (uint8_t)(candidate + 1u);
+                            }
+                        }
+                    }
+
+                    dist[rtrBrickIndex((uint32_t)bx,
+                                       (uint32_t)by,
+                                       (uint32_t)bz)] = best;
+                }
+            }
+        }
+    }
+
+    memset(words + RTR_SCENE_DISTANCE_WORD,
+           0,
+           RTR_SCENE_DISTANCE_WORDS * sizeof(uint32_t));
+    for (uint32_t i = 0u; i < RTR_SCENE_BRICK_CAPACITY; i++) {
+        const uint32_t clamped = dist[i] > RTR_SCENE_DISTANCE_MAX ?
+            RTR_SCENE_DISTANCE_MAX : dist[i];
+        words[RTR_SCENE_DISTANCE_WORD + i / 8u] |= clamped << ((i % 8u) * 4u);
+    }
+
+    free(dist);
+}
+
+/* Masks are stored dense (indexed by brick coordinate) so traversal needs
+ * no map indirection. */
 static uint32_t rtrStoreVoxelBricks(uint32_t *words, const uint8_t *voxels)
 {
+    uint8_t *dist0 = (uint8_t *)malloc(RTR_SCENE_BRICK_CAPACITY);
     uint32_t brickCount = 0u;
 
-    memset(words + RTR_SCENE_VOXEL_MAP_WORD,
-           0,
-           RTR_SCENE_BRICK_CAPACITY * sizeof(uint32_t));
+    if (!dist0) {
+        fprintf(stderr, "scene: occupancy allocation failed\n");
+        return 0u;
+    }
+
+    memset(dist0, 255, RTR_SCENE_BRICK_CAPACITY);
     memset(words + RTR_SCENE_VOXEL_BRICK_WORD,
            0,
            RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS * sizeof(uint32_t));
+    memset(words + RTR_SCENE_BRICK_BOUNDS_WORD,
+           0,
+           RTR_SCENE_BRICK_CAPACITY * sizeof(uint32_t));
 
     for (uint32_t by = 0u; by < RTR_SCENE_BRICK_GRID_Y; by++) {
         for (uint32_t bz = 0u; bz < RTR_SCENE_BRICK_GRID_Z; bz++) {
             for (uint32_t bx = 0u; bx < RTR_SCENE_BRICK_GRID_X; bx++) {
                 uint32_t maskLo = 0u;
                 uint32_t maskHi = 0u;
+                uint32_t boundsMin[3] = {3u, 3u, 3u};
+                uint32_t boundsMax[3] = {0u, 0u, 0u};
 
                 for (uint32_t ly = 0u; ly < RTR_SCENE_BRICK_SIZE; ly++) {
                     for (uint32_t lz = 0u; lz < RTR_SCENE_BRICK_SIZE; lz++) {
@@ -359,22 +457,35 @@ static uint32_t rtrStoreVoxelBricks(uint32_t *words, const uint8_t *voxels)
                                 maskLo |= 1u << bit;
                             else
                                 maskHi |= 1u << (bit - 32u);
+                            if (lx < boundsMin[0]) boundsMin[0] = lx;
+                            if (ly < boundsMin[1]) boundsMin[1] = ly;
+                            if (lz < boundsMin[2]) boundsMin[2] = lz;
+                            if (lx > boundsMax[0]) boundsMax[0] = lx;
+                            if (ly > boundsMax[1]) boundsMax[1] = ly;
+                            if (lz > boundsMax[2]) boundsMax[2] = lz;
                         }
                     }
                 }
 
                 if (!(maskLo || maskHi)) continue;
 
-                const uint32_t brickMap = rtrBrickIndex(bx, by, bz);
-                const uint32_t brickWord =
-                    RTR_SCENE_VOXEL_BRICK_WORD + brickCount * RTR_SCENE_BRICK_WORDS;
-                words[RTR_SCENE_VOXEL_MAP_WORD + brickMap] = brickCount + 1u;
+                const uint32_t brickIndex = rtrBrickIndex(bx, by, bz);
+                const uint32_t brickWord = RTR_SCENE_VOXEL_BRICK_WORD +
+                    brickIndex * RTR_SCENE_BRICK_WORDS;
+                dist0[brickIndex] = 0u;
                 words[brickWord] = maskLo;
                 words[brickWord + 1u] = maskHi;
+                words[RTR_SCENE_BRICK_BOUNDS_WORD + brickIndex] =
+                    boundsMin[0] | (boundsMin[1] << 2u) | (boundsMin[2] << 4u) |
+                    (boundsMax[0] << 6u) | (boundsMax[1] << 8u) |
+                    (boundsMax[2] << 10u);
                 brickCount++;
             }
         }
     }
+
+    rtrStoreBrickDistance(words, dist0);
+    free(dist0);
 
     return brickCount;
 }
