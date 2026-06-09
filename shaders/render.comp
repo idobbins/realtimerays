@@ -50,8 +50,10 @@ const float RTR_LIGHT_RADIUS = 0.7;
 const float RTR_TWO_PI = 6.28318530718;
 const uint RTR_PATH_BOUNCES = 3u;
 const uint RTR_SAMPLES_PER_PIXEL = 1u;
-const float RTR_HISTORY_BLEND = 0.9;
+const uint RTR_HISTORY_PIXEL_WORDS = 3u;
+const float RTR_HISTORY_MAX_FRAMES = 64.0;
 const float RTR_HISTORY_SKY_T = 60000.0;
+const float RTR_INDIRECT_LUMINANCE_CAP = 3.0;
 
 shared uint shBrickCount;
 shared uint shFrameIndex;
@@ -73,6 +75,8 @@ shared vec3 shInvBrickSize;
 shared vec3 shRayBase;
 shared vec3 shRayDx;
 shared vec3 shRayDy;
+shared vec2 shJitter;
+shared vec2 shPrevJitter;
 
 struct RTRVoxelHit {
     bool hit;
@@ -128,6 +132,34 @@ uint rtrRandomU32(inout uint state)
 float rtrRandom01(inout uint state)
 {
     return float(rtrRandomU32(state) & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
+float rtrHaltonBase2(uint i)
+{
+    return float(bitfieldReverse(i)) * 2.3283064365386963e-10;
+}
+
+float rtrHaltonBase3(uint i)
+{
+    float f = 1.0;
+    float r = 0.0;
+
+    while (i > 0u) {
+        f *= 1.0 / 3.0;
+        r += f * float(i % 3u);
+        i /= 3u;
+    }
+
+    return r;
+}
+
+vec3 rtrClampLuminance(vec3 color, float cap)
+{
+    float luminance = dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    if (luminance > cap)
+        color *= cap / luminance;
+
+    return color;
 }
 
 uint rtrBrickMapIndex(ivec3 brick)
@@ -192,11 +224,8 @@ vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight,
     vec3 c01 = vec3(rg01, ba01.x);
     vec3 c11 = vec3(rg11, ba11.x);
     vec3 color = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
-    float luminance = dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
-    if (luminance > cap)
-        color *= cap / luminance;
 
-    return color;
+    return rtrClampLuminance(color, cap);
 }
 
 vec3 rtrSky(vec3 rd)
@@ -238,6 +267,12 @@ void rtrInitShared(vec2 szf)
 
     shFrameIndex = rtrLoadU32(RTR_FRAME_WORD);
     shBrickCount = min(rtrLoadU32(RTR_BRICK_COUNT_WORD), RTR_BRICK_CAPACITY);
+
+    uint jitterIndex = shFrameIndex % 256u + 1u;
+    uint prevJitterIndex = (shFrameIndex + 255u) % 256u + 1u;
+    shJitter = vec2(rtrHaltonBase2(jitterIndex), rtrHaltonBase3(jitterIndex));
+    shPrevJitter = vec2(rtrHaltonBase2(prevJitterIndex),
+                        rtrHaltonBase3(prevJitterIndex));
     rtrCamera(cameraYaw, cameraPitch, cameraRadius,
               shRo, shForward, shRight, shUp);
     rtrCamera(rtrLoadF32(RTR_CAMERA_PREV_YAW_WORD),
@@ -538,7 +573,11 @@ vec3 rtrTracePath(vec3 ro, vec3 rd, inout uint rng, out float primaryT)
     for (uint bounce = 0u; bounce < RTR_PATH_BOUNCES; bounce++) {
         RTRVoxelHit hit;
         if (!rtrTraceVoxels(ro, rd, RTR_INF, hit)) {
-            radiance += throughput * rtrSky(rd);
+            vec3 skyContribution = throughput * rtrSky(rd);
+            if (bounce > 0u)
+                skyContribution = rtrClampLuminance(skyContribution,
+                                                    RTR_INDIRECT_LUMINANCE_CAP);
+            radiance += skyContribution;
             break;
         }
 
@@ -548,8 +587,12 @@ vec3 rtrTracePath(vec3 ro, vec3 rd, inout uint rng, out float primaryT)
         vec3 hitP = ro + rd * hit.t;
         vec3 n = dot(hit.normal, rd) < 0.0 ? hit.normal : -hit.normal;
         vec3 albedo = rtrVoxelAlbedo(hit.voxel, hitP, n);
+        vec3 directContribution = throughput * rtrDirectLight(hitP, n, albedo, rng);
 
-        radiance += throughput * rtrDirectLight(hitP, n, albedo, rng);
+        if (bounce > 0u)
+            directContribution = rtrClampLuminance(directContribution,
+                                                   RTR_INDIRECT_LUMINANCE_CAP);
+        radiance += directContribution;
         throughput *= albedo;
 
         if (bounce + 1u == RTR_PATH_BOUNCES)
@@ -566,24 +609,33 @@ vec3 rtrRenderPixel(ivec2 p, out vec3 primaryRd, out float primaryT)
 {
     vec3 color = vec3(0.0);
 
-    primaryRd = vec3(0.0);
+    primaryRd = rtrRayForPixel(vec2(p) + shJitter);
     primaryT = RTR_INF;
 
     for (uint sampleIndex = 0u;
          sampleIndex < RTR_SAMPLES_PER_PIXEL;
          sampleIndex++) {
         uint rng = rtrSeedPath(uvec2(p), shFrameIndex, sampleIndex);
-        vec2 jitter = vec2(rtrRandom01(rng), rtrRandom01(rng));
-        vec3 rd = rtrRayForPixel(vec2(p) + jitter);
         float t;
-        color += rtrTracePath(shRo, rd, rng, t);
-        if (sampleIndex == 0u) {
-            primaryRd = rd;
+        color += rtrTracePath(shRo, primaryRd, rng, t);
+        if (sampleIndex == 0u)
             primaryT = t;
-        }
     }
 
     return color / float(RTR_SAMPLES_PER_PIXEL);
+}
+
+/* History is stored Karis tonemapped (c / (1 + luma)): outliers are
+ * compressed before they enter the running average, and values stay in
+ * [0, 1) where fp16 keeps enough precision for small blend increments. */
+vec3 rtrHistoryEncode(vec3 color)
+{
+    return color / (1.0 + dot(color, vec3(0.2126, 0.7152, 0.0722)));
+}
+
+vec3 rtrHistoryDecode(vec3 color)
+{
+    return color / max(1.0 - dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.05);
 }
 
 vec3 rtrResolveHistory(vec3 color,
@@ -592,11 +644,14 @@ vec3 rtrResolveHistory(vec3 color,
                        vec3 primaryRd,
                        float primaryT)
 {
-    uint pixelWords = uint(sz.x * sz.y) * 2u;
+    uint pixelWords = uint(sz.x * sz.y) * RTR_HISTORY_PIXEL_WORDS;
     uint parity = shFrameIndex & 1u;
     uint dstBase = RTR_HISTORY_WORD + parity * pixelWords;
     uint srcBase = RTR_HISTORY_WORD + (parity ^ 1u) * pixelWords;
     bool sky = primaryT >= RTR_INF * 0.5;
+    vec3 history = vec3(0.0);
+    float historyFrames = 0.0;
+    float historyWeight = 0.0;
 
     if (shFrameIndex > 0u) {
         vec3 prevDir = sky ? primaryRd
@@ -606,29 +661,61 @@ vec3 rtrResolveHistory(vec3 color,
             vec2 szf = vec2(sz);
             float a = RTR_FOCAL * dot(prevDir, shPrevRight) / fwd;
             float b = RTR_FOCAL * dot(prevDir, shPrevUp) / fwd;
-            ivec2 q = ivec2(floor(
-                vec2(0.5 * (a * szf.y - 1.0 + szf.x),
-                     0.5 * (szf.y - 1.0 - b * szf.y))));
-            if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, sz))) {
-                uint src = srcBase + uint(q.y * sz.x + q.x) * 2u;
+            /* The previous frame sampled pixel q through q + prevJitter,
+             * so subtracting the jitter puts texel q's sample exactly at
+             * integer coordinate q for the bilinear fetch. */
+            vec2 q = vec2(0.5 * (a * szf.y - 1.0 + szf.x),
+                          0.5 * (szf.y - 1.0 - b * szf.y)) - shPrevJitter;
+            ivec2 q0 = ivec2(floor(q));
+            vec2 qf = q - vec2(q0);
+            float prevDist = length(prevDir);
+
+            for (int tap = 0; tap < 4; tap++) {
+                ivec2 offset = ivec2(tap & 1, tap >> 1);
+                ivec2 qt = q0 + offset;
+                if (any(lessThan(qt, ivec2(0))) ||
+                    any(greaterThanEqual(qt, sz))) {
+                    continue;
+                }
+
+                float w = (offset.x == 1 ? qf.x : 1.0 - qf.x) *
+                          (offset.y == 1 ? qf.y : 1.0 - qf.y);
+                if (w <= 0.0)
+                    continue;
+
+                uint src = srcBase +
+                           uint(qt.y * sz.x + qt.x) * RTR_HISTORY_PIXEL_WORDS;
                 vec2 rg = unpackHalf2x16(rtrLoadU32(src));
                 vec2 bt = unpackHalf2x16(rtrLoadU32(src + 1u));
-                float prevDist = length(prevDir);
                 bool valid = sky ?
                     bt.y > RTR_HISTORY_SKY_T * 0.5 :
                     abs(bt.y - prevDist) < prevDist * 0.05 + 0.02;
-                if (valid)
-                    color = mix(color, vec3(rg, bt.x), RTR_HISTORY_BLEND);
+                if (!valid)
+                    continue;
+
+                history += vec3(rg, bt.x) * w;
+                historyFrames += uintBitsToFloat(rtrLoadU32(src + 2u)) * w;
+                historyWeight += w;
             }
         }
     }
 
-    uint dst = dstBase + uint(p.y * sz.x + p.x) * 2u;
-    rtrStoreU32(dst, packHalf2x16(color.rg));
-    rtrStoreU32(dst + 1u, packHalf2x16(vec2(color.b,
-                                            sky ? RTR_HISTORY_SKY_T : primaryT)));
+    vec3 encoded = rtrHistoryEncode(color);
+    float frames = 1.0;
+    if (historyWeight > 0.01) {
+        history /= historyWeight;
+        frames = min(historyFrames / historyWeight + 1.0,
+                     RTR_HISTORY_MAX_FRAMES);
+        encoded = mix(history, encoded, 1.0 / frames);
+    }
 
-    return color;
+    uint dst = dstBase + uint(p.y * sz.x + p.x) * RTR_HISTORY_PIXEL_WORDS;
+    rtrStoreU32(dst, packHalf2x16(encoded.rg));
+    rtrStoreU32(dst + 1u, packHalf2x16(vec2(encoded.b,
+                                            sky ? RTR_HISTORY_SKY_T : primaryT)));
+    rtrStoreU32(dst + 2u, floatBitsToUint(frames));
+
+    return rtrHistoryDecode(encoded);
 }
 
 void main()
