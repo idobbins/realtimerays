@@ -1,0 +1,581 @@
+#version 460
+
+#ifndef RTR_RENDER_PASS
+#define RTR_RENDER_PASS 0
+#endif
+
+#if RTR_RENDER_PASS == 0 || RTR_RENDER_PASS == 1
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#else
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#endif
+
+layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
+
+layout(std430, binding = 1) buffer RTRMemory {
+    uint rtrMem[];
+};
+
+const uint RTR_TRIANGLE_COUNT_WORD = 8u;
+const uint RTR_CAMERA_YAW_WORD = 17u;
+const uint RTR_CAMERA_PITCH_WORD = 18u;
+const uint RTR_CAMERA_RADIUS_WORD = 19u;
+
+const uint RTR_MAX_TRIANGLES = 900000u;
+const uint RTR_MAX_BVH_NODES = RTR_MAX_TRIANGLES * 2u - 1u;
+
+const uint RTR_SCENE_QUANT_MIN_WORD = 24u;
+const uint RTR_SCENE_QUANT_MAX_WORD = 27u;
+const uint RTR_TRIANGLE_GEOM_WORD = 32u;
+const uint RTR_TRIANGLE_WORDS = 5u;
+const uint RTR_BVH_NODE_WORD = RTR_TRIANGLE_GEOM_WORD +
+    RTR_MAX_TRIANGLES * RTR_TRIANGLE_WORDS;
+const uint RTR_BVH_NODE_WORDS = 8u;
+const uint RTR_BLUE_NOISE_SIZE = 64u;
+const uint RTR_BLUE_NOISE_WORD =
+    RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
+const uint RTR_ENVMAP_WIDTH = 1024u;
+const uint RTR_ENVMAP_HEIGHT = 512u;
+const uint RTR_ENVMAP_WORD =
+    RTR_BLUE_NOISE_WORD + RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE;
+const uint RTR_ENVMAP_DIFFUSE_WIDTH = 32u;
+const uint RTR_ENVMAP_DIFFUSE_HEIGHT = 16u;
+const uint RTR_ENVMAP_DIFFUSE_WORD =
+    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_TILE_COUNT_WORD =
+    RTR_ENVMAP_DIFFUSE_WORD +
+    RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u;
+
+const uint RTR_FORWARD_TILE_SIZE = 16u;
+const uint RTR_FORWARD_TILE_CAPACITY = 1024u;
+
+const float RTR_INF = 1.0e20;
+const float RTR_EPS = 0.0001;
+const float RTR_FOCAL = 1.35;
+const float RTR_INV_PI = 0.31830988618;
+const float RTR_ENVMAP_LUMINANCE_CAP = 12.0;
+const float RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP = 2.0;
+const float RTR_ENVMAP_DIFFUSE_EXPOSURE = 0.7;
+const vec3 RTR_ENVMAP_AVERAGE = vec3(0.489, 0.549, 0.574);
+const float RTR_FLOOR_Y = -1.0;
+const float RTR_FLOOR_HALF_EXTENT = 26.0;
+const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
+const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
+const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
+
+shared uint shTriangleCount;
+shared vec3 shRo;
+shared vec3 shForward;
+shared vec3 shRight;
+shared vec3 shUp;
+shared vec3 shSceneQuantMin;
+shared vec3 shSceneQuantMax;
+shared vec3 shSceneQuantScale;
+shared vec3 shRayBase;
+shared vec3 shRayDx;
+shared vec3 shRayDy;
+
+struct RTRTriangle {
+    vec3 v0;
+    vec3 v1;
+    vec3 v2;
+};
+
+struct RTRProjectedVertex {
+    vec2 p;
+};
+
+struct RTRProjectedTriangle {
+    RTRProjectedVertex a;
+    RTRProjectedVertex b;
+    RTRProjectedVertex c;
+};
+
+uint rtrLoadU32(uint word)
+{
+    return rtrMem[word];
+}
+
+void rtrStoreU32(uint word, uint value)
+{
+    rtrMem[word] = value;
+}
+
+float rtrLoadF32(uint word)
+{
+    return uintBitsToFloat(rtrLoadU32(word));
+}
+
+uint rtrHashU32(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+
+    return value;
+}
+
+uvec2 rtrTileGrid(ivec2 sz)
+{
+    return (uvec2(sz) + uvec2(RTR_FORWARD_TILE_SIZE - 1u)) /
+        RTR_FORWARD_TILE_SIZE;
+}
+
+uint rtrTileCount(ivec2 sz)
+{
+    uvec2 grid = rtrTileGrid(sz);
+    return grid.x * grid.y;
+}
+
+uint rtrTileListWord(ivec2 sz)
+{
+    return RTR_TILE_COUNT_WORD + rtrTileCount(sz);
+}
+
+uint rtrTileIndex(uvec2 tile, uvec2 tileGrid)
+{
+    return tile.y * tileGrid.x + tile.x;
+}
+
+uint rtrTileWord(uint tileIndex)
+{
+    return RTR_TILE_COUNT_WORD + tileIndex;
+}
+
+uint rtrTileItemWord(ivec2 sz, uint tileIndex, uint itemIndex)
+{
+    return rtrTileListWord(sz) +
+        tileIndex * RTR_FORWARD_TILE_CAPACITY +
+        itemIndex;
+}
+
+RTRTriangle rtrLoadTriangle(uint i)
+{
+    uint word = RTR_TRIANGLE_GEOM_WORD + i * RTR_TRIANGLE_WORDS;
+    uint w0 = rtrLoadU32(word);
+    uint w1 = rtrLoadU32(word + 1u);
+    uint w2 = rtrLoadU32(word + 2u);
+    uint w3 = rtrLoadU32(word + 3u);
+    uint w4 = rtrLoadU32(word + 4u);
+    vec2 q01 = unpackUnorm2x16(w0);
+    vec2 q23 = unpackUnorm2x16(w1);
+    vec2 q45 = unpackUnorm2x16(w2);
+    vec2 q67 = unpackUnorm2x16(w3);
+    vec2 q8 = unpackUnorm2x16(w4);
+    RTRTriangle tri;
+
+    tri.v0 = shSceneQuantMin + vec3(q01.x, q01.y, q23.x) * shSceneQuantScale;
+    tri.v1 = shSceneQuantMin + vec3(q23.y, q45.x, q45.y) * shSceneQuantScale;
+    tri.v2 = shSceneQuantMin + vec3(q67.x, q67.y, q8.x) * shSceneQuantScale;
+
+    return tri;
+}
+
+vec3 rtrTriangleNormal(RTRTriangle tri)
+{
+    vec3 n = cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
+    float len2 = dot(n, n);
+
+    return len2 > 1.0e-20 ? n * inversesqrt(len2) : vec3(0.0, 1.0, 0.0);
+}
+
+vec3 rtrSurfaceNormal(RTRTriangle tri, vec3 rd)
+{
+    vec3 n = rtrTriangleNormal(tri);
+    if (dot(n, rd) > 0.0)
+        n = -n;
+
+    vec3 an = abs(n);
+    float dominant = max(an.x, max(an.y, an.z));
+    if (dominant > 0.82) {
+        if (an.x >= an.y && an.x >= an.z)
+            n = vec3(n.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+        else if (an.y >= an.z)
+            n = vec3(0.0, n.y >= 0.0 ? 1.0 : -1.0, 0.0);
+        else
+            n = vec3(0.0, 0.0, n.z >= 0.0 ? 1.0 : -1.0);
+    }
+
+    return n;
+}
+
+vec3 rtrFloorAlbedo(vec3 p)
+{
+    ivec2 cell = ivec2(floor(p.xz));
+    float check = float((cell.x ^ cell.y) & 1);
+    vec2 cellUv = fract(p.xz);
+    float edge = min(min(cellUv.x, 1.0 - cellUv.x),
+                     min(cellUv.y, 1.0 - cellUv.y));
+    float grout = 1.0 - smoothstep(0.012, 0.04, edge);
+    vec3 dark = vec3(0.42, 0.44, 0.42);
+    vec3 light = vec3(0.62, 0.64, 0.60);
+    vec3 base = mix(dark, light, check);
+
+    return base * (1.0 - grout * 0.18);
+}
+
+vec3 rtrTriangleAlbedo(uint i, vec3 p, vec3 n)
+{
+    float h = float(rtrHashU32(i * 2246822519u + 3266489917u) & 0xffffu) /
+              65535.0;
+    float height = clamp((p.y - RTR_FLOOR_Y) * 0.55, 0.0, 1.0);
+    float top = max(n.y, 0.0);
+    vec3 stone = mix(vec3(0.28, 0.29, 0.36), vec3(0.48, 0.49, 0.56), height);
+    vec3 cap = vec3(0.62, 0.59, 0.50);
+    vec3 trim = vec3(0.78, 0.55, 0.19);
+    float trimMask = top * smoothstep(0.62, 0.9, h) * smoothstep(0.15, 0.7, height);
+    vec3 base = mix(mix(stone, cap, top * 0.35), trim, trimMask);
+
+    return base * (0.86 + 0.14 * h);
+}
+
+vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
+{
+    const float invTwoPi = 0.15915494309;
+    const float invPi = 0.31830988618;
+    float u = fract(atan(rd.z, rd.x) * invTwoPi + 0.5);
+    float v = clamp(acos(clamp(rd.y, -1.0, 1.0)) * invPi, 0.0, 1.0);
+    float x = u * float(mapWidth) - 0.5;
+    float y = v * float(mapHeight) - 0.5;
+    int x0i = int(floor(x));
+    int y0i = int(floor(y));
+    int width = int(mapWidth);
+    int height = int(mapHeight);
+    uint x0 = uint((x0i % width + width) % width);
+    uint x1 = uint(((x0i + 1) % width + width) % width);
+    uint y0 = uint(clamp(y0i, 0, height - 1));
+    uint y1 = uint(clamp(y0i + 1, 0, height - 1));
+    float tx = fract(x);
+    float ty = fract(y);
+    uint row0 = y0 * mapWidth;
+    uint row1 = y1 * mapWidth;
+    uint word00 = baseWord + (row0 + x0) * 2u;
+    uint word10 = baseWord + (row0 + x1) * 2u;
+    uint word01 = baseWord + (row1 + x0) * 2u;
+    uint word11 = baseWord + (row1 + x1) * 2u;
+    vec2 rg00 = unpackHalf2x16(rtrLoadU32(word00));
+    vec2 ba00 = unpackHalf2x16(rtrLoadU32(word00 + 1u));
+    vec2 rg10 = unpackHalf2x16(rtrLoadU32(word10));
+    vec2 ba10 = unpackHalf2x16(rtrLoadU32(word10 + 1u));
+    vec2 rg01 = unpackHalf2x16(rtrLoadU32(word01));
+    vec2 ba01 = unpackHalf2x16(rtrLoadU32(word01 + 1u));
+    vec2 rg11 = unpackHalf2x16(rtrLoadU32(word11));
+    vec2 ba11 = unpackHalf2x16(rtrLoadU32(word11 + 1u));
+    vec3 c00 = vec3(rg00, ba00.x);
+    vec3 c10 = vec3(rg10, ba10.x);
+    vec3 c01 = vec3(rg01, ba01.x);
+    vec3 c11 = vec3(rg11, ba11.x);
+    vec3 color = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    float luminance = dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    if (luminance > cap)
+        color *= cap / luminance;
+
+    return color;
+}
+
+vec3 rtrSky(vec3 rd)
+{
+    return rtrEnvironmentSample(rd,
+                                RTR_ENVMAP_WORD,
+                                RTR_ENVMAP_WIDTH,
+                                RTR_ENVMAP_HEIGHT,
+                                RTR_ENVMAP_LUMINANCE_CAP);
+}
+
+vec3 rtrSkyDiffuse(vec3 rd)
+{
+    vec3 color = rtrEnvironmentSample(rd,
+                                      RTR_ENVMAP_DIFFUSE_WORD,
+                                      RTR_ENVMAP_DIFFUSE_WIDTH,
+                                      RTR_ENVMAP_DIFFUSE_HEIGHT,
+                                      RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP);
+
+    return mix(color, RTR_ENVMAP_AVERAGE, 0.45) * RTR_ENVMAP_DIFFUSE_EXPOSURE;
+}
+
+void rtrCamera(float cameraYaw,
+               float cameraPitch,
+               float cameraRadius,
+               vec2 sz,
+               out vec3 ro,
+               out vec3 forward,
+               out vec3 right,
+               out vec3 up)
+{
+    float angle = cameraYaw;
+    float pitch = clamp(cameraPitch, 0.08, 1.15);
+    float radius = max(cameraRadius, 1.0);
+    float horizontalRadius = cos(pitch) * radius;
+    ro = RTR_CAMERA_TARGET +
+         vec3(sin(angle) * horizontalRadius, sin(pitch) * radius,
+              cos(angle) * horizontalRadius);
+
+    forward = normalize(RTR_CAMERA_TARGET - ro);
+    right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
+    up = cross(right, forward);
+}
+
+void rtrInitShared(vec2 szf)
+{
+    shTriangleCount = min(rtrLoadU32(RTR_TRIANGLE_COUNT_WORD), RTR_MAX_TRIANGLES);
+
+    float cameraYaw = rtrLoadF32(RTR_CAMERA_YAW_WORD);
+    float cameraPitch = rtrLoadF32(RTR_CAMERA_PITCH_WORD);
+    float cameraRadius = rtrLoadF32(RTR_CAMERA_RADIUS_WORD);
+    float invH = 1.0 / max(szf.y, 1.0);
+
+    rtrCamera(cameraYaw,
+              cameraPitch,
+              cameraRadius,
+              szf,
+              shRo,
+              shForward,
+              shRight,
+              shUp);
+
+    shSceneQuantMin = vec3(rtrLoadF32(RTR_SCENE_QUANT_MIN_WORD),
+                           rtrLoadF32(RTR_SCENE_QUANT_MIN_WORD + 1u),
+                           rtrLoadF32(RTR_SCENE_QUANT_MIN_WORD + 2u));
+    shSceneQuantMax = vec3(rtrLoadF32(RTR_SCENE_QUANT_MAX_WORD),
+                           rtrLoadF32(RTR_SCENE_QUANT_MAX_WORD + 1u),
+                           rtrLoadF32(RTR_SCENE_QUANT_MAX_WORD + 2u));
+    shSceneQuantScale = shSceneQuantMax - shSceneQuantMin;
+    shRayBase = shForward * RTR_FOCAL +
+                shRight * ((1.0 - szf.x) * invH) +
+                shUp * ((szf.y - 1.0) * invH);
+    shRayDx = shRight * (2.0 * invH);
+    shRayDy = shUp * (-2.0 * invH);
+}
+
+vec3 rtrRayForPixel(ivec2 p)
+{
+    vec3 ray = shRayBase +
+               shRayDx * float(p.x) +
+               shRayDy * float(p.y);
+
+    return normalize(ray);
+}
+
+bool rtrProject(vec3 v, vec2 szf, out RTRProjectedVertex outV)
+{
+    vec3 view = v - shRo;
+    float z = dot(view, shForward);
+    if (z <= 0.01)
+        return false;
+
+    float planeX = dot(view, shRight) * RTR_FOCAL / z;
+    float planeY = dot(view, shUp) * RTR_FOCAL / z;
+
+    outV.p = vec2((planeX * szf.y + szf.x - 1.0) * 0.5,
+                  (szf.y - 1.0 - planeY * szf.y) * 0.5);
+    return true;
+}
+
+bool rtrProjectTriangle(RTRTriangle tri, vec2 szf, out RTRProjectedTriangle projected)
+{
+    return rtrProject(tri.v0, szf, projected.a) &&
+           rtrProject(tri.v1, szf, projected.b) &&
+           rtrProject(tri.v2, szf, projected.c);
+}
+
+float rtrEdge(vec2 a, vec2 b, vec2 c)
+{
+    return (c.x - a.x) * (b.y - a.y) -
+           (c.y - a.y) * (b.x - a.x);
+}
+
+void rtrBinTriangle(uint primitiveIndex)
+{
+    if (primitiveIndex >= shTriangleCount)
+        return;
+
+    ivec2 sz = imageSize(rtrOutImage);
+    vec2 szf = vec2(sz);
+    uvec2 tileGrid = rtrTileGrid(sz);
+    RTRProjectedTriangle projected;
+
+    if (!rtrProjectTriangle(rtrLoadTriangle(primitiveIndex), szf, projected))
+        return;
+
+    float area = rtrEdge(projected.a.p, projected.b.p, projected.c.p);
+    if (abs(area) <= 1.0e-6)
+        return;
+
+    vec2 minP = floor(min(projected.a.p, min(projected.b.p, projected.c.p)));
+    vec2 maxP = ceil(max(projected.a.p, max(projected.b.p, projected.c.p)));
+    minP = clamp(minP, vec2(0.0), vec2(sz - ivec2(1)));
+    maxP = clamp(maxP, vec2(0.0), vec2(sz - ivec2(1)));
+
+    uvec2 minTile = uvec2(minP) / RTR_FORWARD_TILE_SIZE;
+    uvec2 maxTile = uvec2(maxP) / RTR_FORWARD_TILE_SIZE;
+    maxTile = min(maxTile, tileGrid - uvec2(1u));
+
+    for (uint ty = minTile.y; ty <= maxTile.y; ty++) {
+        for (uint tx = minTile.x; tx <= maxTile.x; tx++) {
+            uint tileIndex = rtrTileIndex(uvec2(tx, ty), tileGrid);
+            uint itemIndex = atomicAdd(rtrMem[rtrTileWord(tileIndex)], 1u);
+            if (itemIndex < RTR_FORWARD_TILE_CAPACITY)
+                rtrStoreU32(rtrTileItemWord(sz, tileIndex, itemIndex),
+                            primitiveIndex);
+        }
+    }
+}
+
+bool rtrTriangleHit(vec3 ro, vec3 rd, RTRTriangle tri, out float hitT)
+{
+    vec3 e1 = tri.v1 - tri.v0;
+    vec3 e2 = tri.v2 - tri.v0;
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+
+    if (abs(det) < 1.0e-8)
+        return false;
+
+    float invDet = 1.0 / det;
+    vec3 tvec = ro - tri.v0;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0)
+        return false;
+
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+
+    float t = dot(e2, qvec) * invDet;
+    if (t < RTR_EPS)
+        return false;
+
+    hitT = t;
+    return true;
+}
+
+bool rtrFloorHit(vec3 ro, vec3 rd, out float hitT)
+{
+    if (abs(rd.y) < 1.0e-6)
+        return false;
+
+    float t = (RTR_FLOOR_Y - ro.y) / rd.y;
+    if (t < RTR_EPS)
+        return false;
+
+    vec3 p = ro + rd * t;
+    if (abs(p.x) > RTR_FLOOR_HALF_EXTENT || abs(p.z) > RTR_FLOOR_HALF_EXTENT)
+        return false;
+
+    hitT = t;
+    return true;
+}
+
+vec3 rtrTonemap(vec3 color)
+{
+    color *= 0.85;
+    color = (color * (2.51 * color + vec3(0.03))) /
+            (color * (2.43 * color + vec3(0.59)) + vec3(0.14));
+    return sqrt(clamp(color, vec3(0.0), vec3(1.0)));
+}
+
+vec3 rtrShade(vec3 p, vec3 n, vec3 albedo)
+{
+    vec3 toLight = RTR_LIGHT_POS - p;
+    float lightDist2 = max(dot(toLight, toLight), 0.001);
+    vec3 l = toLight * inversesqrt(lightDist2);
+    float ndl = max(dot(n, l), 0.0);
+    vec3 direct = albedo * RTR_LIGHT_COLOR * (ndl / lightDist2) * RTR_INV_PI;
+    vec3 ambient = albedo * (rtrSkyDiffuse(n) * 0.85 + vec3(0.03));
+
+    return direct + ambient;
+}
+
+vec3 rtrResolveSurface(ivec2 p)
+{
+    ivec2 sz = imageSize(rtrOutImage);
+    uvec2 tileGrid = rtrTileGrid(sz);
+    uvec2 tile = min(uvec2(p) / RTR_FORWARD_TILE_SIZE, tileGrid - uvec2(1u));
+    uint tileIndex = rtrTileIndex(tile, tileGrid);
+    uint count = min(rtrLoadU32(rtrTileWord(tileIndex)),
+                     RTR_FORWARD_TILE_CAPACITY);
+    vec3 rd = rtrRayForPixel(p);
+    float bestT = RTR_INF;
+    uint bestTriangle = RTR_MAX_TRIANGLES;
+
+    for (uint i = 0u; i < count; i++) {
+        uint triangleIndex = rtrLoadU32(rtrTileItemWord(sz, tileIndex, i));
+        if (triangleIndex >= shTriangleCount)
+            continue;
+
+        float t = 0.0;
+        if (rtrTriangleHit(shRo, rd, rtrLoadTriangle(triangleIndex), t) &&
+            t < bestT) {
+            bestT = t;
+            bestTriangle = triangleIndex;
+        }
+    }
+
+    if (bestTriangle < shTriangleCount) {
+        RTRTriangle tri = rtrLoadTriangle(bestTriangle);
+        vec3 hitP = shRo + rd * bestT;
+        vec3 n = rtrSurfaceNormal(tri, rd);
+
+        return rtrShade(hitP, n, rtrTriangleAlbedo(bestTriangle, hitP, n));
+    }
+
+    float floorT = 0.0;
+    if (rtrFloorHit(shRo, rd, floorT)) {
+        vec3 hitP = shRo + rd * floorT;
+        vec3 n = vec3(0.0, 1.0, 0.0);
+        if (dot(n, rd) > 0.0)
+            n = -n;
+
+        return rtrShade(hitP, n, rtrFloorAlbedo(hitP));
+    }
+
+    return rtrSky(rd);
+}
+
+#if RTR_RENDER_PASS == 0
+void main()
+{
+    ivec2 sz = imageSize(rtrOutImage);
+    uint tileIndex = gl_GlobalInvocationID.x;
+    if (tileIndex >= rtrTileCount(sz))
+        return;
+
+    rtrStoreU32(rtrTileWord(tileIndex), 0u);
+}
+#elif RTR_RENDER_PASS == 1
+void main()
+{
+    ivec2 sz = imageSize(rtrOutImage);
+
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared(vec2(sz));
+
+    barrier();
+
+    rtrBinTriangle(gl_GlobalInvocationID.x);
+}
+#elif RTR_RENDER_PASS == 2
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(rtrOutImage);
+
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared(vec2(sz));
+
+    barrier();
+
+    if (any(greaterThanEqual(p, sz)))
+        return;
+
+    vec3 color = rtrResolveSurface(p);
+    imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+}
+#else
+void main()
+{
+}
+#endif

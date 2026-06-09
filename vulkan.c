@@ -12,11 +12,15 @@
 #include <string.h>
 #include <time.h>
 
-#include "trace_path_comp_spv.h"
-#include "trace_resolve_comp_spv.h"
+#include "render_clear_comp_spv.h"
+#include "render_bin_comp_spv.h"
+#include "render_resolve_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
+#define RTR_PRIMITIVE_GROUP_SIZE 64u
+#define RTR_FORWARD_TILE_SIZE 16u
+#define RTR_FORWARD_TILE_CAPACITY 1024u
 #define RTR_MEMORY_HEADER_WORDS 32u
 #define RTR_SCENE_TRIANGLE_CAPACITY 900000u
 #define RTR_SCENE_TRIANGLE_WORDS 5u
@@ -31,7 +35,6 @@
 #define RTR_ENVMAP_DIFFUSE_HEIGHT 16u
 #define RTR_ENVMAP_DIFFUSE_WORDS \
     (RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u)
-#define RTR_SIMPLE_PIXEL_WORDS 15u
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
      RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS + \
@@ -88,7 +91,8 @@ enum {
 };
 
 enum {
-    RTR_PIPELINE_TRACE,
+    RTR_PIPELINE_CLEAR,
+    RTR_PIPELINE_BIN,
     RTR_PIPELINE_RESOLVE,
     RTR_PIPELINE_COUNT,
 };
@@ -181,6 +185,17 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
     char *end = NULL;
     const unsigned long parsed = strtoul(value, &end, 10);
     return end != value ? (uint32_t)parsed : fallback;
+}
+
+static uint32_t rtrDivUpU32(uint32_t value, uint32_t divisor)
+{
+    return (value + divisor - 1u) / divisor;
+}
+
+static uint32_t rtrForwardTileCount(void)
+{
+    return rtrDivUpU32(rtrSwapExtent.width, RTR_FORWARD_TILE_SIZE) *
+        rtrDivUpU32(rtrSwapExtent.height, RTR_FORWARD_TILE_SIZE);
 }
 
 static uint32_t rtrFindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags)
@@ -339,18 +354,16 @@ static float rtrFrameSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
-    const VkDeviceSize rtrPixelCount =
-        (VkDeviceSize)rtrSwapExtent.width *
-        (VkDeviceSize)rtrSwapExtent.height;
-    const VkDeviceSize rtrPathTraceWords =
-        rtrPixelCount *
-        (VkDeviceSize)RTR_SIMPLE_PIXEL_WORDS;
+    const VkDeviceSize rtrTileCount = (VkDeviceSize)rtrForwardTileCount();
+    const VkDeviceSize rtrForwardTileWords =
+        rtrTileCount *
+        ((VkDeviceSize)1u + (VkDeviceSize)RTR_FORWARD_TILE_CAPACITY);
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
          (VkDeviceSize)RTR_SCENE_WORDS +
-         rtrPathTraceWords) *
+         rtrForwardTileWords) *
         (VkDeviceSize)sizeof(uint32_t);
-    if (rtrPixelCount == 0u) return 1;
+    if (rtrTileCount == 0u) return 1;
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = rtrMemorySize,
@@ -377,7 +390,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 20u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 23u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
@@ -455,10 +468,21 @@ static void rtrCmdRenderBarrier(VkCommandBuffer commandBuffer)
 static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                                  VkDescriptorSet descriptorSet)
 {
-    const uint32_t groupsX =
+    const uint32_t pixelGroupsX =
         (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
-    const uint32_t groupsY =
+    const uint32_t pixelGroupsY =
         (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
+    const uint32_t primitiveCount =
+        rtrMemoryWords ?
+        rtrMemoryWords[RTR_MEMORY_TRIANGLE_COUNT_WORD] :
+        0u;
+    const uint32_t primitiveGroupsX =
+        (primitiveCount + RTR_PRIMITIVE_GROUP_SIZE - 1u) /
+        RTR_PRIMITIVE_GROUP_SIZE;
+    const uint32_t tileCount = rtrForwardTileCount();
+    const uint32_t tileGroupsX =
+        (tileCount + RTR_PRIMITIVE_GROUP_SIZE - 1u) /
+        RTR_PRIMITIVE_GROUP_SIZE;
 
     vkCmdBindDescriptorSets(commandBuffer,
                             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -470,12 +494,25 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                             NULL);
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
-        const uint32_t groupsZ = 1u;
+        uint32_t groupsX = pixelGroupsX;
+        uint32_t groupsY = pixelGroupsY;
+
+        if (pipeline == RTR_PIPELINE_CLEAR) {
+            if (tileGroupsX == 0u)
+                continue;
+            groupsX = tileGroupsX;
+            groupsY = 1u;
+        } else if (pipeline == RTR_PIPELINE_BIN) {
+            if (primitiveGroupsX == 0u)
+                continue;
+            groupsX = primitiveGroupsX;
+            groupsY = 1u;
+        }
 
         vkCmdBindPipeline(commandBuffer,
                           VK_PIPELINE_BIND_POINT_COMPUTE,
                           rtrPipelines[pipeline]);
-        vkCmdDispatch(commandBuffer, groupsX, groupsY, groupsZ);
+        vkCmdDispatch(commandBuffer, groupsX, groupsY, 1u);
 
         if (pipeline + 1u < RTR_PIPELINE_COUNT)
             rtrCmdRenderBarrier(commandBuffer);
@@ -821,12 +858,14 @@ int rtrVulkanInit(void *windowSurface)
     }, NULL, &rtrPipelineLayout);
 
     const uint32_t *const shaderWords[RTR_PIPELINE_COUNT] = {
-        (const uint32_t *)(const void *)tracePathCompSpv,
-        (const uint32_t *)(const void *)traceResolveCompSpv,
+        (const uint32_t *)(const void *)renderClearCompSpv,
+        (const uint32_t *)(const void *)renderBinCompSpv,
+        (const uint32_t *)(const void *)renderResolveCompSpv,
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
-        tracePathCompSpv_len,
-        traceResolveCompSpv_len,
+        renderClearCompSpv_len,
+        renderBinCompSpv_len,
+        renderResolveCompSpv_len,
     };
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {

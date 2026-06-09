@@ -62,20 +62,24 @@ rule compdb
   description = COMPDB $out
 
 rule clean
-  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace_path.comp.spv $build_dir/trace_resolve.comp.spv $build_dir/trace_path_comp_spv.h $build_dir/trace_resolve_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $build_dir/correctness_check.o $build_dir/correctness_check $bin compile_commands.json
+  command = rm -rf $build_dir/xpost && rm -f $build_dir/.dir $build_dir/trace_*.comp.spv $build_dir/trace_*_comp_spv.h $build_dir/render_*.comp.spv $build_dir/render_*_comp_spv.h $build_dir/main.o $build_dir/vulkan.o $build_dir/scene.o $build_dir/macos.o $build_dir/correctness_check.o $build_dir/correctness_check $bin compile_commands.json
   description = CLEAN
 
 build $build_dir/.dir: mkdir
-build $build_dir/trace_path.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
+build $build_dir/render_clear.comp.spv: glslc shaders/render.comp || $build_dir/.dir
   pass = 0
-build $build_dir/trace_resolve.comp.spv: glslc shaders/trace.comp || $build_dir/.dir
+build $build_dir/render_bin.comp.spv: glslc shaders/render.comp || $build_dir/.dir
   pass = 1
-build $build_dir/trace_path_comp_spv.h: xxd $build_dir/trace_path.comp.spv || $build_dir/.dir
-  name = tracePathCompSpv
-build $build_dir/trace_resolve_comp_spv.h: xxd $build_dir/trace_resolve.comp.spv || $build_dir/.dir
-  name = traceResolveCompSpv
+build $build_dir/render_resolve.comp.spv: glslc shaders/render.comp || $build_dir/.dir
+  pass = 2
+build $build_dir/render_clear_comp_spv.h: xxd $build_dir/render_clear.comp.spv || $build_dir/.dir
+  name = renderClearCompSpv
+build $build_dir/render_bin_comp_spv.h: xxd $build_dir/render_bin.comp.spv || $build_dir/.dir
+  name = renderBinCompSpv
+build $build_dir/render_resolve_comp_spv.h: xxd $build_dir/render_resolve.comp.spv || $build_dir/.dir
+  name = renderResolveCompSpv
 build $build_dir/main.o: cc main.c || $build_dir/.dir
-build $build_dir/vulkan.o: cc vulkan.c | $build_dir/trace_path_comp_spv.h $build_dir/trace_resolve_comp_spv.h || $build_dir/.dir
+build $build_dir/vulkan.o: cc vulkan.c | $build_dir/render_clear_comp_spv.h $build_dir/render_bin_comp_spv.h $build_dir/render_resolve_comp_spv.h || $build_dir/.dir
 build $build_dir/scene.o: cc scene.c || $build_dir/.dir
 build $build_dir/macos.o: objc macos.m || $build_dir/.dir
 build $build_dir/correctness_check.o: cc tools/correctness_check.c || $build_dir/.dir
