@@ -14,9 +14,9 @@ const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
 
 const uint RTR_BRICK_SIZE = 4u;
-const uint RTR_BRICK_GRID_X = 16u;
+const uint RTR_BRICK_GRID_X = 32u;
 const uint RTR_BRICK_GRID_Y = 12u;
-const uint RTR_BRICK_GRID_Z = 16u;
+const uint RTR_BRICK_GRID_Z = 32u;
 const uint RTR_VOXEL_GRID_X = RTR_BRICK_GRID_X * RTR_BRICK_SIZE;
 const uint RTR_VOXEL_GRID_Y = RTR_BRICK_GRID_Y * RTR_BRICK_SIZE;
 const uint RTR_VOXEL_GRID_Z = RTR_BRICK_GRID_Z * RTR_BRICK_SIZE;
@@ -44,7 +44,6 @@ const float RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP = 2.0;
 const float RTR_ENVMAP_DIFFUSE_EXPOSURE = 0.7;
 const vec3 RTR_ENVMAP_AVERAGE = vec3(0.489, 0.549, 0.574);
 const float RTR_FLOOR_Y = -1.0;
-const float RTR_FLOOR_HALF_EXTENT = 26.0;
 const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
@@ -422,6 +421,9 @@ vec3 rtrFloorAlbedo(vec3 p)
 
 vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
 {
+    if (voxel.y == 0)
+        return rtrFloorAlbedo(p);
+
     uint h = rtrHashU32(uint(voxel.x * 73856093 ^
                             voxel.y * 19349663 ^
                             voxel.z * 83492791));
@@ -436,23 +438,6 @@ vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
     vec3 base = mix(mix(stone, cap, top * 0.35), trim, trimMask);
 
     return base * (0.88 + jitter * 0.12);
-}
-
-bool rtrFloorHit(vec3 ro, vec3 rd, out float hitT)
-{
-    if (abs(rd.y) < 1.0e-6)
-        return false;
-
-    float t = (RTR_FLOOR_Y - ro.y) / rd.y;
-    if (t < RTR_EPS)
-        return false;
-
-    vec3 p = ro + rd * t;
-    if (abs(p.x) > RTR_FLOOR_HALF_EXTENT || abs(p.z) > RTR_FLOOR_HALF_EXTENT)
-        return false;
-
-    hitT = t;
-    return true;
 }
 
 vec3 rtrTonemap(vec3 color)
@@ -479,19 +464,12 @@ vec3 rtrRenderPixel(ivec2 p)
 {
     vec3 rd = rtrRayForPixel(p);
     RTRVoxelHit voxelHit;
-    float floorT = 0.0;
     bool hasVoxel = rtrTraceVoxels(shRo, rd, voxelHit);
-    bool hasFloor = rtrFloorHit(shRo, rd, floorT);
 
-    if (hasVoxel && (!hasFloor || voxelHit.t < floorT)) {
+    if (hasVoxel) {
         vec3 hitP = shRo + rd * voxelHit.t;
         vec3 n = voxelHit.normal;
         return rtrShade(hitP, n, rtrVoxelAlbedo(voxelHit.voxel, hitP, n));
-    }
-
-    if (hasFloor) {
-        vec3 hitP = shRo + rd * floorT;
-        return rtrShade(hitP, vec3(0.0, 1.0, 0.0), rtrFloorAlbedo(hitP));
     }
 
     return rtrSky(rd);

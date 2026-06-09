@@ -13,9 +13,9 @@
 #endif
 
 #define RTR_SCENE_BRICK_SIZE 4u
-#define RTR_SCENE_BRICK_GRID_X 16u
+#define RTR_SCENE_BRICK_GRID_X 32u
 #define RTR_SCENE_BRICK_GRID_Y 12u
-#define RTR_SCENE_BRICK_GRID_Z 16u
+#define RTR_SCENE_BRICK_GRID_Z 32u
 #define RTR_SCENE_VOXEL_GRID_X (RTR_SCENE_BRICK_GRID_X * RTR_SCENE_BRICK_SIZE)
 #define RTR_SCENE_VOXEL_GRID_Y (RTR_SCENE_BRICK_GRID_Y * RTR_SCENE_BRICK_SIZE)
 #define RTR_SCENE_VOXEL_GRID_Z (RTR_SCENE_BRICK_GRID_Z * RTR_SCENE_BRICK_SIZE)
@@ -26,6 +26,10 @@
 #define RTR_SCENE_BRICK_WORDS 2u
 #define RTR_SCENE_VOXEL_SIZE 0.055f
 #define RTR_SCENE_FLOOR_Y -1.0f
+#define RTR_SCENE_CASTLE_OFFSET_X \
+    ((int32_t)(RTR_SCENE_VOXEL_GRID_X - 64u) / 2)
+#define RTR_SCENE_CASTLE_OFFSET_Z \
+    ((int32_t)(RTR_SCENE_VOXEL_GRID_Z - 64u) / 2)
 #define RTR_SCENE_ENVMAP_WIDTH 1024u
 #define RTR_SCENE_ENVMAP_HEIGHT 512u
 #define RTR_SCENE_ENVMAP_WORDS (RTR_SCENE_ENVMAP_WIDTH * RTR_SCENE_ENVMAP_HEIGHT * 2u)
@@ -119,9 +123,45 @@ static void rtrClearBox(uint8_t *voxels,
     }
 }
 
+static void rtrFillCastleBox(uint8_t *voxels,
+                             int32_t x0,
+                             int32_t y0,
+                             int32_t z0,
+                             int32_t x1,
+                             int32_t y1,
+                             int32_t z1)
+{
+    rtrFillBox(voxels,
+               x0 + RTR_SCENE_CASTLE_OFFSET_X,
+               y0,
+               z0 + RTR_SCENE_CASTLE_OFFSET_Z,
+               x1 + RTR_SCENE_CASTLE_OFFSET_X,
+               y1,
+               z1 + RTR_SCENE_CASTLE_OFFSET_Z);
+}
+
+static void rtrClearCastleBox(uint8_t *voxels,
+                              int32_t x0,
+                              int32_t y0,
+                              int32_t z0,
+                              int32_t x1,
+                              int32_t y1,
+                              int32_t z1)
+{
+    rtrClearBox(voxels,
+                x0 + RTR_SCENE_CASTLE_OFFSET_X,
+                y0,
+                z0 + RTR_SCENE_CASTLE_OFFSET_Z,
+                x1 + RTR_SCENE_CASTLE_OFFSET_X,
+                y1,
+                z1 + RTR_SCENE_CASTLE_OFFSET_Z);
+}
+
 static void rtrFillTower(uint8_t *voxels, int32_t cx, int32_t cz, int32_t r, int32_t height)
 {
-    rtrFillBox(voxels, cx - r, 0, cz - r, cx + r, height, cz + r);
+    cx += RTR_SCENE_CASTLE_OFFSET_X;
+    cz += RTR_SCENE_CASTLE_OFFSET_Z;
+    rtrFillBox(voxels, cx - r, 1, cz - r, cx + r, height, cz + r);
     rtrFillBox(voxels, cx - r - 1, height + 1, cz - r - 1,
                cx + r + 1, height + 3, cz + r + 1);
 
@@ -141,22 +181,30 @@ static void rtrBuildVoxelScene(uint8_t *voxels)
 {
     memset(voxels, 0, RTR_SCENE_VOXEL_COUNT);
 
-    rtrFillBox(voxels, 14, 0, 14, 49, 2, 49);
-    rtrFillBox(voxels, 15, 3, 15, 48, 9, 17);
-    rtrFillBox(voxels, 15, 3, 46, 48, 9, 48);
-    rtrFillBox(voxels, 15, 3, 18, 17, 9, 45);
-    rtrFillBox(voxels, 46, 3, 18, 48, 9, 45);
+    rtrFillBox(voxels,
+               0,
+               0,
+               0,
+               (int32_t)RTR_SCENE_VOXEL_GRID_X - 1,
+               0,
+               (int32_t)RTR_SCENE_VOXEL_GRID_Z - 1);
 
-    rtrClearBox(voxels, 29, 3, 15, 34, 8, 17);
-    rtrClearBox(voxels, 30, 3, 15, 33, 11, 17);
+    rtrFillCastleBox(voxels, 14, 1, 14, 49, 2, 49);
+    rtrFillCastleBox(voxels, 15, 3, 15, 48, 9, 17);
+    rtrFillCastleBox(voxels, 15, 3, 46, 48, 9, 48);
+    rtrFillCastleBox(voxels, 15, 3, 18, 17, 9, 45);
+    rtrFillCastleBox(voxels, 46, 3, 18, 48, 9, 45);
+
+    rtrClearCastleBox(voxels, 29, 3, 15, 34, 8, 17);
+    rtrClearCastleBox(voxels, 30, 3, 15, 33, 11, 17);
 
     for (int32_t x = 16; x <= 48; x += 4) {
-        rtrFillBox(voxels, x, 10, 15, x + 1, 12, 17);
-        rtrFillBox(voxels, x, 10, 46, x + 1, 12, 48);
+        rtrFillCastleBox(voxels, x, 10, 15, x + 1, 12, 17);
+        rtrFillCastleBox(voxels, x, 10, 46, x + 1, 12, 48);
     }
     for (int32_t z = 20; z <= 44; z += 4) {
-        rtrFillBox(voxels, 15, 10, z, 17, 12, z + 1);
-        rtrFillBox(voxels, 46, 10, z, 48, 12, z + 1);
+        rtrFillCastleBox(voxels, 15, 10, z, 17, 12, z + 1);
+        rtrFillCastleBox(voxels, 46, 10, z, 48, 12, z + 1);
     }
 
     rtrFillTower(voxels, 17, 17, 4, 18);
@@ -164,18 +212,18 @@ static void rtrBuildVoxelScene(uint8_t *voxels)
     rtrFillTower(voxels, 17, 47, 4, 20);
     rtrFillTower(voxels, 47, 47, 4, 24);
 
-    rtrFillBox(voxels, 35, 3, 34, 50, 24, 50);
-    rtrFillBox(voxels, 37, 25, 36, 48, 28, 48);
-    rtrFillBox(voxels, 39, 29, 38, 46, 31, 46);
-    rtrClearBox(voxels, 38, 4, 33, 43, 12, 36);
-    rtrClearBox(voxels, 45, 4, 38, 50, 13, 43);
+    rtrFillCastleBox(voxels, 35, 3, 34, 50, 24, 50);
+    rtrFillCastleBox(voxels, 37, 25, 36, 48, 28, 48);
+    rtrFillCastleBox(voxels, 39, 29, 38, 46, 31, 46);
+    rtrClearCastleBox(voxels, 38, 4, 33, 43, 12, 36);
+    rtrClearCastleBox(voxels, 45, 4, 38, 50, 13, 43);
 
-    rtrFillBox(voxels, 23, 3, 27, 34, 13, 38);
-    rtrFillBox(voxels, 25, 14, 29, 32, 17, 36);
-    rtrClearBox(voxels, 27, 4, 26, 30, 10, 29);
+    rtrFillCastleBox(voxels, 23, 3, 27, 34, 13, 38);
+    rtrFillCastleBox(voxels, 25, 14, 29, 32, 17, 36);
+    rtrClearCastleBox(voxels, 27, 4, 26, 30, 10, 29);
 
     for (int32_t z = 20; z <= 44; z += 8)
-        rtrFillBox(voxels, 22, 3, z, 26, 7, z + 3);
+        rtrFillCastleBox(voxels, 22, 3, z, 26, 7, z + 3);
 }
 
 static uint32_t rtrF32ToF16Word(float value)

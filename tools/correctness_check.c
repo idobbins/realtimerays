@@ -6,9 +6,9 @@
 
 #define RTR_CHECK_HEADER_WORDS 32u
 #define RTR_CHECK_BRICK_SIZE 4u
-#define RTR_CHECK_BRICK_GRID_X 16u
+#define RTR_CHECK_BRICK_GRID_X 32u
 #define RTR_CHECK_BRICK_GRID_Y 12u
-#define RTR_CHECK_BRICK_GRID_Z 16u
+#define RTR_CHECK_BRICK_GRID_Z 32u
 #define RTR_CHECK_BRICK_CAPACITY \
     (RTR_CHECK_BRICK_GRID_X * RTR_CHECK_BRICK_GRID_Y * RTR_CHECK_BRICK_GRID_Z)
 #define RTR_CHECK_BRICK_WORDS 2u
@@ -64,6 +64,8 @@ int main(void)
     uint32_t emptyBricks = 0u;
     uint32_t referencedBricks = 0u;
     uint32_t occupiedVoxels = 0u;
+    uint32_t missingFloorBricks = 0u;
+    uint32_t incompleteFloorBricks = 0u;
     float minX;
     float minY;
     float minZ;
@@ -121,6 +123,22 @@ int main(void)
         occupiedVoxels += rtrCheckPopcount(lo) + rtrCheckPopcount(hi);
     }
 
+    for (uint32_t bz = 0u; bz < RTR_CHECK_BRICK_GRID_Z; bz++) {
+        for (uint32_t bx = 0u; bx < RTR_CHECK_BRICK_GRID_X; bx++) {
+            const uint32_t mapIndex = bz * RTR_CHECK_BRICK_GRID_X + bx;
+            const uint32_t ref = words[RTR_CHECK_VOXEL_MAP_WORD + mapIndex];
+            uint32_t lo;
+            if (ref == 0u || ref > brickCount) {
+                missingFloorBricks++;
+                continue;
+            }
+            lo = words[RTR_CHECK_VOXEL_BRICK_WORD +
+                       (ref - 1u) * RTR_CHECK_BRICK_WORDS];
+            if ((lo & 0xffffu) != 0xffffu)
+                incompleteFloorBricks++;
+        }
+    }
+
     minX = rtrCheckLoadF32(words, RTR_CHECK_SCENE_MIN_WORD);
     minY = rtrCheckLoadF32(words, RTR_CHECK_SCENE_MIN_WORD + 1u);
     minZ = rtrCheckLoadF32(words, RTR_CHECK_SCENE_MIN_WORD + 2u);
@@ -129,15 +147,18 @@ int main(void)
     maxZ = rtrCheckLoadF32(words, RTR_CHECK_SCENE_MAX_WORD + 2u);
 
     if (invalidRefs || duplicateRefs || missingRefs || emptyBricks ||
+        missingFloorBricks || incompleteFloorBricks ||
         !isfinite(minX) || !isfinite(minY) || !isfinite(minZ) ||
         !isfinite(maxX) || !isfinite(maxY) || !isfinite(maxZ) ||
         minX >= maxX || minY >= maxY || minZ >= maxZ) {
         fprintf(stderr,
-                "correctness: voxel failed invalid_refs=%u duplicate_refs=%u missing_refs=%u empty_bricks=%u bounds=[%g %g %g]-[%g %g %g]\n",
+                "correctness: voxel failed invalid_refs=%u duplicate_refs=%u missing_refs=%u empty_bricks=%u missing_floor=%u incomplete_floor=%u bounds=[%g %g %g]-[%g %g %g]\n",
                 invalidRefs,
                 duplicateRefs,
                 missingRefs,
                 emptyBricks,
+                missingFloorBricks,
+                incompleteFloorBricks,
                 minX, minY, minZ,
                 maxX, maxY, maxZ);
         free(words);
@@ -145,10 +166,11 @@ int main(void)
         return 1;
     }
 
-    printf("voxels: ok, %u bricks referenced %u occupied_voxels %u bounds [(%.3f %.3f %.3f) (%.3f %.3f %.3f)]\n",
+    printf("voxels: ok, %u bricks referenced %u occupied_voxels %u floor_bricks %u bounds [(%.3f %.3f %.3f) (%.3f %.3f %.3f)]\n",
            brickCount,
            referencedBricks,
            occupiedVoxels,
+           RTR_CHECK_BRICK_GRID_X * RTR_CHECK_BRICK_GRID_Z,
            minX, minY, minZ,
            maxX, maxY, maxZ);
 
