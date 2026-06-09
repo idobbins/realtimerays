@@ -1,14 +1,6 @@
 #version 460
 
-#ifndef RTR_RENDER_PASS
-#define RTR_RENDER_PASS 0
-#endif
-
-#if RTR_RENDER_PASS == 0 || RTR_RENDER_PASS == 1
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-#else
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-#endif
 
 layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
 
@@ -16,38 +8,32 @@ layout(std430, binding = 1) buffer RTRMemory {
     uint rtrMem[];
 };
 
-const uint RTR_TRIANGLE_COUNT_WORD = 8u;
+const uint RTR_BRICK_COUNT_WORD = 8u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
 
-const uint RTR_MAX_TRIANGLES = 900000u;
-const uint RTR_MAX_BVH_NODES = RTR_MAX_TRIANGLES * 2u - 1u;
-
-const uint RTR_SCENE_QUANT_MIN_WORD = 24u;
-const uint RTR_SCENE_QUANT_MAX_WORD = 27u;
-const uint RTR_TRIANGLE_GEOM_WORD = 32u;
-const uint RTR_TRIANGLE_WORDS = 5u;
-const uint RTR_BVH_NODE_WORD = RTR_TRIANGLE_GEOM_WORD +
-    RTR_MAX_TRIANGLES * RTR_TRIANGLE_WORDS;
-const uint RTR_BVH_NODE_WORDS = 8u;
-const uint RTR_BLUE_NOISE_SIZE = 64u;
-const uint RTR_BLUE_NOISE_WORD =
-    RTR_BVH_NODE_WORD + RTR_MAX_BVH_NODES * RTR_BVH_NODE_WORDS;
+const uint RTR_BRICK_SIZE = 4u;
+const uint RTR_BRICK_GRID_X = 16u;
+const uint RTR_BRICK_GRID_Y = 12u;
+const uint RTR_BRICK_GRID_Z = 16u;
+const uint RTR_VOXEL_GRID_X = RTR_BRICK_GRID_X * RTR_BRICK_SIZE;
+const uint RTR_VOXEL_GRID_Y = RTR_BRICK_GRID_Y * RTR_BRICK_SIZE;
+const uint RTR_VOXEL_GRID_Z = RTR_BRICK_GRID_Z * RTR_BRICK_SIZE;
+const uint RTR_BRICK_CAPACITY = RTR_BRICK_GRID_X * RTR_BRICK_GRID_Y * RTR_BRICK_GRID_Z;
+const uint RTR_BRICK_WORDS = 2u;
+const uint RTR_SCENE_MIN_WORD = 24u;
+const uint RTR_SCENE_MAX_WORD = 27u;
+const uint RTR_VOXEL_MAP_WORD = 32u;
+const uint RTR_VOXEL_BRICK_WORD = RTR_VOXEL_MAP_WORD + RTR_BRICK_CAPACITY;
 const uint RTR_ENVMAP_WIDTH = 1024u;
 const uint RTR_ENVMAP_HEIGHT = 512u;
 const uint RTR_ENVMAP_WORD =
-    RTR_BLUE_NOISE_WORD + RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE;
+    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
 const uint RTR_ENVMAP_DIFFUSE_WIDTH = 32u;
 const uint RTR_ENVMAP_DIFFUSE_HEIGHT = 16u;
 const uint RTR_ENVMAP_DIFFUSE_WORD =
     RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
-const uint RTR_TILE_COUNT_WORD =
-    RTR_ENVMAP_DIFFUSE_WORD +
-    RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u;
-
-const uint RTR_FORWARD_TILE_SIZE = 16u;
-const uint RTR_FORWARD_TILE_CAPACITY = 1024u;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
@@ -63,42 +49,30 @@ const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
 
-shared uint shTriangleCount;
+shared uint shBrickCount;
 shared vec3 shRo;
 shared vec3 shForward;
 shared vec3 shRight;
 shared vec3 shUp;
-shared vec3 shSceneQuantMin;
-shared vec3 shSceneQuantMax;
-shared vec3 shSceneQuantScale;
+shared vec3 shSceneMin;
+shared vec3 shSceneMax;
+shared vec3 shSceneExtent;
+shared vec3 shVoxelSize;
+shared vec3 shBrickSize;
 shared vec3 shRayBase;
 shared vec3 shRayDx;
 shared vec3 shRayDy;
 
-struct RTRTriangle {
-    vec3 v0;
-    vec3 v1;
-    vec3 v2;
-};
-
-struct RTRProjectedVertex {
-    vec2 p;
-};
-
-struct RTRProjectedTriangle {
-    RTRProjectedVertex a;
-    RTRProjectedVertex b;
-    RTRProjectedVertex c;
+struct RTRVoxelHit {
+    bool hit;
+    float t;
+    ivec3 voxel;
+    vec3 normal;
 };
 
 uint rtrLoadU32(uint word)
 {
     return rtrMem[word];
-}
-
-void rtrStoreU32(uint word, uint value)
-{
-    rtrMem[word] = value;
 }
 
 float rtrLoadF32(uint word)
@@ -117,118 +91,36 @@ uint rtrHashU32(uint value)
     return value;
 }
 
-uvec2 rtrTileGrid(ivec2 sz)
+uint rtrBrickMapIndex(ivec3 brick)
 {
-    return (uvec2(sz) + uvec2(RTR_FORWARD_TILE_SIZE - 1u)) /
-        RTR_FORWARD_TILE_SIZE;
+    return uint((brick.y * int(RTR_BRICK_GRID_Z) + brick.z) *
+                int(RTR_BRICK_GRID_X) + brick.x);
 }
 
-uint rtrTileCount(ivec2 sz)
+uint rtrBrickMap(ivec3 brick)
 {
-    uvec2 grid = rtrTileGrid(sz);
-    return grid.x * grid.y;
-}
-
-uint rtrTileListWord(ivec2 sz)
-{
-    return RTR_TILE_COUNT_WORD + rtrTileCount(sz);
-}
-
-uint rtrTileIndex(uvec2 tile, uvec2 tileGrid)
-{
-    return tile.y * tileGrid.x + tile.x;
-}
-
-uint rtrTileWord(uint tileIndex)
-{
-    return RTR_TILE_COUNT_WORD + tileIndex;
-}
-
-uint rtrTileItemWord(ivec2 sz, uint tileIndex, uint itemIndex)
-{
-    return rtrTileListWord(sz) +
-        tileIndex * RTR_FORWARD_TILE_CAPACITY +
-        itemIndex;
-}
-
-RTRTriangle rtrLoadTriangle(uint i)
-{
-    uint word = RTR_TRIANGLE_GEOM_WORD + i * RTR_TRIANGLE_WORDS;
-    uint w0 = rtrLoadU32(word);
-    uint w1 = rtrLoadU32(word + 1u);
-    uint w2 = rtrLoadU32(word + 2u);
-    uint w3 = rtrLoadU32(word + 3u);
-    uint w4 = rtrLoadU32(word + 4u);
-    vec2 q01 = unpackUnorm2x16(w0);
-    vec2 q23 = unpackUnorm2x16(w1);
-    vec2 q45 = unpackUnorm2x16(w2);
-    vec2 q67 = unpackUnorm2x16(w3);
-    vec2 q8 = unpackUnorm2x16(w4);
-    RTRTriangle tri;
-
-    tri.v0 = shSceneQuantMin + vec3(q01.x, q01.y, q23.x) * shSceneQuantScale;
-    tri.v1 = shSceneQuantMin + vec3(q23.y, q45.x, q45.y) * shSceneQuantScale;
-    tri.v2 = shSceneQuantMin + vec3(q67.x, q67.y, q8.x) * shSceneQuantScale;
-
-    return tri;
-}
-
-vec3 rtrTriangleNormal(RTRTriangle tri)
-{
-    vec3 n = cross(tri.v1 - tri.v0, tri.v2 - tri.v0);
-    float len2 = dot(n, n);
-
-    return len2 > 1.0e-20 ? n * inversesqrt(len2) : vec3(0.0, 1.0, 0.0);
-}
-
-vec3 rtrSurfaceNormal(RTRTriangle tri, vec3 rd)
-{
-    vec3 n = rtrTriangleNormal(tri);
-    if (dot(n, rd) > 0.0)
-        n = -n;
-
-    vec3 an = abs(n);
-    float dominant = max(an.x, max(an.y, an.z));
-    if (dominant > 0.82) {
-        if (an.x >= an.y && an.x >= an.z)
-            n = vec3(n.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
-        else if (an.y >= an.z)
-            n = vec3(0.0, n.y >= 0.0 ? 1.0 : -1.0, 0.0);
-        else
-            n = vec3(0.0, 0.0, n.z >= 0.0 ? 1.0 : -1.0);
+    if (any(lessThan(brick, ivec3(0))) ||
+        brick.x >= int(RTR_BRICK_GRID_X) ||
+        brick.y >= int(RTR_BRICK_GRID_Y) ||
+        brick.z >= int(RTR_BRICK_GRID_Z)) {
+        return 0u;
     }
 
-    return n;
+    return rtrLoadU32(RTR_VOXEL_MAP_WORD + rtrBrickMapIndex(brick));
 }
 
-vec3 rtrFloorAlbedo(vec3 p)
+uvec2 rtrBrickMask(uint brickRef)
 {
-    ivec2 cell = ivec2(floor(p.xz));
-    float check = float((cell.x ^ cell.y) & 1);
-    vec2 cellUv = fract(p.xz);
-    float edge = min(min(cellUv.x, 1.0 - cellUv.x),
-                     min(cellUv.y, 1.0 - cellUv.y));
-    float grout = 1.0 - smoothstep(0.012, 0.04, edge);
-    vec3 dark = vec3(0.42, 0.44, 0.42);
-    vec3 light = vec3(0.62, 0.64, 0.60);
-    vec3 base = mix(dark, light, check);
-
-    return base * (1.0 - grout * 0.18);
+    uint word = RTR_VOXEL_BRICK_WORD + (brickRef - 1u) * RTR_BRICK_WORDS;
+    return uvec2(rtrLoadU32(word), rtrLoadU32(word + 1u));
 }
 
-vec3 rtrTriangleAlbedo(uint i, vec3 p, vec3 n)
+bool rtrMaskBit(uvec2 mask, ivec3 local)
 {
-    float h = float(rtrHashU32(i * 2246822519u + 3266489917u) & 0xffffu) /
-              65535.0;
-    float height = clamp((p.y - RTR_FLOOR_Y) * 0.55, 0.0, 1.0);
-    float top = max(n.y, 0.0);
-    vec3 stone = mix(vec3(0.28, 0.29, 0.36), vec3(0.48, 0.49, 0.56), height);
-    vec3 cap = vec3(0.62, 0.59, 0.50);
-    vec3 trim = vec3(0.78, 0.55, 0.19);
-    float trimMask = top * smoothstep(0.62, 0.9, h) * smoothstep(0.15, 0.7, height);
-    vec3 base = mix(mix(stone, cap, top * 0.35), trim, trimMask);
-
-    return base * (0.86 + 0.14 * h);
+    uint bit = uint(local.x + local.z * 4 + local.y * 16);
+    if (bit < 32u)
+        return (mask.x & (1u << bit)) != 0u;
+    return (mask.y & (1u << (bit - 32u))) != 0u;
 }
 
 vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
@@ -319,29 +211,26 @@ void rtrCamera(float cameraYaw,
 
 void rtrInitShared(vec2 szf)
 {
-    shTriangleCount = min(rtrLoadU32(RTR_TRIANGLE_COUNT_WORD), RTR_MAX_TRIANGLES);
-
     float cameraYaw = rtrLoadF32(RTR_CAMERA_YAW_WORD);
     float cameraPitch = rtrLoadF32(RTR_CAMERA_PITCH_WORD);
     float cameraRadius = rtrLoadF32(RTR_CAMERA_RADIUS_WORD);
     float invH = 1.0 / max(szf.y, 1.0);
 
-    rtrCamera(cameraYaw,
-              cameraPitch,
-              cameraRadius,
-              szf,
-              shRo,
-              shForward,
-              shRight,
-              shUp);
+    shBrickCount = min(rtrLoadU32(RTR_BRICK_COUNT_WORD), RTR_BRICK_CAPACITY);
+    rtrCamera(cameraYaw, cameraPitch, cameraRadius, szf,
+              shRo, shForward, shRight, shUp);
 
-    shSceneQuantMin = vec3(rtrLoadF32(RTR_SCENE_QUANT_MIN_WORD),
-                           rtrLoadF32(RTR_SCENE_QUANT_MIN_WORD + 1u),
-                           rtrLoadF32(RTR_SCENE_QUANT_MIN_WORD + 2u));
-    shSceneQuantMax = vec3(rtrLoadF32(RTR_SCENE_QUANT_MAX_WORD),
-                           rtrLoadF32(RTR_SCENE_QUANT_MAX_WORD + 1u),
-                           rtrLoadF32(RTR_SCENE_QUANT_MAX_WORD + 2u));
-    shSceneQuantScale = shSceneQuantMax - shSceneQuantMin;
+    shSceneMin = vec3(rtrLoadF32(RTR_SCENE_MIN_WORD),
+                      rtrLoadF32(RTR_SCENE_MIN_WORD + 1u),
+                      rtrLoadF32(RTR_SCENE_MIN_WORD + 2u));
+    shSceneMax = vec3(rtrLoadF32(RTR_SCENE_MAX_WORD),
+                      rtrLoadF32(RTR_SCENE_MAX_WORD + 1u),
+                      rtrLoadF32(RTR_SCENE_MAX_WORD + 2u));
+    shSceneExtent = shSceneMax - shSceneMin;
+    shVoxelSize = shSceneExtent / vec3(RTR_VOXEL_GRID_X,
+                                       RTR_VOXEL_GRID_Y,
+                                       RTR_VOXEL_GRID_Z);
+    shBrickSize = shVoxelSize * float(RTR_BRICK_SIZE);
     shRayBase = shForward * RTR_FOCAL +
                 shRight * ((1.0 - szf.x) * invH) +
                 shUp * ((szf.y - 1.0) * invH);
@@ -358,98 +247,195 @@ vec3 rtrRayForPixel(ivec2 p)
     return normalize(ray);
 }
 
-bool rtrProject(vec3 v, vec2 szf, out RTRProjectedVertex outV)
+bool rtrBoxHit(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax, out float t0, out float t1)
 {
-    vec3 view = v - shRo;
-    float z = dot(view, shForward);
-    if (z <= 0.01)
-        return false;
+    vec3 invRd = 1.0 / mix(max(abs(rd), vec3(1.0e-8)),
+                           -max(abs(rd), vec3(1.0e-8)),
+                           lessThan(rd, vec3(0.0)));
+    vec3 a = (bmin - ro) * invRd;
+    vec3 b = (bmax - ro) * invRd;
+    vec3 lo = min(a, b);
+    vec3 hi = max(a, b);
 
-    float planeX = dot(view, shRight) * RTR_FOCAL / z;
-    float planeY = dot(view, shUp) * RTR_FOCAL / z;
-
-    outV.p = vec2((planeX * szf.y + szf.x - 1.0) * 0.5,
-                  (szf.y - 1.0 - planeY * szf.y) * 0.5);
-    return true;
+    t0 = max(max(lo.x, lo.y), max(lo.z, RTR_EPS));
+    t1 = min(min(hi.x, hi.y), hi.z);
+    return t0 <= t1;
 }
 
-bool rtrProjectTriangle(RTRTriangle tri, vec2 szf, out RTRProjectedTriangle projected)
+void rtrDDASetup(vec3 ro,
+                 vec3 rd,
+                 vec3 origin,
+                 vec3 cellSize,
+                 ivec3 cell,
+                 out ivec3 stepDir,
+                 out vec3 tMax,
+                 out vec3 tDelta)
 {
-    return rtrProject(tri.v0, szf, projected.a) &&
-           rtrProject(tri.v1, szf, projected.b) &&
-           rtrProject(tri.v2, szf, projected.c);
+    stepDir = ivec3(rd.x >= 0.0 ? 1 : -1,
+                    rd.y >= 0.0 ? 1 : -1,
+                    rd.z >= 0.0 ? 1 : -1);
+    vec3 nextCell = vec3(cell) + max(vec3(stepDir), vec3(0.0));
+    vec3 boundary = origin + nextCell * cellSize;
+
+    tMax = (boundary - ro) / rd;
+    tDelta = cellSize / max(abs(rd), vec3(1.0e-8));
+
+    if (abs(rd.x) < 1.0e-8) tMax.x = RTR_INF;
+    if (abs(rd.y) < 1.0e-8) tMax.y = RTR_INF;
+    if (abs(rd.z) < 1.0e-8) tMax.z = RTR_INF;
 }
 
-float rtrEdge(vec2 a, vec2 b, vec2 c)
+bool rtrTraceBrick(vec3 ro,
+                   vec3 rd,
+                   ivec3 brick,
+                   uvec2 mask,
+                   float startT,
+                   float endT,
+                   vec3 entryNormal,
+                   out RTRVoxelHit hit)
 {
-    return (c.x - a.x) * (b.y - a.y) -
-           (c.y - a.y) * (b.x - a.x);
-}
+    vec3 brickMin = shSceneMin + vec3(brick) * shBrickSize;
+    vec3 localP = clamp(ro + rd * (startT + RTR_EPS),
+                        brickMin,
+                        brickMin + shBrickSize - shVoxelSize * 0.001);
+    ivec3 voxel = ivec3(floor((localP - brickMin) / shVoxelSize));
+    ivec3 stepDir;
+    vec3 tMax;
+    vec3 tDelta;
+    vec3 normal = entryNormal;
+    float t = startT;
 
-void rtrBinTriangle(uint primitiveIndex)
-{
-    if (primitiveIndex >= shTriangleCount)
-        return;
+    voxel = clamp(voxel, ivec3(0), ivec3(3));
+    rtrDDASetup(ro, rd, brickMin, shVoxelSize, voxel, stepDir, tMax, tDelta);
 
-    ivec2 sz = imageSize(rtrOutImage);
-    vec2 szf = vec2(sz);
-    uvec2 tileGrid = rtrTileGrid(sz);
-    RTRProjectedTriangle projected;
+    for (uint i = 0u; i < 16u; i++) {
+        if (any(lessThan(voxel, ivec3(0))) ||
+            any(greaterThanEqual(voxel, ivec3(4))) ||
+            t > endT) {
+            break;
+        }
 
-    if (!rtrProjectTriangle(rtrLoadTriangle(primitiveIndex), szf, projected))
-        return;
+        if (rtrMaskBit(mask, voxel)) {
+            hit.hit = true;
+            hit.t = t;
+            hit.voxel = brick * int(RTR_BRICK_SIZE) + voxel;
+            hit.normal = normal;
+            return true;
+        }
 
-    float area = rtrEdge(projected.a.p, projected.b.p, projected.c.p);
-    if (abs(area) <= 1.0e-6)
-        return;
-
-    vec2 minP = floor(min(projected.a.p, min(projected.b.p, projected.c.p)));
-    vec2 maxP = ceil(max(projected.a.p, max(projected.b.p, projected.c.p)));
-    minP = clamp(minP, vec2(0.0), vec2(sz - ivec2(1)));
-    maxP = clamp(maxP, vec2(0.0), vec2(sz - ivec2(1)));
-
-    uvec2 minTile = uvec2(minP) / RTR_FORWARD_TILE_SIZE;
-    uvec2 maxTile = uvec2(maxP) / RTR_FORWARD_TILE_SIZE;
-    maxTile = min(maxTile, tileGrid - uvec2(1u));
-
-    for (uint ty = minTile.y; ty <= maxTile.y; ty++) {
-        for (uint tx = minTile.x; tx <= maxTile.x; tx++) {
-            uint tileIndex = rtrTileIndex(uvec2(tx, ty), tileGrid);
-            uint itemIndex = atomicAdd(rtrMem[rtrTileWord(tileIndex)], 1u);
-            if (itemIndex < RTR_FORWARD_TILE_CAPACITY)
-                rtrStoreU32(rtrTileItemWord(sz, tileIndex, itemIndex),
-                            primitiveIndex);
+        if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
+            t = tMax.x;
+            tMax.x += tDelta.x;
+            voxel.x += stepDir.x;
+            normal = vec3(-float(stepDir.x), 0.0, 0.0);
+        } else if (tMax.y <= tMax.z) {
+            t = tMax.y;
+            tMax.y += tDelta.y;
+            voxel.y += stepDir.y;
+            normal = vec3(0.0, -float(stepDir.y), 0.0);
+        } else {
+            t = tMax.z;
+            tMax.z += tDelta.z;
+            voxel.z += stepDir.z;
+            normal = vec3(0.0, 0.0, -float(stepDir.z));
         }
     }
+
+    return false;
 }
 
-bool rtrTriangleHit(vec3 ro, vec3 rd, RTRTriangle tri, out float hitT)
+bool rtrTraceVoxels(vec3 ro, vec3 rd, out RTRVoxelHit hit)
 {
-    vec3 e1 = tri.v1 - tri.v0;
-    vec3 e2 = tri.v2 - tri.v0;
-    vec3 pvec = cross(rd, e2);
-    float det = dot(e1, pvec);
-
-    if (abs(det) < 1.0e-8)
+    float tEnter;
+    float tExit;
+    if (!rtrBoxHit(ro, rd, shSceneMin, shSceneMax, tEnter, tExit))
         return false;
 
-    float invDet = 1.0 / det;
-    vec3 tvec = ro - tri.v0;
-    float u = dot(tvec, pvec) * invDet;
-    if (u < 0.0 || u > 1.0)
-        return false;
+    vec3 p = clamp(ro + rd * (tEnter + RTR_EPS),
+                   shSceneMin,
+                   shSceneMax - shBrickSize * 0.001);
+    ivec3 brick = ivec3(floor((p - shSceneMin) / shBrickSize));
+    ivec3 stepDir;
+    vec3 tMax;
+    vec3 tDelta;
+    vec3 normal = vec3(0.0, 1.0, 0.0);
+    float t = tEnter;
 
-    vec3 qvec = cross(tvec, e1);
-    float v = dot(rd, qvec) * invDet;
-    if (v < 0.0 || u + v > 1.0)
-        return false;
+    brick = clamp(brick, ivec3(0), ivec3(RTR_BRICK_GRID_X - 1u,
+                                         RTR_BRICK_GRID_Y - 1u,
+                                         RTR_BRICK_GRID_Z - 1u));
+    rtrDDASetup(ro, rd, shSceneMin, shBrickSize, brick, stepDir, tMax, tDelta);
 
-    float t = dot(e2, qvec) * invDet;
-    if (t < RTR_EPS)
-        return false;
+    for (uint i = 0u; i < 96u; i++) {
+        if (any(lessThan(brick, ivec3(0))) ||
+            brick.x >= int(RTR_BRICK_GRID_X) ||
+            brick.y >= int(RTR_BRICK_GRID_Y) ||
+            brick.z >= int(RTR_BRICK_GRID_Z) ||
+            t > tExit) {
+            break;
+        }
 
-    hitT = t;
-    return true;
+        float nextT = min(min(tMax.x, tMax.y), tMax.z);
+        uint brickRef = rtrBrickMap(brick);
+        if (brickRef != 0u && brickRef <= shBrickCount) {
+            if (rtrTraceBrick(ro, rd, brick, rtrBrickMask(brickRef),
+                              t, min(nextT, tExit), normal, hit)) {
+                return true;
+            }
+        }
+
+        if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
+            t = tMax.x;
+            tMax.x += tDelta.x;
+            brick.x += stepDir.x;
+            normal = vec3(-float(stepDir.x), 0.0, 0.0);
+        } else if (tMax.y <= tMax.z) {
+            t = tMax.y;
+            tMax.y += tDelta.y;
+            brick.y += stepDir.y;
+            normal = vec3(0.0, -float(stepDir.y), 0.0);
+        } else {
+            t = tMax.z;
+            tMax.z += tDelta.z;
+            brick.z += stepDir.z;
+            normal = vec3(0.0, 0.0, -float(stepDir.z));
+        }
+    }
+
+    return false;
+}
+
+vec3 rtrFloorAlbedo(vec3 p)
+{
+    ivec2 cell = ivec2(floor(p.xz));
+    float check = float((cell.x ^ cell.y) & 1);
+    vec2 cellUv = fract(p.xz);
+    float edge = min(min(cellUv.x, 1.0 - cellUv.x),
+                     min(cellUv.y, 1.0 - cellUv.y));
+    float grout = 1.0 - smoothstep(0.012, 0.04, edge);
+    vec3 dark = vec3(0.42, 0.44, 0.42);
+    vec3 light = vec3(0.62, 0.64, 0.60);
+    vec3 base = mix(dark, light, check);
+
+    return base * (1.0 - grout * 0.18);
+}
+
+vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
+{
+    uint h = rtrHashU32(uint(voxel.x * 73856093 ^
+                            voxel.y * 19349663 ^
+                            voxel.z * 83492791));
+    float jitter = float(h & 0xffffu) / 65535.0;
+    float height = clamp((p.y - RTR_FLOOR_Y) * 0.55, 0.0, 1.0);
+    float top = max(n.y, 0.0);
+    vec3 stone = mix(vec3(0.28, 0.29, 0.36), vec3(0.50, 0.51, 0.58), height);
+    vec3 cap = vec3(0.64, 0.61, 0.52);
+    vec3 trim = vec3(0.78, 0.55, 0.19);
+    float trimMask = top * smoothstep(0.70, 0.95, jitter) *
+        smoothstep(0.18, 0.75, height);
+    vec3 base = mix(mix(stone, cap, top * 0.35), trim, trimMask);
+
+    return base * (0.88 + jitter * 0.12);
 }
 
 bool rtrFloorHit(vec3 ro, vec3 rd, out float hitT)
@@ -489,75 +475,28 @@ vec3 rtrShade(vec3 p, vec3 n, vec3 albedo)
     return direct + ambient;
 }
 
-vec3 rtrResolveSurface(ivec2 p)
+vec3 rtrRenderPixel(ivec2 p)
 {
-    ivec2 sz = imageSize(rtrOutImage);
-    uvec2 tileGrid = rtrTileGrid(sz);
-    uvec2 tile = min(uvec2(p) / RTR_FORWARD_TILE_SIZE, tileGrid - uvec2(1u));
-    uint tileIndex = rtrTileIndex(tile, tileGrid);
-    uint count = min(rtrLoadU32(rtrTileWord(tileIndex)),
-                     RTR_FORWARD_TILE_CAPACITY);
     vec3 rd = rtrRayForPixel(p);
-    float bestT = RTR_INF;
-    uint bestTriangle = RTR_MAX_TRIANGLES;
-
-    for (uint i = 0u; i < count; i++) {
-        uint triangleIndex = rtrLoadU32(rtrTileItemWord(sz, tileIndex, i));
-        if (triangleIndex >= shTriangleCount)
-            continue;
-
-        float t = 0.0;
-        if (rtrTriangleHit(shRo, rd, rtrLoadTriangle(triangleIndex), t) &&
-            t < bestT) {
-            bestT = t;
-            bestTriangle = triangleIndex;
-        }
-    }
-
-    if (bestTriangle < shTriangleCount) {
-        RTRTriangle tri = rtrLoadTriangle(bestTriangle);
-        vec3 hitP = shRo + rd * bestT;
-        vec3 n = rtrSurfaceNormal(tri, rd);
-
-        return rtrShade(hitP, n, rtrTriangleAlbedo(bestTriangle, hitP, n));
-    }
-
+    RTRVoxelHit voxelHit;
     float floorT = 0.0;
-    if (rtrFloorHit(shRo, rd, floorT)) {
-        vec3 hitP = shRo + rd * floorT;
-        vec3 n = vec3(0.0, 1.0, 0.0);
-        if (dot(n, rd) > 0.0)
-            n = -n;
+    bool hasVoxel = rtrTraceVoxels(shRo, rd, voxelHit);
+    bool hasFloor = rtrFloorHit(shRo, rd, floorT);
 
-        return rtrShade(hitP, n, rtrFloorAlbedo(hitP));
+    if (hasVoxel && (!hasFloor || voxelHit.t < floorT)) {
+        vec3 hitP = shRo + rd * voxelHit.t;
+        vec3 n = voxelHit.normal;
+        return rtrShade(hitP, n, rtrVoxelAlbedo(voxelHit.voxel, hitP, n));
+    }
+
+    if (hasFloor) {
+        vec3 hitP = shRo + rd * floorT;
+        return rtrShade(hitP, vec3(0.0, 1.0, 0.0), rtrFloorAlbedo(hitP));
     }
 
     return rtrSky(rd);
 }
 
-#if RTR_RENDER_PASS == 0
-void main()
-{
-    ivec2 sz = imageSize(rtrOutImage);
-    uint tileIndex = gl_GlobalInvocationID.x;
-    if (tileIndex >= rtrTileCount(sz))
-        return;
-
-    rtrStoreU32(rtrTileWord(tileIndex), 0u);
-}
-#elif RTR_RENDER_PASS == 1
-void main()
-{
-    ivec2 sz = imageSize(rtrOutImage);
-
-    if (gl_LocalInvocationIndex == 0u)
-        rtrInitShared(vec2(sz));
-
-    barrier();
-
-    rtrBinTriangle(gl_GlobalInvocationID.x);
-}
-#elif RTR_RENDER_PASS == 2
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -571,11 +510,5 @@ void main()
     if (any(greaterThanEqual(p, sz)))
         return;
 
-    vec3 color = rtrResolveSurface(p);
-    imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+    imageStore(rtrOutImage, p, vec4(rtrTonemap(rtrRenderPixel(p)), 1.0));
 }
-#else
-void main()
-{
-}
-#endif

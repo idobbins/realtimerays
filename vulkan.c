@@ -12,22 +12,18 @@
 #include <string.h>
 #include <time.h>
 
-#include "render_clear_comp_spv.h"
-#include "render_bin_comp_spv.h"
-#include "render_resolve_comp_spv.h"
+#include "render_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #define RTR_TILE_SIZE 8u
-#define RTR_PRIMITIVE_GROUP_SIZE 64u
-#define RTR_FORWARD_TILE_SIZE 16u
-#define RTR_FORWARD_TILE_CAPACITY 1024u
 #define RTR_MEMORY_HEADER_WORDS 32u
-#define RTR_SCENE_TRIANGLE_CAPACITY 900000u
-#define RTR_SCENE_TRIANGLE_WORDS 5u
-#define RTR_SCENE_BVH_NODE_COUNT (RTR_SCENE_TRIANGLE_CAPACITY * 2u - 1u)
-#define RTR_SCENE_BVH_NODE_WORDS 8u
-#define RTR_BLUE_NOISE_SIZE 64u
-#define RTR_BLUE_NOISE_WORDS (RTR_BLUE_NOISE_SIZE * RTR_BLUE_NOISE_SIZE)
+#define RTR_SCENE_BRICK_SIZE 4u
+#define RTR_SCENE_BRICK_GRID_X 16u
+#define RTR_SCENE_BRICK_GRID_Y 12u
+#define RTR_SCENE_BRICK_GRID_Z 16u
+#define RTR_SCENE_BRICK_CAPACITY \
+    (RTR_SCENE_BRICK_GRID_X * RTR_SCENE_BRICK_GRID_Y * RTR_SCENE_BRICK_GRID_Z)
+#define RTR_SCENE_BRICK_WORDS 2u
 #define RTR_ENVMAP_WIDTH 1024u
 #define RTR_ENVMAP_HEIGHT 512u
 #define RTR_ENVMAP_WORDS (RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u)
@@ -36,9 +32,8 @@
 #define RTR_ENVMAP_DIFFUSE_WORDS \
     (RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u)
 #define RTR_SCENE_WORDS \
-    (RTR_SCENE_TRIANGLE_CAPACITY * RTR_SCENE_TRIANGLE_WORDS + \
-     RTR_SCENE_BVH_NODE_COUNT * RTR_SCENE_BVH_NODE_WORDS + \
-     RTR_BLUE_NOISE_WORDS + \
+    (RTR_SCENE_BRICK_CAPACITY + \
+     RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS + \
      RTR_ENVMAP_WORDS + \
      RTR_ENVMAP_DIFFUSE_WORDS)
 #define RTR_MEMORY_MAGIC 0x30525452u
@@ -54,7 +49,7 @@ enum {
     RTR_MEMORY_WIDTH_WORD = 2,
     RTR_MEMORY_HEIGHT_WORD = 3,
     RTR_MEMORY_FRAME_WORD = 4,
-    RTR_MEMORY_TRIANGLE_COUNT_WORD = 8,
+    RTR_MEMORY_BRICK_COUNT_WORD = 8,
     RTR_MEMORY_CAMERA_YAW_WORD = 17,
     RTR_MEMORY_CAMERA_PITCH_WORD = 18,
     RTR_MEMORY_CAMERA_RADIUS_WORD = 19,
@@ -91,9 +86,7 @@ enum {
 };
 
 enum {
-    RTR_PIPELINE_CLEAR,
-    RTR_PIPELINE_BIN,
-    RTR_PIPELINE_RESOLVE,
+    RTR_PIPELINE_RENDER,
     RTR_PIPELINE_COUNT,
 };
 
@@ -185,17 +178,6 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
     char *end = NULL;
     const unsigned long parsed = strtoul(value, &end, 10);
     return end != value ? (uint32_t)parsed : fallback;
-}
-
-static uint32_t rtrDivUpU32(uint32_t value, uint32_t divisor)
-{
-    return (value + divisor - 1u) / divisor;
-}
-
-static uint32_t rtrForwardTileCount(void)
-{
-    return rtrDivUpU32(rtrSwapExtent.width, RTR_FORWARD_TILE_SIZE) *
-        rtrDivUpU32(rtrSwapExtent.height, RTR_FORWARD_TILE_SIZE);
 }
 
 static uint32_t rtrFindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags)
@@ -354,16 +336,10 @@ static float rtrFrameSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
-    const VkDeviceSize rtrTileCount = (VkDeviceSize)rtrForwardTileCount();
-    const VkDeviceSize rtrForwardTileWords =
-        rtrTileCount *
-        ((VkDeviceSize)1u + (VkDeviceSize)RTR_FORWARD_TILE_CAPACITY);
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
-         (VkDeviceSize)RTR_SCENE_WORDS +
-         rtrForwardTileWords) *
+         (VkDeviceSize)RTR_SCENE_WORDS) *
         (VkDeviceSize)sizeof(uint32_t);
-    if (rtrTileCount == 0u) return 1;
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = rtrMemorySize,
@@ -390,7 +366,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 23u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 30u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
@@ -442,29 +418,6 @@ static void rtrUpdateMemory(void)
                         autoOrbit, cameraYaw, cameraPitch, cameraRadius);
 }
 
-static void rtrCmdRenderBarrier(VkCommandBuffer commandBuffer)
-{
-    vkCmdPipelineBarrier(commandBuffer,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0u,
-                         0u,
-                         NULL,
-                         1u,
-                         &(VkBufferMemoryBarrier){
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = rtrMemoryBuffer,
-        .offset = 0u,
-        .size = VK_WHOLE_SIZE,
-    },
-                         0u,
-                         NULL);
-}
-
 static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                                  VkDescriptorSet descriptorSet)
 {
@@ -472,17 +425,6 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
         (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
     const uint32_t pixelGroupsY =
         (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
-    const uint32_t primitiveCount =
-        rtrMemoryWords ?
-        rtrMemoryWords[RTR_MEMORY_TRIANGLE_COUNT_WORD] :
-        0u;
-    const uint32_t primitiveGroupsX =
-        (primitiveCount + RTR_PRIMITIVE_GROUP_SIZE - 1u) /
-        RTR_PRIMITIVE_GROUP_SIZE;
-    const uint32_t tileCount = rtrForwardTileCount();
-    const uint32_t tileGroupsX =
-        (tileCount + RTR_PRIMITIVE_GROUP_SIZE - 1u) /
-        RTR_PRIMITIVE_GROUP_SIZE;
 
     vkCmdBindDescriptorSets(commandBuffer,
                             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -493,30 +435,10 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                             0u,
                             NULL);
 
-    for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
-        uint32_t groupsX = pixelGroupsX;
-        uint32_t groupsY = pixelGroupsY;
-
-        if (pipeline == RTR_PIPELINE_CLEAR) {
-            if (tileGroupsX == 0u)
-                continue;
-            groupsX = tileGroupsX;
-            groupsY = 1u;
-        } else if (pipeline == RTR_PIPELINE_BIN) {
-            if (primitiveGroupsX == 0u)
-                continue;
-            groupsX = primitiveGroupsX;
-            groupsY = 1u;
-        }
-
-        vkCmdBindPipeline(commandBuffer,
-                          VK_PIPELINE_BIND_POINT_COMPUTE,
-                          rtrPipelines[pipeline]);
-        vkCmdDispatch(commandBuffer, groupsX, groupsY, 1u);
-
-        if (pipeline + 1u < RTR_PIPELINE_COUNT)
-            rtrCmdRenderBarrier(commandBuffer);
-    }
+    vkCmdBindPipeline(commandBuffer,
+                      VK_PIPELINE_BIND_POINT_COMPUTE,
+                      rtrPipelines[RTR_PIPELINE_RENDER]);
+    vkCmdDispatch(commandBuffer, pixelGroupsX, pixelGroupsY, 1u);
 }
 
 static int rtrCreateTimingQueryPool(void)
@@ -858,14 +780,10 @@ int rtrVulkanInit(void *windowSurface)
     }, NULL, &rtrPipelineLayout);
 
     const uint32_t *const shaderWords[RTR_PIPELINE_COUNT] = {
-        (const uint32_t *)(const void *)renderClearCompSpv,
-        (const uint32_t *)(const void *)renderBinCompSpv,
-        (const uint32_t *)(const void *)renderResolveCompSpv,
+        (const uint32_t *)(const void *)renderCompSpv,
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
-        renderClearCompSpv_len,
-        renderBinCompSpv_len,
-        renderResolveCompSpv_len,
+        renderCompSpv_len,
     };
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {
