@@ -638,6 +638,17 @@ vec3 rtrHistoryDecode(vec3 color)
     return color / max(1.0 - dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.05);
 }
 
+vec4 rtrCatmullRomWeights(float t)
+{
+    float t2 = t * t;
+    float t3 = t2 * t;
+
+    return vec4(0.5 * (-t3 + 2.0 * t2 - t),
+                0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
+                0.5 * (-3.0 * t3 + 4.0 * t2 + t),
+                0.5 * (t3 - t2));
+}
+
 vec3 rtrResolveHistory(vec3 color,
                        ivec2 p,
                        ivec2 sz,
@@ -663,39 +674,78 @@ vec3 rtrResolveHistory(vec3 color,
             float b = RTR_FOCAL * dot(prevDir, shPrevUp) / fwd;
             /* The previous frame sampled pixel q through q + prevJitter,
              * so subtracting the jitter puts texel q's sample exactly at
-             * integer coordinate q for the bilinear fetch. */
+             * integer coordinate q for the filtered fetch. */
             vec2 q = vec2(0.5 * (a * szf.y - 1.0 + szf.x),
                           0.5 * (szf.y - 1.0 - b * szf.y)) - shPrevJitter;
             ivec2 q0 = ivec2(floor(q));
             vec2 qf = q - vec2(q0);
             float prevDist = length(prevDir);
+            vec4 wx = rtrCatmullRomWeights(qf.x);
+            vec4 wy = rtrCatmullRomWeights(qf.y);
+            vec3 sharp = vec3(0.0);
+            vec3 innerMin = vec3(1.0e9);
+            vec3 innerMax = vec3(-1.0e9);
+            vec3 anyHistory = vec3(0.0);
+            float anyFrames = 0.0;
+            float anyCount = 0.0;
+            bool allValid = true;
 
-            for (int tap = 0; tap < 4; tap++) {
-                ivec2 offset = ivec2(tap & 1, tap >> 1);
-                ivec2 qt = q0 + offset;
-                if (any(lessThan(qt, ivec2(0))) ||
-                    any(greaterThanEqual(qt, sz))) {
-                    continue;
+            /* 4x4 neighborhood: the inner 2x2 builds a per-tap validated
+             * bilinear average; when every tap is valid the full
+             * Catmull-Rom kernel is used instead, which stays sharp under
+             * repeated per-frame resampling where bilinear blurs. */
+            for (int tap = 0; tap < 16; tap++) {
+                ivec2 offset = ivec2(tap & 3, tap >> 2);
+                ivec2 qt = q0 + offset - 1;
+                bool valid = all(greaterThanEqual(qt, ivec2(0))) &&
+                             all(lessThan(qt, sz));
+
+                if (valid) {
+                    uint src = srcBase +
+                               uint(qt.y * sz.x + qt.x) *
+                                   RTR_HISTORY_PIXEL_WORDS;
+                    vec2 rg = unpackHalf2x16(rtrLoadU32(src));
+                    vec2 bt = unpackHalf2x16(rtrLoadU32(src + 1u));
+                    float tapFrames = uintBitsToFloat(rtrLoadU32(src + 2u));
+                    valid = sky ?
+                        bt.y > RTR_HISTORY_SKY_T * 0.5 :
+                        abs(bt.y - prevDist) < prevDist * 0.05 + 0.02;
+
+                    if (valid) {
+                        vec3 c = vec3(rg, bt.x);
+                        sharp += c * (wx[offset.x] * wy[offset.y]);
+                        anyHistory += c;
+                        anyFrames += tapFrames;
+                        anyCount += 1.0;
+                        if (offset.x >= 1 && offset.x <= 2 &&
+                            offset.y >= 1 && offset.y <= 2) {
+                            float w = (offset.x == 2 ? qf.x : 1.0 - qf.x) *
+                                      (offset.y == 2 ? qf.y : 1.0 - qf.y);
+                            history += c * w;
+                            historyFrames += tapFrames * w;
+                            historyWeight += w;
+                            innerMin = min(innerMin, c);
+                            innerMax = max(innerMax, c);
+                        }
+                    }
                 }
 
-                float w = (offset.x == 1 ? qf.x : 1.0 - qf.x) *
-                          (offset.y == 1 ? qf.y : 1.0 - qf.y);
-                if (w <= 0.0)
-                    continue;
+                allValid = allValid && valid;
+            }
 
-                uint src = srcBase +
-                           uint(qt.y * sz.x + qt.x) * RTR_HISTORY_PIXEL_WORDS;
-                vec2 rg = unpackHalf2x16(rtrLoadU32(src));
-                vec2 bt = unpackHalf2x16(rtrLoadU32(src + 1u));
-                bool valid = sky ?
-                    bt.y > RTR_HISTORY_SKY_T * 0.5 :
-                    abs(bt.y - prevDist) < prevDist * 0.05 + 0.02;
-                if (!valid)
-                    continue;
-
-                history += vec3(rg, bt.x) * w;
-                historyFrames += uintBitsToFloat(rtrLoadU32(src + 2u)) * w;
-                historyWeight += w;
+            /* Catmull-Rom lobes can over/undershoot; clamping to the
+             * bilinear footprint's range keeps the sharpness without
+             * letting the encoded color escape the valid history range. */
+            if (allValid) {
+                history = clamp(sharp, innerMin, innerMax) * historyWeight;
+            } else if (historyWeight <= 0.01 && anyCount > 0.0) {
+                /* The bilinear footprint missed (jitter pushed this
+                 * pixel's sample onto its minority surface), but the
+                 * wider 4x4 holds validated history for the same
+                 * surface; borrowing it beats a raw 1-spp sample. */
+                history = anyHistory;
+                historyFrames = anyFrames;
+                historyWeight = anyCount;
             }
         }
     }
