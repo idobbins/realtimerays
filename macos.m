@@ -25,9 +25,6 @@ static uint32_t rtrMouseDragging = 0u;
 static uint32_t rtrMouseDragActive = 0u;
 static float rtrMouseDownX = 0.0f;
 static float rtrMouseDownY = 0.0f;
-static uint32_t rtrImpulsePending = 0u;
-static float rtrImpulseX = 0.0f;
-static float rtrImpulseY = 0.0f;
 
 static float rtrClamp(float value, float lo, float hi)
 {
@@ -93,9 +90,6 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     rtrMouseDragActive = 0u;
     rtrMouseDownX = 0.0f;
     rtrMouseDownY = 0.0f;
-    rtrImpulsePending = 0u;
-    rtrImpulseX = 0.0f;
-    rtrImpulseY = 0.0f;
     return 0;
 }
 
@@ -120,16 +114,6 @@ void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radiu
 void rtrWindowSetCameraYaw(float yaw)
 {
     rtrCameraYaw = yaw;
-}
-
-int rtrWindowConsumeImpulse(float *x, float *y)
-{
-    if (!rtrImpulsePending) return 0;
-
-    if (x) *x = rtrImpulseX;
-    if (y) *y = rtrImpulseY;
-    rtrImpulsePending = 0u;
-    return 1;
 }
 
 int rtrPumpEventsOnce(void)
@@ -169,24 +153,8 @@ int rtrPumpEventsOnce(void)
                     rtrMouseDownX = rtrMouseX;
                     rtrMouseDownY = rtrMouseY;
                 } else if (type == NSEventTypeLeftMouseUp) {
-                    const float dx = rtrMouseX - rtrMouseDownX;
-                    const float dy = rtrMouseY - rtrMouseDownY;
-                    const uint32_t click =
-                        rtrMouseDragging &&
-                        !rtrMouseDragActive &&
-                        dx * dx + dy * dy <=
-                            RTR_MOUSE_DRAG_THRESHOLD * RTR_MOUSE_DRAG_THRESHOLD;
-                    if (click) {
-                        rtrImpulseX = rtrMouseX;
-                        rtrImpulseY = rtrMouseY;
-                        rtrImpulsePending = 1u;
-                    }
                     rtrMouseDragging = 0u;
                     rtrMouseDragActive = 0u;
-                } else if (type == NSEventTypeRightMouseDown) {
-                    rtrImpulseX = rtrMouseX;
-                    rtrImpulseY = rtrMouseY;
-                    rtrImpulsePending = 1u;
                 } else if (type == NSEventTypeLeftMouseDragged && rtrMouseDragging &&
                            oldMouseX >= 0.0f && oldMouseY >= 0.0f) {
                     const float dx = rtrMouseX - oldMouseX;

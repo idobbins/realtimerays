@@ -8,10 +8,6 @@
 #define RTR_SCENE_HDRI_PATH "assets/hdri/spaichingen_hill_1024x512_rgba16f.bin"
 #endif
 
-#ifndef RTR_SCENE_HDRI_DIFFUSE_PATH
-#define RTR_SCENE_HDRI_DIFFUSE_PATH "assets/hdri/spaichingen_hill_diffuse_32x16_rgba16f.bin"
-#endif
-
 #define RTR_SCENE_BRICK_SIZE 4u
 #define RTR_SCENE_BRICK_GRID_X 32u
 #define RTR_SCENE_BRICK_GRID_Y 12u
@@ -33,10 +29,6 @@
 #define RTR_SCENE_ENVMAP_WIDTH 1024u
 #define RTR_SCENE_ENVMAP_HEIGHT 512u
 #define RTR_SCENE_ENVMAP_WORDS (RTR_SCENE_ENVMAP_WIDTH * RTR_SCENE_ENVMAP_HEIGHT * 2u)
-#define RTR_SCENE_ENVMAP_DIFFUSE_WIDTH 32u
-#define RTR_SCENE_ENVMAP_DIFFUSE_HEIGHT 16u
-#define RTR_SCENE_ENVMAP_DIFFUSE_WORDS \
-    (RTR_SCENE_ENVMAP_DIFFUSE_WIDTH * RTR_SCENE_ENVMAP_DIFFUSE_HEIGHT * 2u)
 
 enum {
     RTR_SCENE_BRICK_COUNT_WORD = 8,
@@ -51,8 +43,6 @@ enum {
     RTR_SCENE_ENVMAP_WORD =
         RTR_SCENE_VOXEL_BRICK_WORD +
         RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS,
-    RTR_SCENE_ENVMAP_DIFFUSE_WORD =
-        RTR_SCENE_ENVMAP_WORD + RTR_SCENE_ENVMAP_WORDS,
 };
 
 static uint32_t rtrF32Word(float value)
@@ -315,12 +305,6 @@ static void rtrStoreEnvironment(uint32_t *words)
                             RTR_SCENE_ENVMAP_WIDTH,
                             RTR_SCENE_ENVMAP_HEIGHT,
                             RTR_SCENE_ENVMAP_WORDS);
-    rtrStoreEnvironmentFile(words,
-                            RTR_SCENE_HDRI_DIFFUSE_PATH,
-                            RTR_SCENE_ENVMAP_DIFFUSE_WORD,
-                            RTR_SCENE_ENVMAP_DIFFUSE_WIDTH,
-                            RTR_SCENE_ENVMAP_DIFFUSE_HEIGHT,
-                            RTR_SCENE_ENVMAP_DIFFUSE_WORDS);
 }
 
 static void rtrStoreSceneBounds(uint32_t *words)

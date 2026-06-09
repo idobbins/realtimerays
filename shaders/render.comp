@@ -9,10 +9,10 @@ layout(std430, binding = 1) buffer RTRMemory {
 };
 
 const uint RTR_BRICK_COUNT_WORD = 8u;
+const uint RTR_FRAME_WORD = 4u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
-const uint RTR_CHUNK_COUNT_WORD = 20u;
 
 const uint RTR_BRICK_SIZE = 4u;
 const uint RTR_BRICK_GRID_X = 32u;
@@ -31,51 +31,22 @@ const uint RTR_ENVMAP_WIDTH = 1024u;
 const uint RTR_ENVMAP_HEIGHT = 512u;
 const uint RTR_ENVMAP_WORD =
     RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
-const uint RTR_ENVMAP_DIFFUSE_WIDTH = 32u;
-const uint RTR_ENVMAP_DIFFUSE_HEIGHT = 16u;
-const uint RTR_ENVMAP_DIFFUSE_WORD =
-    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
-const uint RTR_CHUNK_MAX = 128u;
-const uint RTR_CHUNK_SIZE_X = 8u;
-const uint RTR_CHUNK_SIZE_Y = 16u;
-const uint RTR_CHUNK_SIZE_Z = 8u;
-const uint RTR_CHUNK_MASK_BITS = RTR_CHUNK_SIZE_X * RTR_CHUNK_SIZE_Y * RTR_CHUNK_SIZE_Z;
-const uint RTR_CHUNK_MASK_WORDS = (RTR_CHUNK_MASK_BITS + 31u) / 32u;
-const uint RTR_CHUNK_STATE_WORDS = 32u;
-const uint RTR_CHUNK_STATE_WORD = RTR_ENVMAP_DIFFUSE_WORD +
-    RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u;
-const uint RTR_CHUNK_MASK_WORD =
-    RTR_CHUNK_STATE_WORD + RTR_CHUNK_MAX * RTR_CHUNK_STATE_WORDS;
-const uint RTR_CHUNK_ACTIVE_WORD = 0u;
-const uint RTR_CHUNK_BASE_X_WORD = 1u;
-const uint RTR_CHUNK_BASE_Y_WORD = 2u;
-const uint RTR_CHUNK_BASE_Z_WORD = 3u;
-const uint RTR_CHUNK_POSITION_X_WORD = 4u;
-const uint RTR_CHUNK_POSITION_Y_WORD = 5u;
-const uint RTR_CHUNK_POSITION_Z_WORD = 6u;
-const uint RTR_CHUNK_ROTATION_X_WORD = 8u;
-const uint RTR_CHUNK_ROTATION_Y_WORD = 9u;
-const uint RTR_CHUNK_ROTATION_Z_WORD = 10u;
-const uint RTR_CHUNK_ROTATION_W_WORD = 11u;
-const uint RTR_CHUNK_LOCAL_MIN_X_WORD = 16u;
-const uint RTR_CHUNK_LOCAL_MAX_X_WORD = 20u;
-const uint RTR_CHUNK_GRID_MIN_X_WORD = 24u;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
 const float RTR_FOCAL = 1.35;
 const float RTR_INV_PI = 0.31830988618;
 const float RTR_ENVMAP_LUMINANCE_CAP = 12.0;
-const float RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP = 2.0;
-const float RTR_ENVMAP_DIFFUSE_EXPOSURE = 0.7;
-const vec3 RTR_ENVMAP_AVERAGE = vec3(0.489, 0.549, 0.574);
 const float RTR_FLOOR_Y = -1.0;
 const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
+const float RTR_LIGHT_RADIUS = 0.7;
+const float RTR_TWO_PI = 6.28318530718;
+const uint RTR_PATH_BOUNCES = 3u;
+const uint RTR_SAMPLES_PER_PIXEL = 2u;
 
 shared uint shBrickCount;
-shared uint shChunkCount;
 shared vec3 shRo;
 shared vec3 shForward;
 shared vec3 shRight;
@@ -117,6 +88,29 @@ uint rtrHashU32(uint value)
     return value;
 }
 
+uint rtrSeedPath(uvec2 coord, uint frameIndex, uint sampleIndex)
+{
+    uint seed = coord.x * 1973u ^
+                coord.y * 9277u ^
+                frameIndex * 26699u ^
+                sampleIndex * 31847u ^
+                0x9e3779b9u;
+
+    return rtrHashU32(seed) | 1u;
+}
+
+uint rtrRandomU32(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float rtrRandom01(inout uint state)
+{
+    return float(rtrRandomU32(state) & 0x00ffffffu) * (1.0 / 16777216.0);
+}
+
 uint rtrBrickMapIndex(ivec3 brick)
 {
     return uint((brick.y * int(RTR_BRICK_GRID_Z) + brick.z) *
@@ -141,64 +135,12 @@ uvec2 rtrBrickMask(uint brickRef)
     return uvec2(rtrLoadU32(word), rtrLoadU32(word + 1u));
 }
 
-uint rtrChunkStateWord(uint chunk, uint word)
-{
-    return RTR_CHUNK_STATE_WORD + chunk * RTR_CHUNK_STATE_WORDS + word;
-}
-
-uint rtrChunkMaskWord(uint chunk)
-{
-    return RTR_CHUNK_MASK_WORD + chunk * RTR_CHUNK_MASK_WORDS;
-}
-
-vec3 rtrLoadChunkVec3(uint chunk, uint word)
-{
-    uint base = rtrChunkStateWord(chunk, word);
-    return vec3(rtrLoadF32(base), rtrLoadF32(base + 1u), rtrLoadF32(base + 2u));
-}
-
-vec4 rtrLoadChunkQuat(uint chunk)
-{
-    uint base = rtrChunkStateWord(chunk, RTR_CHUNK_ROTATION_X_WORD);
-    return normalize(vec4(rtrLoadF32(base),
-                          rtrLoadF32(base + 1u),
-                          rtrLoadF32(base + 2u),
-                          rtrLoadF32(base + 3u)));
-}
-
-vec3 rtrQuatRotate(vec4 q, vec3 v)
-{
-    vec3 uv = cross(q.xyz, v);
-    vec3 uuv = cross(q.xyz, uv);
-    return v + (uv * q.w + uuv) * 2.0;
-}
-
-vec3 rtrQuatInverseRotate(vec4 q, vec3 v)
-{
-    return rtrQuatRotate(vec4(-q.xyz, q.w), v);
-}
-
 bool rtrMaskBit(uvec2 mask, ivec3 local)
 {
     uint bit = uint(local.x + local.z * 4 + local.y * 16);
     if (bit < 32u)
         return (mask.x & (1u << bit)) != 0u;
     return (mask.y & (1u << (bit - 32u))) != 0u;
-}
-
-bool rtrChunkMaskBit(uint chunk, ivec3 local)
-{
-    if (any(lessThan(local, ivec3(0))) ||
-        local.x >= int(RTR_CHUNK_SIZE_X) ||
-        local.y >= int(RTR_CHUNK_SIZE_Y) ||
-        local.z >= int(RTR_CHUNK_SIZE_Z)) {
-        return false;
-    }
-
-    uint bit = uint((local.y * int(RTR_CHUNK_SIZE_Z) + local.z) *
-                    int(RTR_CHUNK_SIZE_X) + local.x);
-    uint word = rtrLoadU32(rtrChunkMaskWord(chunk) + bit / 32u);
-    return (word & (1u << (bit & 31u))) != 0u;
 }
 
 vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
@@ -254,17 +196,6 @@ vec3 rtrSky(vec3 rd)
                                 RTR_ENVMAP_LUMINANCE_CAP);
 }
 
-vec3 rtrSkyDiffuse(vec3 rd)
-{
-    vec3 color = rtrEnvironmentSample(rd,
-                                      RTR_ENVMAP_DIFFUSE_WORD,
-                                      RTR_ENVMAP_DIFFUSE_WIDTH,
-                                      RTR_ENVMAP_DIFFUSE_HEIGHT,
-                                      RTR_ENVMAP_DIFFUSE_LUMINANCE_CAP);
-
-    return mix(color, RTR_ENVMAP_AVERAGE, 0.45) * RTR_ENVMAP_DIFFUSE_EXPOSURE;
-}
-
 void rtrCamera(float cameraYaw,
                float cameraPitch,
                float cameraRadius,
@@ -295,7 +226,6 @@ void rtrInitShared(vec2 szf)
     float invH = 1.0 / max(szf.y, 1.0);
 
     shBrickCount = min(rtrLoadU32(RTR_BRICK_COUNT_WORD), RTR_BRICK_CAPACITY);
-    shChunkCount = min(rtrLoadU32(RTR_CHUNK_COUNT_WORD), RTR_CHUNK_MAX);
     rtrCamera(cameraYaw, cameraPitch, cameraRadius, szf,
               shRo, shForward, shRight, shUp);
 
@@ -317,11 +247,11 @@ void rtrInitShared(vec2 szf)
     shRayDy = shUp * (-2.0 * invH);
 }
 
-vec3 rtrRayForPixel(ivec2 p)
+vec3 rtrRayForPixel(vec2 p)
 {
     vec3 ray = shRayBase +
-               shRayDx * float(p.x) +
-               shRayDy * float(p.y);
+               shRayDx * p.x +
+               shRayDy * p.y;
 
     return normalize(ray);
 }
@@ -484,123 +414,6 @@ bool rtrTraceVoxels(vec3 ro, vec3 rd, out RTRVoxelHit hit)
     return false;
 }
 
-bool rtrTraceChunkLocal(uint chunk,
-                        vec3 localRo,
-                        vec3 localRd,
-                        vec4 rotation,
-                        float startT,
-                        float endT,
-                        vec3 entryNormal,
-                        out RTRVoxelHit hit)
-{
-    vec3 chunkSize = shVoxelSize *
-        vec3(float(RTR_CHUNK_SIZE_X),
-             float(RTR_CHUNK_SIZE_Y),
-             float(RTR_CHUNK_SIZE_Z));
-    vec3 chunkMin = rtrLoadChunkVec3(chunk, RTR_CHUNK_GRID_MIN_X_WORD);
-    vec3 chunkMax = chunkMin + chunkSize;
-    vec3 localP = clamp(localRo + localRd * (startT + RTR_EPS),
-                        chunkMin,
-                        chunkMax - shVoxelSize * 0.001);
-    ivec3 voxel = ivec3(floor((localP - chunkMin) / shVoxelSize));
-    ivec3 stepDir;
-    vec3 tMax;
-    vec3 tDelta;
-    vec3 normal = entryNormal;
-    float t = startT;
-
-    voxel = clamp(voxel,
-                  ivec3(0),
-                  ivec3(int(RTR_CHUNK_SIZE_X - 1u),
-                        int(RTR_CHUNK_SIZE_Y - 1u),
-                        int(RTR_CHUNK_SIZE_Z - 1u)));
-    rtrDDASetup(localRo, localRd, chunkMin, shVoxelSize, voxel,
-                stepDir, tMax, tDelta);
-
-    for (uint i = 0u; i < 64u; i++) {
-        if (any(lessThan(voxel, ivec3(0))) ||
-            voxel.x >= int(RTR_CHUNK_SIZE_X) ||
-            voxel.y >= int(RTR_CHUNK_SIZE_Y) ||
-            voxel.z >= int(RTR_CHUNK_SIZE_Z) ||
-            t > endT) {
-            break;
-        }
-
-        if (rtrChunkMaskBit(chunk, voxel)) {
-            ivec3 base =
-                ivec3(int(rtrLoadU32(rtrChunkStateWord(chunk, RTR_CHUNK_BASE_X_WORD))),
-                      int(rtrLoadU32(rtrChunkStateWord(chunk, RTR_CHUNK_BASE_Y_WORD))),
-                      int(rtrLoadU32(rtrChunkStateWord(chunk, RTR_CHUNK_BASE_Z_WORD))));
-            hit.hit = true;
-            hit.t = t;
-            hit.voxel = base + voxel;
-            hit.normal = normalize(rtrQuatRotate(rotation, normal));
-            return true;
-        }
-
-        if (tMax.x <= tMax.y && tMax.x <= tMax.z) {
-            t = tMax.x;
-            tMax.x += tDelta.x;
-            voxel.x += stepDir.x;
-            normal = vec3(-float(stepDir.x), 0.0, 0.0);
-        } else if (tMax.y <= tMax.z) {
-            t = tMax.y;
-            tMax.y += tDelta.y;
-            voxel.y += stepDir.y;
-            normal = vec3(0.0, -float(stepDir.y), 0.0);
-        } else {
-            t = tMax.z;
-            tMax.z += tDelta.z;
-            voxel.z += stepDir.z;
-            normal = vec3(0.0, 0.0, -float(stepDir.z));
-        }
-    }
-
-    return false;
-}
-
-bool rtrTraceChunks(vec3 ro, vec3 rd, out RTRVoxelHit hit)
-{
-    bool anyHit = false;
-    float bestT = RTR_INF;
-
-    for (uint chunk = 0u; chunk < shChunkCount; chunk++) {
-        if (rtrLoadU32(rtrChunkStateWord(chunk, RTR_CHUNK_ACTIVE_WORD)) == 0u)
-            continue;
-
-        vec3 pos = rtrLoadChunkVec3(chunk, RTR_CHUNK_POSITION_X_WORD);
-        vec4 rotation = rtrLoadChunkQuat(chunk);
-        vec3 localRo = rtrQuatInverseRotate(rotation, ro - pos);
-        vec3 localRd = rtrQuatInverseRotate(rotation, rd);
-        vec3 localMin = rtrLoadChunkVec3(chunk, RTR_CHUNK_LOCAL_MIN_X_WORD);
-        vec3 localMax = rtrLoadChunkVec3(chunk, RTR_CHUNK_LOCAL_MAX_X_WORD);
-        float tEnter;
-        float tExit;
-        if (!rtrBoxHit(localRo, localRd, localMin, localMax, tEnter, tExit))
-            continue;
-        if (tEnter >= bestT)
-            continue;
-
-        vec3 entryNormal = vec3(0.0, 1.0, 0.0);
-        RTRVoxelHit candidate;
-        if (rtrTraceChunkLocal(chunk,
-                               localRo,
-                               localRd,
-                               rotation,
-                               tEnter,
-                               min(tExit, bestT),
-                               entryNormal,
-                               candidate) &&
-            candidate.t < bestT) {
-            bestT = candidate.t;
-            hit = candidate;
-            anyHit = true;
-        }
-    }
-
-    return anyHit;
-}
-
 vec3 rtrFloorAlbedo(vec3 p)
 {
     ivec2 cell = ivec2(floor(p.xz));
@@ -645,39 +458,108 @@ vec3 rtrTonemap(vec3 color)
     return sqrt(clamp(color, vec3(0.0), vec3(1.0)));
 }
 
-vec3 rtrShade(vec3 p, vec3 n, vec3 albedo)
+vec3 rtrRandomUnitVector(inout uint rng)
 {
-    vec3 toLight = RTR_LIGHT_POS - p;
-    float lightDist2 = max(dot(toLight, toLight), 0.001);
-    vec3 l = toLight * inversesqrt(lightDist2);
-    float ndl = max(dot(n, l), 0.0);
-    vec3 direct = albedo * RTR_LIGHT_COLOR * (ndl / lightDist2) * RTR_INV_PI;
-    vec3 ambient = albedo * (rtrSkyDiffuse(n) * 0.85 + vec3(0.03));
+    float z = 1.0 - 2.0 * rtrRandom01(rng);
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    float phi = RTR_TWO_PI * rtrRandom01(rng);
 
-    return direct + ambient;
+    return vec3(cos(phi) * r, z, sin(phi) * r);
+}
+
+vec3 rtrCosineHemisphere(vec3 n, inout uint rng)
+{
+    float u0 = rtrRandom01(rng);
+    float u1 = rtrRandom01(rng);
+    float r = sqrt(u0);
+    float phi = RTR_TWO_PI * u1;
+    vec3 tangent = normalize(abs(n.y) < 0.999 ?
+                             cross(vec3(0.0, 1.0, 0.0), n) :
+                             cross(vec3(1.0, 0.0, 0.0), n));
+    vec3 bitangent = cross(n, tangent);
+
+    return normalize(tangent * (cos(phi) * r) +
+                     bitangent * (sin(phi) * r) +
+                     n * sqrt(max(0.0, 1.0 - u0)));
+}
+
+float rtrVisibility(vec3 ro, vec3 rd, float maxT)
+{
+    RTRVoxelHit blocker;
+    if (!rtrTraceVoxels(ro, rd, blocker))
+        return 1.0;
+
+    return blocker.t < maxT - RTR_EPS * 8.0 ? 0.0 : 1.0;
+}
+
+vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, inout uint rng)
+{
+    vec3 lightPoint = RTR_LIGHT_POS + rtrRandomUnitVector(rng) * RTR_LIGHT_RADIUS;
+    vec3 toLight = lightPoint - p;
+    float lightDist2 = max(dot(toLight, toLight), 0.001);
+    float lightDist = sqrt(lightDist2);
+    vec3 l = toLight / lightDist;
+    float ndl = max(dot(n, l), 0.0);
+    if (ndl <= 0.0)
+        return vec3(0.0);
+
+    float visibility = rtrVisibility(p + n * RTR_EPS * 8.0,
+                                     l,
+                                     lightDist - RTR_LIGHT_RADIUS);
+
+    return albedo * RTR_LIGHT_COLOR * (ndl / lightDist2) * RTR_INV_PI * visibility;
+}
+
+vec3 rtrTracePath(vec3 ro, vec3 rd, inout uint rng)
+{
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (uint bounce = 0u; bounce < RTR_PATH_BOUNCES; bounce++) {
+        RTRVoxelHit hit;
+        if (!rtrTraceVoxels(ro, rd, hit)) {
+            radiance += throughput * rtrSky(rd);
+            break;
+        }
+
+        vec3 hitP = ro + rd * hit.t;
+        vec3 n = dot(hit.normal, rd) < 0.0 ? hit.normal : -hit.normal;
+        vec3 albedo = rtrVoxelAlbedo(hit.voxel, hitP, n);
+
+        radiance += throughput * rtrDirectLight(hitP, n, albedo, rng);
+        throughput *= albedo;
+
+        float survive = clamp(max(max(throughput.r, throughput.g), throughput.b),
+                              0.08,
+                              0.95);
+        if (bounce >= 2u) {
+            if (rtrRandom01(rng) > survive)
+                break;
+            throughput /= survive;
+        }
+
+        ro = hitP + n * RTR_EPS * 8.0;
+        rd = rtrCosineHemisphere(n, rng);
+    }
+
+    return radiance;
 }
 
 vec3 rtrRenderPixel(ivec2 p)
 {
-    vec3 rd = rtrRayForPixel(p);
-    RTRVoxelHit voxelHit;
-    bool hasVoxel = rtrTraceVoxels(shRo, rd, voxelHit);
-    RTRVoxelHit chunkHit;
-    bool hasChunk = rtrTraceChunks(shRo, rd, chunkHit);
+    uint frameIndex = rtrLoadU32(RTR_FRAME_WORD);
+    vec3 color = vec3(0.0);
 
-    if (hasChunk && (!hasVoxel || chunkHit.t < voxelHit.t)) {
-        vec3 hitP = shRo + rd * chunkHit.t;
-        vec3 n = chunkHit.normal;
-        return rtrShade(hitP, n, rtrVoxelAlbedo(chunkHit.voxel, hitP, n));
+    for (uint sampleIndex = 0u;
+         sampleIndex < RTR_SAMPLES_PER_PIXEL;
+         sampleIndex++) {
+        uint rng = rtrSeedPath(uvec2(p), frameIndex, sampleIndex);
+        vec2 jitter = vec2(rtrRandom01(rng), rtrRandom01(rng));
+        vec3 rd = rtrRayForPixel(vec2(p) + jitter);
+        color += rtrTracePath(shRo, rd, rng);
     }
 
-    if (hasVoxel) {
-        vec3 hitP = shRo + rd * voxelHit.t;
-        vec3 n = voxelHit.normal;
-        return rtrShade(hitP, n, rtrVoxelAlbedo(voxelHit.voxel, hitP, n));
-    }
-
-    return rtrSky(rd);
+    return color / float(RTR_SAMPLES_PER_PIXEL);
 }
 
 void main()
