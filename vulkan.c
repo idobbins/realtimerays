@@ -31,6 +31,7 @@
     (RTR_SCENE_BRICK_CAPACITY + \
      RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS + \
      RTR_ENVMAP_WORDS)
+#define RTR_HISTORY_PIXEL_WORDS 2u
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
@@ -48,6 +49,9 @@ enum {
     RTR_MEMORY_CAMERA_YAW_WORD = 17,
     RTR_MEMORY_CAMERA_PITCH_WORD = 18,
     RTR_MEMORY_CAMERA_RADIUS_WORD = 19,
+    RTR_MEMORY_CAMERA_PREV_YAW_WORD = 20,
+    RTR_MEMORY_CAMERA_PREV_PITCH_WORD = 21,
+    RTR_MEMORY_CAMERA_PREV_RADIUS_WORD = 22,
 };
 
 enum {
@@ -331,9 +335,14 @@ static float rtrFrameSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
+    const VkDeviceSize rtrHistoryWords =
+        (VkDeviceSize)rtrSwapExtent.width *
+        (VkDeviceSize)rtrSwapExtent.height *
+        (VkDeviceSize)(RTR_HISTORY_PIXEL_WORDS * 2u);
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
-         (VkDeviceSize)RTR_SCENE_WORDS) *
+         (VkDeviceSize)RTR_SCENE_WORDS +
+         rtrHistoryWords) *
         (VkDeviceSize)sizeof(uint32_t);
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -361,12 +370,15 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 30u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 31u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PREV_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PREV_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PREV_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
     rtrScene(rtrMemoryWords);
 
     return 0;
@@ -381,6 +393,12 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_FRAME_WORD] = rtrFrameIndex;
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PREV_YAW_WORD] =
+        rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD];
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PREV_PITCH_WORD] =
+        rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD];
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PREV_RADIUS_WORD] =
+        rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD];
     if (!rtrCameraAutoReady) {
         rtrCameraAutoBase = cameraYaw -
             (autoOrbit ? time * RTR_CAMERA_AUTO_SPEED : 0.0f);
