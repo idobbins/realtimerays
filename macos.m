@@ -10,6 +10,7 @@
 #define RTR_CAMERA_MAX_PITCH 1.15f
 #define RTR_CAMERA_MIN_RADIUS 1.2f
 #define RTR_CAMERA_MAX_RADIUS 9.0f
+#define RTR_MOUSE_DRAG_THRESHOLD 4.0f
 
 static NSWindow *rtrWindowHandle = nil;
 static void *rtrSurfaceLayer = NULL;
@@ -21,6 +22,12 @@ static float rtrCameraPitch = RTR_CAMERA_DEFAULT_PITCH;
 static float rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
 static uint32_t rtrAutoOrbit = 1u;
 static uint32_t rtrMouseDragging = 0u;
+static uint32_t rtrMouseDragActive = 0u;
+static float rtrMouseDownX = 0.0f;
+static float rtrMouseDownY = 0.0f;
+static uint32_t rtrImpulsePending = 0u;
+static float rtrImpulseX = 0.0f;
+static float rtrImpulseY = 0.0f;
 
 static float rtrClamp(float value, float lo, float hi)
 {
@@ -83,6 +90,12 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
     rtrAutoOrbit = 1u;
     rtrMouseDragging = 0u;
+    rtrMouseDragActive = 0u;
+    rtrMouseDownX = 0.0f;
+    rtrMouseDownY = 0.0f;
+    rtrImpulsePending = 0u;
+    rtrImpulseX = 0.0f;
+    rtrImpulseY = 0.0f;
     return 0;
 }
 
@@ -107,6 +120,16 @@ void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radiu
 void rtrWindowSetCameraYaw(float yaw)
 {
     rtrCameraYaw = yaw;
+}
+
+int rtrWindowConsumeImpulse(float *x, float *y)
+{
+    if (!rtrImpulsePending) return 0;
+
+    if (x) *x = rtrImpulseX;
+    if (y) *y = rtrImpulseY;
+    rtrImpulsePending = 0u;
+    return 1;
 }
 
 int rtrPumpEventsOnce(void)
@@ -141,23 +164,51 @@ int rtrPumpEventsOnce(void)
                 rtrUpdateMouseFromEvent(event);
 
                 if (type == NSEventTypeLeftMouseDown) {
-                    rtrEnterManualOrbit();
                     rtrMouseDragging = 1u;
+                    rtrMouseDragActive = 0u;
+                    rtrMouseDownX = rtrMouseX;
+                    rtrMouseDownY = rtrMouseY;
                 } else if (type == NSEventTypeLeftMouseUp) {
+                    const float dx = rtrMouseX - rtrMouseDownX;
+                    const float dy = rtrMouseY - rtrMouseDownY;
+                    const uint32_t click =
+                        rtrMouseDragging &&
+                        !rtrMouseDragActive &&
+                        dx * dx + dy * dy <=
+                            RTR_MOUSE_DRAG_THRESHOLD * RTR_MOUSE_DRAG_THRESHOLD;
+                    if (click) {
+                        rtrImpulseX = rtrMouseX;
+                        rtrImpulseY = rtrMouseY;
+                        rtrImpulsePending = 1u;
+                    }
                     rtrMouseDragging = 0u;
+                    rtrMouseDragActive = 0u;
+                } else if (type == NSEventTypeRightMouseDown) {
+                    rtrImpulseX = rtrMouseX;
+                    rtrImpulseY = rtrMouseY;
+                    rtrImpulsePending = 1u;
                 } else if (type == NSEventTypeLeftMouseDragged && rtrMouseDragging &&
                            oldMouseX >= 0.0f && oldMouseY >= 0.0f) {
                     const float dx = rtrMouseX - oldMouseX;
                     const float dy = rtrMouseY - oldMouseY;
+                    const float dragX = rtrMouseX - rtrMouseDownX;
+                    const float dragY = rtrMouseY - rtrMouseDownY;
 
-                    rtrCameraYaw += dx * 0.006f;
-                    rtrCameraPitch = rtrClamp(rtrCameraPitch - dy * 0.004f,
-                                              RTR_CAMERA_MIN_PITCH,
-                                              RTR_CAMERA_MAX_PITCH);
+                    if (!rtrMouseDragActive &&
+                        dragX * dragX + dragY * dragY >
+                            RTR_MOUSE_DRAG_THRESHOLD * RTR_MOUSE_DRAG_THRESHOLD) {
+                        rtrEnterManualOrbit();
+                        rtrMouseDragActive = 1u;
+                    }
+
+                    if (rtrMouseDragActive) {
+                        rtrCameraYaw += dx * 0.006f;
+                        rtrCameraPitch = rtrClamp(rtrCameraPitch - dy * 0.004f,
+                                                  RTR_CAMERA_MIN_PITCH,
+                                                  RTR_CAMERA_MAX_PITCH);
+                    }
                 }
             } else if (type == NSEventTypeScrollWheel) {
-                rtrEnterManualOrbit();
-
                 const float dy = (float)[event scrollingDeltaY];
                 rtrCameraRadius = rtrClamp(rtrCameraRadius * expf(-dy * 0.045f),
                                            RTR_CAMERA_MIN_RADIUS,

@@ -1,0 +1,203 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 1) buffer RTRMemory {
+    uint rtrMem[];
+};
+
+const uint RTR_CHUNK_COUNT_WORD = 20u;
+const uint RTR_DT_WORD = 21u;
+
+const uint RTR_BRICK_SIZE = 4u;
+const uint RTR_BRICK_GRID_X = 32u;
+const uint RTR_BRICK_GRID_Y = 12u;
+const uint RTR_BRICK_GRID_Z = 32u;
+const uint RTR_BRICK_CAPACITY = RTR_BRICK_GRID_X * RTR_BRICK_GRID_Y * RTR_BRICK_GRID_Z;
+const uint RTR_BRICK_WORDS = 2u;
+const uint RTR_VOXEL_MAP_WORD = 32u;
+const uint RTR_VOXEL_BRICK_WORD = RTR_VOXEL_MAP_WORD + RTR_BRICK_CAPACITY;
+const uint RTR_ENVMAP_WIDTH = 1024u;
+const uint RTR_ENVMAP_HEIGHT = 512u;
+const uint RTR_ENVMAP_WORD =
+    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
+const uint RTR_ENVMAP_DIFFUSE_WIDTH = 32u;
+const uint RTR_ENVMAP_DIFFUSE_HEIGHT = 16u;
+const uint RTR_ENVMAP_DIFFUSE_WORD =
+    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_CHUNK_MAX = 128u;
+const uint RTR_CHUNK_STATE_WORDS = 32u;
+const uint RTR_CHUNK_STATE_WORD = RTR_ENVMAP_DIFFUSE_WORD +
+    RTR_ENVMAP_DIFFUSE_WIDTH * RTR_ENVMAP_DIFFUSE_HEIGHT * 2u;
+
+const uint RTR_CHUNK_ACTIVE_WORD = 0u;
+const uint RTR_CHUNK_POSITION_X_WORD = 4u;
+const uint RTR_CHUNK_AWAKE_WORD = 7u;
+const uint RTR_CHUNK_ROTATION_X_WORD = 8u;
+const uint RTR_CHUNK_ROTATION_W_WORD = 11u;
+const uint RTR_CHUNK_VELOCITY_X_WORD = 13u;
+const uint RTR_CHUNK_LOCAL_MIN_X_WORD = 16u;
+const uint RTR_CHUNK_LOCAL_MAX_X_WORD = 20u;
+const uint RTR_CHUNK_ANGULAR_VELOCITY_X_WORD = 28u;
+
+const float RTR_FLOOR_Y = -1.0;
+const float RTR_FRAME_TIME_CLAMP_SECONDS = 0.05;
+
+uint rtrLoadU32(uint word)
+{
+    return rtrMem[word];
+}
+
+float rtrLoadF32(uint word)
+{
+    return uintBitsToFloat(rtrLoadU32(word));
+}
+
+void rtrStoreU32(uint word, uint value)
+{
+    rtrMem[word] = value;
+}
+
+void rtrStoreF32(uint word, float value)
+{
+    rtrMem[word] = floatBitsToUint(value);
+}
+
+uint rtrChunkStateWord(uint chunk, uint word)
+{
+    return RTR_CHUNK_STATE_WORD + chunk * RTR_CHUNK_STATE_WORDS + word;
+}
+
+vec3 rtrLoadChunkVec3(uint chunk, uint word)
+{
+    uint base = rtrChunkStateWord(chunk, word);
+    return vec3(rtrLoadF32(base), rtrLoadF32(base + 1u), rtrLoadF32(base + 2u));
+}
+
+void rtrStoreChunkVec3(uint chunk, uint word, vec3 value)
+{
+    uint base = rtrChunkStateWord(chunk, word);
+    rtrStoreF32(base, value.x);
+    rtrStoreF32(base + 1u, value.y);
+    rtrStoreF32(base + 2u, value.z);
+}
+
+vec4 rtrLoadChunkQuat(uint chunk)
+{
+    uint base = rtrChunkStateWord(chunk, RTR_CHUNK_ROTATION_X_WORD);
+    return normalize(vec4(rtrLoadF32(base),
+                          rtrLoadF32(base + 1u),
+                          rtrLoadF32(base + 2u),
+                          rtrLoadF32(base + 3u)));
+}
+
+void rtrStoreChunkQuat(uint chunk, vec4 q)
+{
+    uint base = rtrChunkStateWord(chunk, RTR_CHUNK_ROTATION_X_WORD);
+    q = normalize(q);
+    rtrStoreF32(base, q.x);
+    rtrStoreF32(base + 1u, q.y);
+    rtrStoreF32(base + 2u, q.z);
+    rtrStoreF32(base + 3u, q.w);
+}
+
+vec4 rtrQuatMul(vec4 a, vec4 b)
+{
+    return vec4(a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
+}
+
+vec4 rtrQuatIntegrate(vec4 q, vec3 angularVelocity, float dt)
+{
+    vec4 omega = vec4(angularVelocity, 0.0);
+    vec4 dq = rtrQuatMul(omega, q);
+    return normalize(q + dq * (0.5 * dt));
+}
+
+vec3 rtrQuatRotate(vec4 q, vec3 v)
+{
+    vec3 uv = cross(q.xyz, v);
+    vec3 uuv = cross(q.xyz, uv);
+    return v + (uv * q.w + uuv) * 2.0;
+}
+
+bool rtrChunkFloorCollide(inout vec3 position,
+                          vec4 rotation,
+                          vec3 localMin,
+                          vec3 localMax,
+                          inout vec3 velocity,
+                          inout vec3 angularVelocity)
+{
+    float minY = 1.0e20;
+    for (uint corner = 0u; corner < 8u; corner++) {
+        vec3 local = vec3((corner & 1u) != 0u ? localMax.x : localMin.x,
+                          (corner & 2u) != 0u ? localMax.y : localMin.y,
+                          (corner & 4u) != 0u ? localMax.z : localMin.z);
+        float y = (position + rtrQuatRotate(rotation, local)).y;
+        minY = min(minY, y);
+    }
+
+    if (minY >= RTR_FLOOR_Y + 0.005)
+        return minY <= RTR_FLOOR_Y + 0.015;
+
+    position.y += RTR_FLOOR_Y - minY;
+    if (velocity.y < 0.0)
+        velocity.y *= -0.18;
+    velocity.xz *= 0.82;
+    angularVelocity *= 0.78;
+    return true;
+}
+
+void main()
+{
+    uint chunk = gl_GlobalInvocationID.x;
+    uint chunkCount = min(rtrLoadU32(RTR_CHUNK_COUNT_WORD), RTR_CHUNK_MAX);
+    if (chunk >= chunkCount)
+        return;
+
+    uint base = rtrChunkStateWord(chunk, 0u);
+    if (rtrLoadU32(base + RTR_CHUNK_ACTIVE_WORD) == 0u ||
+        rtrLoadU32(base + RTR_CHUNK_AWAKE_WORD) == 0u) {
+        return;
+    }
+
+    float dt = clamp(rtrLoadF32(RTR_DT_WORD), 0.0, RTR_FRAME_TIME_CLAMP_SECONDS);
+    if (dt <= 0.0)
+        return;
+
+    vec3 position = rtrLoadChunkVec3(chunk, RTR_CHUNK_POSITION_X_WORD);
+    vec3 velocity = rtrLoadChunkVec3(chunk, RTR_CHUNK_VELOCITY_X_WORD);
+    vec3 angularVelocity =
+        rtrLoadChunkVec3(chunk, RTR_CHUNK_ANGULAR_VELOCITY_X_WORD);
+    vec3 localMin = rtrLoadChunkVec3(chunk, RTR_CHUNK_LOCAL_MIN_X_WORD);
+    vec3 localMax = rtrLoadChunkVec3(chunk, RTR_CHUNK_LOCAL_MAX_X_WORD);
+    vec4 rotation = rtrLoadChunkQuat(chunk);
+
+    velocity.y -= 5.8 * dt;
+    position += velocity * dt;
+    rotation = rtrQuatIntegrate(rotation, angularVelocity, dt);
+    bool grounded = rtrChunkFloorCollide(position,
+                                         rotation,
+                                         localMin,
+                                         localMax,
+                                         velocity,
+                                         angularVelocity);
+
+    velocity *= 0.992;
+    angularVelocity *= 0.988;
+
+    if (grounded &&
+        dot(velocity, velocity) <= 0.0004 &&
+        dot(angularVelocity, angularVelocity) <= 0.0004) {
+        velocity = vec3(0.0);
+        angularVelocity = vec3(0.0);
+        rtrStoreU32(base + RTR_CHUNK_AWAKE_WORD, 0u);
+    }
+
+    rtrStoreChunkVec3(chunk, RTR_CHUNK_POSITION_X_WORD, position);
+    rtrStoreChunkVec3(chunk, RTR_CHUNK_VELOCITY_X_WORD, velocity);
+    rtrStoreChunkVec3(chunk, RTR_CHUNK_ANGULAR_VELOCITY_X_WORD, angularVelocity);
+    rtrStoreChunkQuat(chunk, rotation);
+}
