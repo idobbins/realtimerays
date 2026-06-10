@@ -104,10 +104,11 @@ enum {
     RTR_PIPELINE_COUNT,
 };
 
-/* Wavefront queue sizing; strides must match shaders/render.comp. */
+/* Wavefront queue sizing; strides and capacity arithmetic must match
+ * shaders/render.comp. */
 #define RTR_WF_HEADER_WORDS 16u
-#define RTR_WF_PIXEL_WORDS 31u
 #define RTR_WF_QUEUE_GROUP_SIZE 128u
+#define RTR_WF_BUDGET_MAX 4u
 /* Must match the RTR_BOUNCES default in shaders/render.comp. */
 #define RTR_HOST_BOUNCES 3u
 
@@ -205,6 +206,27 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
     char *end = NULL;
     const unsigned long parsed = strtoul(value, &end, 10);
     return end != value ? (uint32_t)parsed : fallback;
+}
+
+/* Decoupled first-hit sample budgets (wavefront only): RTR_LIGHT_SPP
+ * shadow rays and RTR_GI_SPP bounce chains per primary hit. */
+static uint32_t rtrWfBudget(const char *name)
+{
+    uint32_t value = rtrEnvU32(name, 1u);
+
+    if (value < 1u) value = 1u;
+    if (value > RTR_WF_BUDGET_MAX) value = RTR_WF_BUDGET_MAX;
+    return value;
+}
+
+static uint32_t rtrWfPixelWords(void)
+{
+    const uint32_t lightSpp = rtrWfBudget("RTR_LIGHT_SPP");
+    const uint32_t giSpp = rtrWfBudget("RTR_GI_SPP");
+    const uint32_t shadowCap = lightSpp > giSpp ? lightSpp : giSpp;
+
+    /* accum + ping-pong ray queues + hits + parity shadow queues */
+    return 3u + 14u * giSpp + 14u * shadowCap;
 }
 
 static uint32_t rtrFindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags)
@@ -367,7 +389,7 @@ static int rtrCreateMemoryBuffer(void)
         (VkDeviceSize)RTR_WF_HEADER_WORDS +
         (VkDeviceSize)rtrSwapExtent.width *
         (VkDeviceSize)rtrSwapExtent.height *
-        (VkDeviceSize)RTR_WF_PIXEL_WORDS;
+        (VkDeviceSize)rtrWfPixelWords();
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
          (VkDeviceSize)RTR_SCENE_WORDS +
@@ -407,6 +429,10 @@ static int rtrCreateMemoryBuffer(void)
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
     rtrScene(rtrMemoryWords);
+    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 8u] =
+        rtrWfBudget("RTR_LIGHT_SPP");
+    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 9u] =
+        rtrWfBudget("RTR_GI_SPP");
 
     return 0;
 }
@@ -488,8 +514,15 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
     const uint32_t pixelGroupsY =
         (rtrSwapExtent.height + RTR_TILE_Y - 1u) / RTR_TILE_Y;
     const uint32_t pixels = rtrSwapExtent.width * rtrSwapExtent.height;
+    const uint32_t lightSpp = rtrWfBudget("RTR_LIGHT_SPP");
+    const uint32_t giSpp = rtrWfBudget("RTR_GI_SPP");
+    const uint32_t shadowCap = lightSpp > giSpp ? lightSpp : giSpp;
     const uint32_t queueGroups =
-        (pixels + RTR_WF_QUEUE_GROUP_SIZE - 1u) / RTR_WF_QUEUE_GROUP_SIZE;
+        (pixels * giSpp + RTR_WF_QUEUE_GROUP_SIZE - 1u) /
+        RTR_WF_QUEUE_GROUP_SIZE;
+    const uint32_t shadowGroups =
+        (pixels * shadowCap + RTR_WF_QUEUE_GROUP_SIZE - 1u) /
+        RTR_WF_QUEUE_GROUP_SIZE;
     uint32_t spp = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
 
     if (spp < 1u) spp = 1u;
@@ -537,7 +570,7 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                                queueGroups, 1u);
             rtrCmdComputeBarrier(commandBuffer);
             rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_SHADOW,
-                               queueGroups, 1u);
+                               shadowGroups, 1u);
             if (depth + 1u < RTR_HOST_BOUNCES) {
                 push.depth = depth + 1u;
                 push.parity = (depth + 1u) & 1u;

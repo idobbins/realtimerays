@@ -114,6 +114,11 @@ const uint RTR_ENVMAP_WIDTH = 1024u;
 const uint RTR_ENVMAP_HEIGHT = 512u;
 const uint RTR_ENVMAP_WORD =
     RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
+const uint RTR_WF_WORD =
+    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_WF_LIGHT_SPP_WORD = RTR_WF_WORD + 8u;
+const uint RTR_WF_GI_SPP_WORD = RTR_WF_WORD + 9u;
+const uint RTR_BUDGET_MAX = 4u;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
@@ -133,6 +138,8 @@ const float RTR_INDIRECT_LUMINANCE_CAP = 3.0;
 #endif
 
 shared uint shSpp;
+shared uint shLightSpp;
+shared uint shGiSpp;
 shared ivec2 shSize;
 shared uint shPixels;
 /* Per-frame sampling shift: every frame is an independent estimate (no
@@ -332,6 +339,8 @@ void rtrInitShared(void)
                    int(rtrLoadU32(RTR_HEIGHT_WORD)));
     shPixels = uint(shSize.x * shSize.y);
     shSpp = clamp(rtrLoadU32(RTR_SPP_WORD), 1u, 256u);
+    shLightSpp = clamp(rtrLoadU32(RTR_WF_LIGHT_SPP_WORD), 1u, RTR_BUDGET_MAX);
+    shGiSpp = clamp(rtrLoadU32(RTR_WF_GI_SPP_WORD), 1u, RTR_BUDGET_MAX);
     shFrameRot = rtrHashToUnit2(frameHash);
     shFrameSalt = rtrHashU32(frameHash);
 
@@ -646,14 +655,20 @@ vec2 rtrSampleHam(uint sampleIndex)
  *   rays   2 x 9 words     ping-pong bounce-ray queues
  *   hits   2 words         hit records parallel to the consumed queue
  *   shadow 10 words        shadow-ray queue */
-const uint RTR_WF_WORD =
-    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
 const uint RTR_WF_RAY_COUNT_WORD = RTR_WF_WORD; /* + parity */
 const uint RTR_WF_SHADOW_COUNT_WORD = RTR_WF_WORD + 2u; /* + parity */
 const uint RTR_WF_DATA_WORD = RTR_WF_WORD + 16u;
 const uint RTR_WF_RAY_STRIDE = 6u;
 const uint RTR_WF_HIT_STRIDE = 2u;
 const uint RTR_WF_SHADOW_STRIDE = 7u;
+
+/* Low-discrepancy shift for the extra budget samples; index zero reduces
+ * to the base point so 1/1 budgets reproduce the undecoupled estimator
+ * exactly. */
+vec2 rtrBudgetShift(uint i)
+{
+    return vec2(float(i) * 0.7548777, float(i) * 0.5698403);
+}
 
 /* Octahedral direction encoding: queue records carry unit directions in
  * one word. The ~2e-5 quantization acts as a vanishing extra jitter on
@@ -707,34 +722,53 @@ uint rtrWfAccumWord(uint pixel)
     return RTR_WF_DATA_WORD + pixel * 3u;
 }
 
+/* Queue capacities scale with the GI/light budgets; the host sizes the
+ * buffer and dispatches with the same arithmetic. */
 uint rtrWfRayWord(uint parity, uint index)
 {
+    uint cap = shPixels * shGiSpp;
+
     return RTR_WF_DATA_WORD + shPixels * 3u +
-        (parity * shPixels + index) * RTR_WF_RAY_STRIDE;
+        (parity * cap + index) * RTR_WF_RAY_STRIDE;
 }
 
 uint rtrWfHitWord(uint index)
 {
-    return RTR_WF_DATA_WORD + shPixels * 15u + index * RTR_WF_HIT_STRIDE;
+    return RTR_WF_DATA_WORD + shPixels * 3u + shPixels * shGiSpp * 12u +
+        index * RTR_WF_HIT_STRIDE;
 }
 
 /* The shadow queue is parity-buffered so shadow(d) can run concurrently
  * with trace(d+1), which resets the other parity's counters. */
 uint rtrWfShadowWord(uint parity, uint index)
 {
-    return RTR_WF_DATA_WORD + shPixels * 17u +
-        (parity * shPixels + index) * RTR_WF_SHADOW_STRIDE;
+    uint cap = shPixels * max(shLightSpp, shGiSpp);
+
+    return RTR_WF_DATA_WORD + shPixels * 3u + shPixels * shGiSpp * 14u +
+        (parity * cap + index) * RTR_WF_SHADOW_STRIDE;
 }
 
-/* Each pixel appears at most once per queue, so accumulation needs no
- * atomics. */
+/* With sample budgets above one, several rays of the same pixel can land
+ * in one dispatch, so accumulation must be atomic; 16.16 fixed point on
+ * u32 atomicAdd covers the radiance range (sums stay far below 65k) at
+ * 1.5e-5 precision without relying on float-atomic extensions. At 1/1
+ * budgets each pixel appears at most once per queue and the plain
+ * read-modify-write (a uniform branch) skips the atomic tax. */
 void rtrWfAccumAdd(uint pixel, f16vec3 c)
 {
     uint w = rtrWfAccumWord(pixel);
+    uvec3 fx = uvec3(round(max(vec3(c), vec3(0.0)) * 65536.0));
 
-    rtrStoreF32(w, rtrLoadF32(w) + float(c.r));
-    rtrStoreF32(w + 1u, rtrLoadF32(w + 1u) + float(c.g));
-    rtrStoreF32(w + 2u, rtrLoadF32(w + 2u) + float(c.b));
+    if (shLightSpp == 1u && shGiSpp == 1u) {
+        rtrStoreU32(w, rtrLoadU32(w) + fx.r);
+        rtrStoreU32(w + 1u, rtrLoadU32(w + 1u) + fx.g);
+        rtrStoreU32(w + 2u, rtrLoadU32(w + 2u) + fx.b);
+        return;
+    }
+
+    if (fx.r != 0u) atomicAdd(rtrMem[w], fx.r);
+    if (fx.g != 0u) atomicAdd(rtrMem[w + 1u], fx.g);
+    if (fx.b != 0u) atomicAdd(rtrMem[w + 2u], fx.b);
 }
 
 void rtrWfStoreRay(uint word, vec3 ro, vec3 rd, f16vec3 throughput, uint pixel)
@@ -932,9 +966,9 @@ void main()
         if (pc.sampleIndex == 0u) {
             uint w = rtrWfAccumWord(pixel);
 
-            rtrStoreF32(w, 0.0);
-            rtrStoreF32(w + 1u, 0.0);
-            rtrStoreF32(w + 2u, 0.0);
+            rtrStoreU32(w, 0u);
+            rtrStoreU32(w + 1u, 0u);
+            rtrStoreU32(w + 2u, 0u);
         }
     }
 
@@ -1014,24 +1048,23 @@ void main()
 
     const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
     bool valid = index < count;
-    bool emitShadow = false;
-    bool emitBounce = false;
     uint pixel = 0u;
-    vec3 shadowRo = vec3(0.0);
-    vec3 shadowRd = vec3(0.0);
-    float shadowMaxT = 0.0;
-    f16vec3 pendingDirect = f16vec3(0.0);
-    vec3 nextRo = vec3(0.0);
-    vec3 nextRd = vec3(0.0);
-    f16vec3 throughput = f16vec3(0.0);
+    vec3 emitRo = vec3(0.0);
+    uint shadowEmits = 0u;
+    uint bounceEmits = 0u;
+    uint shadowDir[RTR_BUDGET_MAX];
+    float shadowFar[RTR_BUDGET_MAX];
+    uint shadowPend[RTR_BUDGET_MAX];
+    uint bounceDir[RTR_BUDGET_MAX];
+    uint chainThroughput = 0u;
 
     if (valid) {
         uint w = rtrWfRayWord(pc.parity, index);
         vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
         vec3 rd = rtrUnpackDirection(rtrLoadU32(w + 3u));
         uint hitWord = rtrLoadU32(rtrWfHitWord(index));
+        f16vec3 throughput = f16vec3(rtrUnpackRgb9e5(rtrLoadU32(w + 4u)));
 
-        throughput = f16vec3(rtrUnpackRgb9e5(rtrLoadU32(w + 4u)));
         pixel = rtrLoadU32(w + 5u);
 
         if ((hitWord & 0x80000000u) == 0u) {
@@ -1055,48 +1088,74 @@ void main()
             uint hashHemi = rtrHashU32(hashLight);
             uint sampleSalt = rtrWfSampleSalt();
             vec2 ham = rtrSampleHam(pc.sampleIndex);
-            vec2 uL = pc.depth == 0u ?
+
+            /* Direct light: at the first hit the budget splits the light
+             * estimator into several cheap shadow rays, each weighted
+             * 1/K; deeper hits keep one sample. */
+            uint lightSamples = pc.depth == 0u ? shLightSpp : 1u;
+            f16vec3 directBase = throughput * albedo *
+                f16vec3(float16_t(1.0 / float(lightSamples)));
+            vec2 uLBase = pc.depth == 0u ?
                 fract(ham + rtrHashToUnit2(hashLight) + shFrameRot) :
                 rtrHashToUnit2(rtrHashU32(hashLight ^ sampleSalt));
-            vec3 l;
-            float lightT;
-            float lightScale;
-            bool lit = rtrSampleLight(hitP, n, uL, l, lightT, lightScale);
 
-            pendingDirect = throughput * albedo *
-                f16vec3(RTR_LIGHT_COLOR * lightScale);
-            if (pc.depth > 0u)
-                pendingDirect =
-                    rtrClampLuminance(pendingDirect,
-                                      float16_t(RTR_INDIRECT_LUMINANCE_CAP));
-            throughput *= albedo;
+            for (uint i = 0u; i < lightSamples; i++) {
+                vec2 uL = i == 0u ?
+                    uLBase : fract(uLBase + rtrBudgetShift(i));
+                vec3 l;
+                float lightT;
+                float lightScale;
 
-            if (pc.depth + 1u < RTR_PATH_BOUNCES) {
-                vec2 uH = pc.depth == 0u ?
+                if (!rtrSampleLight(hitP, n, uL, l, lightT, lightScale))
+                    continue;
+
+                f16vec3 pending = directBase *
+                    f16vec3(RTR_LIGHT_COLOR * lightScale);
+
+                if (pc.depth > 0u)
+                    pending = rtrClampLuminance(
+                        pending, float16_t(RTR_INDIRECT_LUMINANCE_CAP));
+                shadowDir[shadowEmits] = rtrPackDirection(l);
+                shadowFar[shadowEmits] = lightT - RTR_EPS * 8.0;
+                shadowPend[shadowEmits] = rtrPackRgb9e5(vec3(pending));
+                shadowEmits++;
+            }
+
+            /* Indirect: the first hit branches into M chains carrying
+             * throughput/M each (unbiased splitting); deeper hits
+             * continue a single chain. */
+            uint giChains = pc.depth + 1u < RTR_PATH_BOUNCES ?
+                (pc.depth == 0u ? shGiSpp : 1u) : 0u;
+
+            if (giChains > 0u) {
+                vec2 uHBase = pc.depth == 0u ?
                     fract(ham + rtrHashToUnit2(hashHemi) * hemiJitter +
                           shFrameRot) :
                     rtrHashToUnit2(rtrHashU32(hashHemi ^ sampleSalt));
 
-                nextRo = hitP + n * RTR_EPS * 8.0;
-                nextRd = rtrCosineHemisphere(n, uH);
-                emitBounce = true;
+                chainThroughput =
+                    rtrPackRgb9e5(vec3(throughput * albedo) /
+                                  float(giChains));
+                for (uint j = 0u; j < giChains; j++) {
+                    vec2 uH = j == 0u ?
+                        uHBase : fract(uHBase + rtrBudgetShift(j));
+
+                    bounceDir[bounceEmits] =
+                        rtrPackDirection(rtrCosineHemisphere(n, uH));
+                    bounceEmits++;
+                }
             }
-            if (lit) {
-                shadowRo = hitP + n * RTR_EPS * 8.0;
-                shadowRd = l;
-                shadowMaxT = lightT - RTR_EPS * 8.0;
-                emitShadow = true;
-            }
+            emitRo = hitP + n * RTR_EPS * 8.0;
         }
     }
 
-    uint shadowSlot = 0u;
-    uint bounceSlot = 0u;
+    uint shadowLocal = 0u;
+    uint bounceLocal = 0u;
 
-    if (emitShadow)
-        shadowSlot = atomicAdd(shWfShadowCount, 1u);
-    if (emitBounce)
-        bounceSlot = atomicAdd(shWfOutCount, 1u);
+    if (shadowEmits > 0u)
+        shadowLocal = atomicAdd(shWfShadowCount, shadowEmits);
+    if (bounceEmits > 0u)
+        bounceLocal = atomicAdd(shWfOutCount, bounceEmits);
 
     barrier();
 
@@ -1111,20 +1170,28 @@ void main()
 
     barrier();
 
-    if (emitShadow) {
-        uint w = rtrWfShadowWord(pc.parity, shWfShadowBase + shadowSlot);
+    for (uint i = 0u; i < shadowEmits; i++) {
+        uint w = rtrWfShadowWord(pc.parity,
+                                 shWfShadowBase + shadowLocal + i);
 
-        rtrStoreF32(w, shadowRo.x);
-        rtrStoreF32(w + 1u, shadowRo.y);
-        rtrStoreF32(w + 2u, shadowRo.z);
-        rtrStoreU32(w + 3u, rtrPackDirection(shadowRd));
-        rtrStoreF32(w + 4u, shadowMaxT);
-        rtrStoreU32(w + 5u, rtrPackRgb9e5(vec3(pendingDirect)));
+        rtrStoreF32(w, emitRo.x);
+        rtrStoreF32(w + 1u, emitRo.y);
+        rtrStoreF32(w + 2u, emitRo.z);
+        rtrStoreU32(w + 3u, shadowDir[i]);
+        rtrStoreF32(w + 4u, shadowFar[i]);
+        rtrStoreU32(w + 5u, shadowPend[i]);
         rtrStoreU32(w + 6u, pixel);
     }
-    if (emitBounce) {
-        rtrWfStoreRay(rtrWfRayWord(pc.parity ^ 1u, shWfOutBase + bounceSlot),
-                      nextRo, nextRd, throughput, pixel);
+    for (uint j = 0u; j < bounceEmits; j++) {
+        uint w = rtrWfRayWord(pc.parity ^ 1u,
+                              shWfOutBase + bounceLocal + j);
+
+        rtrStoreF32(w, emitRo.x);
+        rtrStoreF32(w + 1u, emitRo.y);
+        rtrStoreF32(w + 2u, emitRo.z);
+        rtrStoreU32(w + 3u, bounceDir[j]);
+        rtrStoreU32(w + 4u, chainThroughput);
+        rtrStoreU32(w + 5u, pixel);
     }
 }
 
@@ -1175,8 +1242,10 @@ void main()
         return;
 
     uint w = rtrWfAccumWord(uint(p.y) * uint(shSize.x) + uint(p.x));
-    vec3 color = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u)) *
-        (1.0 / float(shSpp));
+    vec3 color = vec3(float(rtrLoadU32(w)),
+                      float(rtrLoadU32(w + 1u)),
+                      float(rtrLoadU32(w + 2u))) *
+        (1.0 / (65536.0 * float(shSpp)));
 
     imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
 }
