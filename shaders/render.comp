@@ -1,29 +1,70 @@
 #version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 #ifndef RTR_BOUNCES
 #define RTR_BOUNCES 3
 #endif
 
 #ifndef RTR_HEMI_JITTER_R
-#define RTR_HEMI_JITTER_R 0.25
+#define RTR_HEMI_JITTER_R 1.0
 #endif
 
 #ifndef RTR_HEMI_JITTER_PHI
-#define RTR_HEMI_JITTER_PHI 0.25
+#define RTR_HEMI_JITTER_PHI 1.0
 #endif
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#ifndef RTR_WG_X
+#define RTR_WG_X 16
+#endif
+
+#ifndef RTR_WG_Y
+#define RTR_WG_Y 8
+#endif
+
+/* Profiling build: counts traversal work into header words so the host can
+ * report where GPU time goes. Counter atomics skew timing, so stats builds
+ * are for counts only, never for benchmarks. */
+#ifndef RTR_STATS
+#define RTR_STATS 0
+#endif
+
+layout(local_size_x = RTR_WG_X, local_size_y = RTR_WG_Y, local_size_z = 1) in;
 
 layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
 
+#if RTR_STATS
+layout(std430, binding = 1) restrict buffer RTRMemory {
+    uint rtrMem[];
+};
+#else
 layout(std430, binding = 1) restrict readonly buffer RTRMemory {
     uint rtrMem[];
 };
+#endif
+
+const uint RTR_STAT_CLASS_PRIMARY = 0u;
+const uint RTR_STAT_CLASS_SHADOW = 1u;
+const uint RTR_STAT_CLASS_BOUNCE = 2u;
+
+#if RTR_STATS
+const uint RTR_STAT_COUNTERS = 12u;
+/* gStats index: 0-2 brick iters by class, 3-5 traversals by class,
+ * 6 voxel iters, 7 jumps, 8 brick entries, 9 AABB rejects, 10 hits,
+ * 11 envmap samples. */
+const uint RTR_STAT_WORDS[RTR_STAT_COUNTERS] =
+    uint[](5u, 6u, 7u, 12u, 13u, 14u, 15u, 16u, 20u, 21u, 22u, 23u);
+uint gStats[RTR_STAT_COUNTERS];
+shared uint shStats[RTR_STAT_COUNTERS];
+#define RTR_STAT_ADD(slot) gStats[slot]++
+#else
+#define RTR_STAT_ADD(slot)
+#endif
 
 const uint RTR_SPP_WORD = 4u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
+const uint RTR_FRAME_WORD = 30u;
 
 const uint RTR_BRICK_SIZE = 4u;
 const uint RTR_BRICK_GRID_X = 32u;
@@ -36,14 +77,13 @@ const uint RTR_BRICK_CAPACITY = RTR_BRICK_GRID_X * RTR_BRICK_GRID_Y * RTR_BRICK_
 const uint RTR_BRICK_WORDS = 2u;
 const uint RTR_SCENE_MIN_WORD = 24u;
 const uint RTR_SCENE_MAX_WORD = 27u;
-const uint RTR_DISTANCE_WORDS = RTR_BRICK_CAPACITY / 8u;
-const uint RTR_DISTANCE_WORD = 32u;
-const uint RTR_VOXEL_BRICK_WORD = RTR_DISTANCE_WORD + RTR_DISTANCE_WORDS;
-const uint RTR_BRICK_BOUNDS_WORD =
-    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
+const uint RTR_BRICK_META_WORD = 32u;
+const uint RTR_VOXEL_BRICK_WORD =
+    RTR_BRICK_META_WORD + RTR_BRICK_CAPACITY / 2u;
 const uint RTR_ENVMAP_WIDTH = 1024u;
 const uint RTR_ENVMAP_HEIGHT = 512u;
-const uint RTR_ENVMAP_WORD = RTR_BRICK_BOUNDS_WORD + RTR_BRICK_CAPACITY;
+const uint RTR_ENVMAP_WORD =
+    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
 
 const float RTR_INF = 1.0e20;
 const float RTR_EPS = 0.0001;
@@ -58,14 +98,17 @@ const float RTR_LIGHT_RADIUS = 0.7;
 const float RTR_TWO_PI = 6.28318530718;
 const uint RTR_PATH_BOUNCES = uint(RTR_BOUNCES);
 const float RTR_INDIRECT_LUMINANCE_CAP = 3.0;
-/* Indirect rays stop after this distance and shade as sky: grazing rays
- * otherwise dominate traversal cost while carrying the least
- * cosine-weighted energy. */
 #ifndef RTR_INDIRECT_MAX_T
-#define RTR_INDIRECT_MAX_T 3.0
+#define RTR_INDIRECT_MAX_T 1.0e20
 #endif
 
 shared uint shSpp;
+/* Per-frame sampling shift: every frame is an independent estimate (no
+ * data is reused across frames), so estimator error boils like film grain
+ * instead of freezing into a pattern on the screen or the surfaces. The
+ * shift is uniform across all lanes, so it costs no SIMD coherence. */
+shared vec2 shFrameRot;
+shared uint shFrameSalt;
 shared vec3 shRo;
 shared vec3 shForward;
 shared vec3 shRight;
@@ -119,9 +162,13 @@ vec2 rtrHashToUnit2(uint h)
     return vec2(float(h & 0xffffu), float(h >> 16u)) * (1.0 / 65536.0);
 }
 
-vec3 rtrClampLuminance(vec3 color, float cap)
+/* Shading state runs in half precision: colors and throughput tolerate it
+ * easily, and on Apple GPUs halving those live ranges is register-file
+ * relief that buys simdgroup occupancy. Geometry stays fp32. */
+f16vec3 rtrClampLuminance(f16vec3 color, float16_t cap)
 {
-    float luminance = dot(max(color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    float16_t luminance = dot(max(color, f16vec3(0.0)),
+                              f16vec3(0.2126, 0.7152, 0.0722));
     if (luminance > cap)
         color *= cap / luminance;
 
@@ -134,12 +181,13 @@ uint rtrBrickMapIndex(ivec3 brick)
                 int(RTR_BRICK_GRID_X) + brick.x);
 }
 
-/* Chebyshev distance (in bricks) to the nearest occupied brick; zero means
- * this brick has voxels. */
-uint rtrBrickDistance(uint brickIndex)
+/* 16-bit meta record per brick: bits 0-3 Chebyshev distance (in bricks)
+ * to the nearest occupied brick (zero means this brick has voxels), bits
+ * 4-15 the occupied-voxel AABB as six 2-bit fields. */
+uint rtrBrickMeta(uint brickIndex)
 {
-    return (rtrLoadU32(RTR_DISTANCE_WORD + (brickIndex >> 3u)) >>
-            ((brickIndex & 7u) * 4u)) & 0xfu;
+    return (rtrLoadU32(RTR_BRICK_META_WORD + (brickIndex >> 1u)) >>
+            ((brickIndex & 1u) * 16u)) & 0xffffu;
 }
 
 uvec2 rtrBrickMask(uint brickIndex)
@@ -156,7 +204,7 @@ bool rtrMaskBit(uvec2 mask, ivec3 local)
     return (mask.y & (1u << (bit - 32u))) != 0u;
 }
 
-vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
+f16vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
 {
     const float invTwoPi = 0.15915494309;
     const float invPi = 0.31830988618;
@@ -188,17 +236,19 @@ vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight,
     vec2 ba01 = unpackHalf2x16(rtrLoadU32(word01 + 1u));
     vec2 rg11 = unpackHalf2x16(rtrLoadU32(word11));
     vec2 ba11 = unpackHalf2x16(rtrLoadU32(word11 + 1u));
-    vec3 c00 = vec3(rg00, ba00.x);
-    vec3 c10 = vec3(rg10, ba10.x);
-    vec3 c01 = vec3(rg01, ba01.x);
-    vec3 c11 = vec3(rg11, ba11.x);
-    vec3 color = mix(mix(c00, c10, tx), mix(c01, c11, tx), ty);
+    f16vec3 c00 = f16vec3(vec3(rg00, ba00.x));
+    f16vec3 c10 = f16vec3(vec3(rg10, ba10.x));
+    f16vec3 c01 = f16vec3(vec3(rg01, ba01.x));
+    f16vec3 c11 = f16vec3(vec3(rg11, ba11.x));
+    float16_t fx = float16_t(tx);
+    f16vec3 color = mix(mix(c00, c10, fx), mix(c01, c11, fx), float16_t(ty));
 
-    return rtrClampLuminance(color, cap);
+    return rtrClampLuminance(color, float16_t(cap));
 }
 
-vec3 rtrSky(vec3 rd)
+f16vec3 rtrSky(vec3 rd)
 {
+    RTR_STAT_ADD(11u);
     return rtrEnvironmentSample(rd,
                                 RTR_ENVMAP_WORD,
                                 RTR_ENVMAP_WIDTH,
@@ -233,8 +283,12 @@ void rtrInitShared(vec2 szf)
     float cameraPitch = rtrLoadF32(RTR_CAMERA_PITCH_WORD);
     float cameraRadius = rtrLoadF32(RTR_CAMERA_RADIUS_WORD);
     float invH = 1.0 / max(szf.y, 1.0);
+    uint frameHash = rtrHashU32(rtrLoadU32(RTR_FRAME_WORD) * 0x9e3779b9u +
+                                0x85ebca6bu);
 
     shSpp = clamp(rtrLoadU32(RTR_SPP_WORD), 1u, 256u);
+    shFrameRot = rtrHashToUnit2(frameHash);
+    shFrameSalt = rtrHashU32(frameHash);
 
     rtrCamera(cameraYaw, cameraPitch, cameraRadius,
               shRo, shForward, shRight, shUp);
@@ -286,25 +340,21 @@ bool rtrBoxHit(vec3 ro, vec3 invRd, vec3 bmin, vec3 bmax, out float t0, out floa
     return t0 <= t1;
 }
 
-/* DDA steps are select-based rather than branch-based: divergent rays in a
- * SIMD group would otherwise serialize the three axis branches every step.
- * The stepped axis is carried as a 0/1 mask and the normal is derived from
- * it only at a hit. The ray is first clipped to the brick's occupied-voxel
- * AABB, so rays that merely graze a brick (e.g. skimming above the floor
- * layer) never start the voxel walk at all. */
+/* The ray is clipped to the brick's occupied-voxel AABB before any voxel
+ * walk, so rays that merely graze a brick (e.g. skimming above the floor
+ * layer) bail out on the slab test. The voxel DDA itself is select-based
+ * rather than branch-based, and the entry face comes from the slab axes,
+ * so the hit normal needs no per-step bookkeeping upstream. */
 bool rtrTraceBrick(vec3 ro,
                    vec3 rd,
                    vec3 invRd,
-                   ivec3 stepDir,
-                   vec3 tDelta,
                    ivec3 brick,
                    uint brickIndex,
+                   uint bounds,
                    float startT,
                    float endT,
-                   vec3 entrySel,
                    out RTRVoxelHit hit)
 {
-    uint bounds = rtrLoadU32(RTR_BRICK_BOUNDS_WORD + brickIndex);
     vec3 boundsMin = vec3(uvec3(bounds, bounds >> 2u, bounds >> 4u) & 3u);
     vec3 boundsMax = vec3((uvec3(bounds >> 6u, bounds >> 8u, bounds >> 10u)
                            & 3u)) + 1.0;
@@ -316,10 +366,16 @@ bool rtrTraceBrick(vec3 ro,
     float t0 = max(max(tLo.x, tLo.y), max(tLo.z, startT));
     float t1 = min(min(tHi.x, tHi.y), min(tHi.z, endT));
 
-    if (t0 > t1)
+    if (t0 > t1) {
+        RTR_STAT_ADD(9u);
         return false;
+    }
 
+    RTR_STAT_ADD(8u);
     uvec2 mask = rtrBrickMask(brickIndex);
+    ivec3 stepDir = ivec3(mix(ivec3(-1), ivec3(1),
+                              greaterThanEqual(invRd, vec3(0.0))));
+    vec3 tDelta = shVoxelSize * abs(invRd);
     vec3 localP = clamp(ro + rd * (t0 + RTR_EPS),
                         brickMin,
                         brickMin + shBrickSize - shVoxelSize * 0.001);
@@ -327,19 +383,16 @@ bool rtrTraceBrick(vec3 ro,
                         ivec3(0), ivec3(3));
     vec3 nextCell = vec3(voxel) + max(vec3(stepDir), vec3(0.0));
     vec3 tMax = (brickMin + nextCell * shVoxelSize - ro) * invRd;
-    vec3 sel = entrySel;
+    bool ax = tLo.x >= tLo.y && tLo.x >= tLo.z;
+    bool ay = !ax && tLo.y >= tLo.z;
+    vec3 sel = vec3(ax, ay, !(ax || ay));
     float t = t0;
-
-    if (t0 > startT) {
-        bool ax = tLo.x >= tLo.y && tLo.x >= tLo.z;
-        bool ay = !ax && tLo.y >= tLo.z;
-        sel = vec3(ax, ay, !(ax || ay));
-    }
 
     for (uint i = 0u; i < 16u; i++) {
         if (any(greaterThanEqual(uvec3(voxel), uvec3(4u))) || t > t1)
             break;
 
+        RTR_STAT_ADD(6u);
         if (rtrMaskBit(mask, voxel)) {
             hit.hit = true;
             hit.t = t;
@@ -359,8 +412,17 @@ bool rtrTraceBrick(vec3 ro,
     return false;
 }
 
-bool rtrTraceVoxels(vec3 ro, vec3 rd, float maxT, out RTRVoxelHit hit)
+/* Every iteration has one uniform shape: locate the brick at t, enter it
+ * if it holds voxels, then advance to the exit of the largest
+ * guaranteed-empty Chebyshev box around it (radius zero for an occupied
+ * or boundary brick, so a plain step is just a degenerate jump).
+ * Incremental DDA stepping would be fewer ops per iteration, but it needs
+ * a second divergent code path that SIMD groups end up serializing. */
+bool rtrTraceVoxels(vec3 ro, vec3 rd, float maxT, uint statClass,
+                    out RTRVoxelHit hit)
 {
+    RTR_STAT_ADD(3u + statClass);
+
     vec3 invRd = rtrInvDir(rd);
     float tEnter;
     float tExit;
@@ -368,73 +430,47 @@ bool rtrTraceVoxels(vec3 ro, vec3 rd, float maxT, out RTRVoxelHit hit)
         return false;
 
     tExit = min(tExit, maxT);
-
-    vec3 p = clamp(ro + rd * (tEnter + RTR_EPS),
-                   shSceneMin,
-                   shSceneMax - shBrickSize * 0.001);
-    ivec3 brick = clamp(ivec3(floor((p - shSceneMin) * shInvBrickSize)),
-                        ivec3(0), ivec3(RTR_BRICK_GRID_X - 1u,
-                                        RTR_BRICK_GRID_Y - 1u,
-                                        RTR_BRICK_GRID_Z - 1u));
-    ivec3 stepDir = ivec3(mix(ivec3(-1), ivec3(1),
-                              greaterThanEqual(invRd, vec3(0.0))));
-    vec3 tDeltaBrick = shBrickSize * abs(invRd);
-    vec3 tDeltaVoxel = shVoxelSize * abs(invRd);
-    vec3 nextCell = vec3(brick) + max(vec3(stepDir), vec3(0.0));
-    vec3 tMax = (shSceneMin + nextCell * shBrickSize - ro) * invRd;
-    vec3 sel = vec3(0.0, 1.0, 0.0);
     float t = tEnter;
 
-    for (uint i = 0u; i < 96u; i++) {
+    for (uint i = 0u; i < 72u; i++) {
+        if (t > tExit)
+            break;
+
+        vec3 p = (ro + rd * (t + RTR_EPS) - shSceneMin) * shInvBrickSize;
+        ivec3 brick = ivec3(floor(p));
         if (any(greaterThanEqual(uvec3(brick),
                                  uvec3(RTR_BRICK_GRID_X,
                                        RTR_BRICK_GRID_Y,
-                                       RTR_BRICK_GRID_Z))) ||
-            t > tExit) {
+                                       RTR_BRICK_GRID_Z)))) {
             break;
         }
 
+        RTR_STAT_ADD(statClass);
         uint brickIndex = rtrBrickMapIndex(brick);
-        uint dist = rtrBrickDistance(brickIndex);
+        uint meta = rtrBrickMeta(brickIndex);
+        uint dist = meta & 0xfu;
+        float r = 0.0;
         if (dist == 0u) {
-            float nextT = min(min(tMax.x, tMax.y), tMax.z);
-            if (rtrTraceBrick(ro, rd, invRd, stepDir, tDeltaVoxel, brick,
-                              brickIndex,
-                              t, min(nextT, tExit), sel, hit)) {
+            if (rtrTraceBrick(ro, rd, invRd, brick, brickIndex, meta >> 4u,
+                              t, tExit, hit)) {
+                RTR_STAT_ADD(10u);
                 return true;
             }
-        } else if (dist > 1u) {
-            /* All bricks within Chebyshev radius dist-1 are empty, so the
-             * ray can jump to the exit of that box and re-enter the DDA
-             * there. */
-            float r = float(dist - 1u);
-            vec3 boxMin = shSceneMin + (vec3(brick) - r) * shBrickSize;
-            vec3 boxMax = shSceneMin + (vec3(brick) + (r + 1.0)) * shBrickSize;
-            vec3 tFar = max((boxMin - ro) * invRd, (boxMax - ro) * invRd);
-            bool jx = tFar.x <= tFar.y && tFar.x <= tFar.z;
-            bool jy = !jx && tFar.y <= tFar.z;
-
-            sel = vec3(jx, jy, !(jx || jy));
-            t = (jx ? tFar.x : (jy ? tFar.y : tFar.z)) + RTR_EPS;
-            brick = ivec3(floor((ro + rd * t - shSceneMin) * shInvBrickSize));
-            tMax = (shSceneMin +
-                    (vec3(brick) + max(vec3(stepDir), vec3(0.0))) * shBrickSize -
-                    ro) * invRd;
-            continue;
+        } else {
+            r = float(dist - 1u);
+            RTR_STAT_ADD(7u);
         }
 
-        bool sx = tMax.x <= tMax.y && tMax.x <= tMax.z;
-        bool sy = !sx && tMax.y <= tMax.z;
-        sel = vec3(sx, sy, !(sx || sy));
-        t = sx ? tMax.x : (sy ? tMax.y : tMax.z);
-        tMax += sel * tDeltaBrick;
-        brick += ivec3(sel) * stepDir;
+        vec3 boxMin = shSceneMin + (vec3(brick) - r) * shBrickSize;
+        vec3 boxMax = shSceneMin + (vec3(brick) + (r + 1.0)) * shBrickSize;
+        vec3 tFar = max((boxMin - ro) * invRd, (boxMax - ro) * invRd);
+        t = min(min(tFar.x, tFar.y), tFar.z);
     }
 
     return false;
 }
 
-vec3 rtrFloorAlbedo(vec3 p)
+f16vec3 rtrFloorAlbedo(vec3 p)
 {
     ivec2 cell = ivec2(floor(p.xz));
     float check = float((cell.x ^ cell.y) & 1);
@@ -446,10 +482,10 @@ vec3 rtrFloorAlbedo(vec3 p)
     vec3 light = vec3(0.62, 0.64, 0.60);
     vec3 base = mix(dark, light, check);
 
-    return base * (1.0 - grout * 0.18);
+    return f16vec3(base * (1.0 - grout * 0.18));
 }
 
-vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
+f16vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
 {
     if (voxel.y == 0)
         return rtrFloorAlbedo(p);
@@ -467,7 +503,7 @@ vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
         smoothstep(0.18, 0.75, height);
     vec3 base = mix(mix(stone, cap, top * 0.35), trim, trimMask);
 
-    return base * (0.88 + jitter * 0.12);
+    return f16vec3(base * (0.88 + jitter * 0.12));
 }
 
 vec3 rtrTonemap(vec3 color)
@@ -476,15 +512,6 @@ vec3 rtrTonemap(vec3 color)
     color = (color * (2.51 * color + vec3(0.03))) /
             (color * (2.43 * color + vec3(0.59)) + vec3(0.14));
     return sqrt(clamp(color, vec3(0.0), vec3(1.0)));
-}
-
-vec3 rtrSphereDirection(vec2 u)
-{
-    float z = 1.0 - 2.0 * u.x;
-    float r = sqrt(max(0.0, 1.0 - z * z));
-    float phi = RTR_TWO_PI * u.y;
-
-    return vec3(cos(phi) * r, z, sin(phi) * r);
 }
 
 vec3 rtrCosineHemisphere(vec3 n, vec2 u)
@@ -501,103 +528,177 @@ vec3 rtrCosineHemisphere(vec3 n, vec2 u)
                      n * sqrt(max(0.0, 1.0 - u.x)));
 }
 
-float rtrVisibility(vec3 ro, vec3 rd, float maxT)
+/* Solid-angle cone sampling of the sphere light: every sample direction
+ * lands on the visible cap, where uniform surface sampling wastes half
+ * its samples on the far side and doubles penumbra variance. The
+ * 2(1-cosThetaMax)/R^2 weight reduces to 1/d^2 in the far field, so the
+ * brightness matches the previous point-on-sphere estimator. The shadow
+ * ray itself goes through the path loop's single traversal call site. */
+bool rtrSampleLight(vec3 p, vec3 n, vec2 u,
+                    out vec3 l, out float maxT, out float scale)
 {
-    RTRVoxelHit blocker;
-    return rtrTraceVoxels(ro, rd, maxT - RTR_EPS * 8.0, blocker) ? 0.0 : 1.0;
+    vec3 toCenter = RTR_LIGHT_POS - p;
+    float dist2 = max(dot(toCenter, toCenter), 0.001);
+    float dist = sqrt(dist2);
+    float radius2 = RTR_LIGHT_RADIUS * RTR_LIGHT_RADIUS;
+    float sinThetaMax2 = clamp(radius2 / dist2, 0.0, 1.0);
+    float cosThetaMax = sqrt(1.0 - sinThetaMax2);
+    float cosTheta = 1.0 - u.x * (1.0 - cosThetaMax);
+    float sinTheta2 = max(1.0 - cosTheta * cosTheta, 0.0);
+    float phi = RTR_TWO_PI * u.y;
+    vec3 w = toCenter / dist;
+    vec3 tangent = normalize(abs(w.y) < 0.999 ?
+                             cross(vec3(0.0, 1.0, 0.0), w) :
+                             cross(vec3(1.0, 0.0, 0.0), w));
+    vec3 bitangent = cross(w, tangent);
+    float sinTheta = sqrt(sinTheta2);
+    float ndl;
+
+    l = normalize(tangent * (cos(phi) * sinTheta) +
+                  bitangent * (sin(phi) * sinTheta) +
+                  w * cosTheta);
+    ndl = max(dot(n, l), 0.0);
+    maxT = dist * cosTheta - sqrt(max(radius2 - dist2 * sinTheta2, 0.0));
+    scale = ndl * RTR_INV_PI * 2.0 * (1.0 - cosThetaMax) / radius2;
+
+    return ndl > 0.0;
 }
 
-vec3 rtrDirectLight(vec3 p, vec3 n, vec3 albedo, vec2 u)
+/* Sampling rotations are hashed from the quantized hit position rather
+ * than the pixel: the grain anchors to surfaces instead of the screen, so
+ * it rides with geometry under camera motion. Cells are 1/16 voxel and
+ * the point is inset along the normal so face samples never straddle a
+ * cell boundary. */
+uint rtrHashPosition(vec3 p, vec3 n)
 {
-    vec3 lightPoint = RTR_LIGHT_POS + rtrSphereDirection(u) * RTR_LIGHT_RADIUS;
-    vec3 toLight = lightPoint - p;
-    float lightDist2 = max(dot(toLight, toLight), 0.001);
-    float lightDist = sqrt(lightDist2);
-    vec3 l = toLight / lightDist;
-    float ndl = max(dot(n, l), 0.0);
-    if (ndl <= 0.0)
-        return vec3(0.0);
+    vec3 inset = p - n * (shVoxelSize.x * 0.03125);
+    ivec3 q = ivec3(floor(inset * (shInvVoxelSize.x * 16.0)));
 
-    float visibility = rtrVisibility(p + n * RTR_EPS * 8.0,
-                                     l,
-                                     lightDist - RTR_LIGHT_RADIUS);
-
-    return albedo * RTR_LIGHT_COLOR * (ndl / lightDist2) * RTR_INV_PI * visibility;
+    return rtrHashU32(uint(q.x * 73856093 ^ q.y * 19349663 ^ q.z * 83492791));
 }
 
-/* Deeper bounces reuse the sample's base point with fixed per-bounce
- * shifts instead of white noise: every lane in a SIMD group then follows
- * the same relative path, which keeps secondary traversal coherent. */
-vec3 rtrTracePath(vec3 ro, vec3 rd, vec2 ham, vec2 uLight, vec2 uHemi)
+/* Bounce zero is stratified (it carries nearly all the variance); deeper
+ * bounces use independent hashes of surface cell and sample index.
+ * Reusing one stratified coordinate across bounce dimensions samples the
+ * path integral along correlated diagonals and shows up as a systematic
+ * energy error, not just noise. */
+/* The path loop has exactly one rtrTraceVoxels call site, alternating
+ * between bounce rays and shadow rays: each inlined traversal context
+ * costs a register-allocation bracket (Metal pipeline probe: one site
+ * 448 threads/threadgroup, two sites 384), and occupancy is the
+ * renderer's measured limiter. Traversals stay whole calls -- flattening
+ * them into a per-step state machine was tried and ran 2.5x slower. */
+vec3 rtrTracePath(vec3 ro, vec3 rd, vec2 ham, uint sampleSalt)
 {
-    const vec2 bounceShift = vec2(0.7548777, 0.5698403);
-    vec3 radiance = vec3(0.0);
-    vec3 throughput = vec3(1.0);
+    const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
+    f16vec3 radiance = f16vec3(0.0);
+    f16vec3 throughput = f16vec3(1.0);
+    f16vec3 pendingDirect = f16vec3(0.0);
+    vec3 nextRo = vec3(0.0);
+    vec3 nextRd = vec3(0.0);
+    float maxT = RTR_INF;
+    uint bounce = 0u;
+    bool isShadow = false;
+    bool hasNext = false;
 
-    for (uint bounce = 0u; bounce < RTR_PATH_BOUNCES; bounce++) {
+    for (uint segment = 0u; segment < 2u * RTR_PATH_BOUNCES; segment++) {
         RTRVoxelHit hit;
-        float maxT = bounce == 0u ? RTR_INF : float(RTR_INDIRECT_MAX_T);
-        if (!rtrTraceVoxels(ro, rd, maxT, hit)) {
-            vec3 skyContribution = throughput * rtrSky(rd);
+        uint statClass = isShadow ? RTR_STAT_CLASS_SHADOW :
+            (bounce == 0u ? RTR_STAT_CLASS_PRIMARY : RTR_STAT_CLASS_BOUNCE);
+        bool hitFound = rtrTraceVoxels(ro, rd, maxT, statClass, hit);
+
+        if (isShadow) {
+            if (!hitFound)
+                radiance += pendingDirect;
+            isShadow = false;
+            if (!hasNext)
+                break;
+            bounce++;
+            ro = nextRo;
+            rd = nextRd;
+            maxT = float(RTR_INDIRECT_MAX_T);
+            continue;
+        }
+
+        if (!hitFound) {
+            f16vec3 skyContribution = throughput * rtrSky(rd);
             if (bounce > 0u)
-                skyContribution = rtrClampLuminance(skyContribution,
-                                                    RTR_INDIRECT_LUMINANCE_CAP);
+                skyContribution =
+                    rtrClampLuminance(skyContribution,
+                                      float16_t(RTR_INDIRECT_LUMINANCE_CAP));
             radiance += skyContribution;
             break;
         }
 
         vec3 hitP = ro + rd * hit.t;
         vec3 n = dot(hit.normal, rd) < 0.0 ? hit.normal : -hit.normal;
-        vec3 albedo = rtrVoxelAlbedo(hit.voxel, hitP, n);
+        f16vec3 albedo = rtrVoxelAlbedo(hit.voxel, hitP, n);
+        uint hashLight = rtrHashPosition(hitP, n);
+        uint hashHemi = rtrHashU32(hashLight);
         vec2 uL = bounce == 0u ?
-            uLight : fract(ham + bounceShift * float(bounce));
-        vec3 directContribution = throughput * rtrDirectLight(hitP, n, albedo, uL);
+            fract(ham + rtrHashToUnit2(hashLight) + shFrameRot) :
+            rtrHashToUnit2(rtrHashU32(hashLight ^ sampleSalt));
+        vec3 l;
+        float lightT;
+        float lightScale;
+        bool lit = rtrSampleLight(hitP, n, uL, l, lightT, lightScale);
 
+        pendingDirect = throughput * albedo * f16vec3(RTR_LIGHT_COLOR *
+                                                      lightScale);
         if (bounce > 0u)
-            directContribution = rtrClampLuminance(directContribution,
-                                                   RTR_INDIRECT_LUMINANCE_CAP);
-        radiance += directContribution;
+            pendingDirect =
+                rtrClampLuminance(pendingDirect,
+                                  float16_t(RTR_INDIRECT_LUMINANCE_CAP));
         throughput *= albedo;
+        hasNext = bounce + 1u < RTR_PATH_BOUNCES;
+        if (hasNext) {
+            vec2 uH = bounce == 0u ?
+                fract(ham + rtrHashToUnit2(hashHemi) * hemiJitter +
+                      shFrameRot) :
+                rtrHashToUnit2(rtrHashU32(hashHemi ^ sampleSalt));
 
-        if (bounce + 1u == RTR_PATH_BOUNCES)
+            nextRo = hitP + n * RTR_EPS * 8.0;
+            nextRd = rtrCosineHemisphere(n, uH);
+        }
+
+        if (lit) {
+            isShadow = true;
+            ro = hitP + n * RTR_EPS * 8.0;
+            rd = l;
+            maxT = lightT - RTR_EPS * 8.0;
+            continue;
+        }
+
+        if (!hasNext)
             break;
-
-        vec2 uH = bounce == 0u ?
-            uHemi : fract(uHemi + bounceShift * float(bounce));
-        ro = hitP + n * RTR_EPS * 8.0;
-        rd = rtrCosineHemisphere(n, uH);
+        bounce++;
+        ro = nextRo;
+        rd = nextRd;
+        maxT = float(RTR_INDIRECT_MAX_T);
     }
 
-    return radiance;
+    return vec3(radiance);
 }
 
-/* Stratified, frame-independent sampling: every sample's Hammersley point
- * is shifted by a per-pixel Cranley-Patterson rotation, so neighboring
- * pixels decorrelate (banding becomes fine grain) while the image stays a
- * pure function of camera pose and scene. The hemisphere rotation is
- * deliberately scaled down: clustered bounce directions keep secondary
- * rays coherent across a SIMD group, which is worth more than 2x in
- * traversal time, while still breaking face-wide bias into grain. */
+/* Stratified, frame-varying sampling: every sample's Hammersley point is
+ * shifted by a Cranley-Patterson rotation hashed from the surface cell it
+ * shades plus the frame, so estimator error is fresh boiling grain each
+ * frame rather than a frozen pattern. Only the anti-aliasing offset is
+ * pixel-hashed, since it integrates the pixel footprint itself. */
 vec3 rtrRenderPixel(ivec2 p)
 {
-    const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
     float invSpp = 1.0 / float(shSpp);
     uint h0 = rtrHashU32(uint(p.x) * 1973u ^ uint(p.y) * 9277u ^ 0x9e3779b9u);
-    uint h1 = rtrHashU32(h0);
-    uint h2 = rtrHashU32(h1);
     vec2 rotPixel = rtrHashToUnit2(h0);
-    vec2 rotLight = rtrHashToUnit2(h1);
-    vec2 rotHemi = rtrHashToUnit2(h2) * hemiJitter;
     vec3 color = vec3(0.0);
 
     for (uint sampleIndex = 0u; sampleIndex < shSpp; sampleIndex++) {
         vec2 ham = vec2((float(sampleIndex) + 0.5) * invSpp,
                         rtrRadicalInverse2(sampleIndex));
-        vec3 rd = rtrRayForPixel(vec2(p) + fract(ham + rotPixel));
+        vec3 rd = rtrRayForPixel(vec2(p) + fract(ham + rotPixel + shFrameRot));
 
         color += rtrTracePath(shRo, rd, ham,
-                              fract(ham + rotLight),
-                              fract(ham + rotHemi));
+                              (sampleIndex + 1u) * 0x9e3779b9u ^ shFrameSalt);
     }
 
     return color * invSpp;
@@ -611,10 +712,28 @@ void main()
     if (gl_LocalInvocationIndex == 0u)
         rtrInitShared(vec2(sz));
 
+#if RTR_STATS
+    for (uint i = 0u; i < RTR_STAT_COUNTERS; i++)
+        gStats[i] = 0u;
+    if (gl_LocalInvocationIndex < RTR_STAT_COUNTERS)
+        shStats[gl_LocalInvocationIndex] = 0u;
+#endif
+
     barrier();
 
-    if (any(greaterThanEqual(p, sz)))
-        return;
+    if (all(lessThan(p, sz)))
+        imageStore(rtrOutImage, p, vec4(rtrTonemap(rtrRenderPixel(p)), 1.0));
 
-    imageStore(rtrOutImage, p, vec4(rtrTonemap(rtrRenderPixel(p)), 1.0));
+#if RTR_STATS
+    barrier();
+    for (uint i = 0u; i < RTR_STAT_COUNTERS; i++) {
+        if (gStats[i] != 0u)
+            atomicAdd(shStats[i], gStats[i]);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex < RTR_STAT_COUNTERS) {
+        atomicAdd(rtrMem[RTR_STAT_WORDS[gl_LocalInvocationIndex]],
+                  shStats[gl_LocalInvocationIndex]);
+    }
+#endif
 }

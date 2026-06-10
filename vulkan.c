@@ -15,7 +15,12 @@
 #include "render_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
-#define RTR_TILE_SIZE 8u
+#ifndef RTR_TILE_X
+#define RTR_TILE_X 16u
+#endif
+#ifndef RTR_TILE_Y
+#define RTR_TILE_Y 8u
+#endif
 #define RTR_MEMORY_HEADER_WORDS 32u
 #define RTR_SCENE_BRICK_SIZE 4u
 #define RTR_SCENE_BRICK_GRID_X 32u
@@ -24,14 +29,13 @@
 #define RTR_SCENE_BRICK_CAPACITY \
     (RTR_SCENE_BRICK_GRID_X * RTR_SCENE_BRICK_GRID_Y * RTR_SCENE_BRICK_GRID_Z)
 #define RTR_SCENE_BRICK_WORDS 2u
-#define RTR_SCENE_DISTANCE_WORDS (RTR_SCENE_BRICK_CAPACITY / 8u)
+#define RTR_SCENE_META_WORDS (RTR_SCENE_BRICK_CAPACITY / 2u)
 #define RTR_ENVMAP_WIDTH 1024u
 #define RTR_ENVMAP_HEIGHT 512u
 #define RTR_ENVMAP_WORDS (RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u)
 #define RTR_SCENE_WORDS \
-    (RTR_SCENE_DISTANCE_WORDS + \
+    (RTR_SCENE_META_WORDS + \
      RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS + \
-     RTR_SCENE_BRICK_CAPACITY + \
      RTR_ENVMAP_WORDS)
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
@@ -50,6 +54,7 @@ enum {
     RTR_MEMORY_CAMERA_YAW_WORD = 17,
     RTR_MEMORY_CAMERA_PITCH_WORD = 18,
     RTR_MEMORY_CAMERA_RADIUS_WORD = 19,
+    RTR_MEMORY_FRAME_WORD = 30,
 };
 
 #define RTR_DEFAULT_SPP 2u
@@ -365,7 +370,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 32u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 34u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_SPP_WORD] = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
@@ -385,6 +390,7 @@ static void rtrUpdateMemoryWith(float time,
 {
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
+    rtrMemoryWords[RTR_MEMORY_FRAME_WORD] = rtrFrameIndex;
     if (!rtrCameraAutoReady) {
         rtrCameraAutoBase = cameraYaw -
             (autoOrbit ? time * RTR_CAMERA_AUTO_SPEED : 0.0f);
@@ -421,9 +427,9 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                                  VkDescriptorSet descriptorSet)
 {
     const uint32_t pixelGroupsX =
-        (rtrSwapExtent.width + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
+        (rtrSwapExtent.width + RTR_TILE_X - 1u) / RTR_TILE_X;
     const uint32_t pixelGroupsY =
-        (rtrSwapExtent.height + RTR_TILE_SIZE - 1u) / RTR_TILE_SIZE;
+        (rtrSwapExtent.height + RTR_TILE_Y - 1u) / RTR_TILE_Y;
 
     vkCmdBindDescriptorSets(commandBuffer,
                             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -649,9 +655,30 @@ int rtrVulkanInit(void *windowSurface)
                    rtrTimestampValidBits > 0u &&
                    rtrTimestampPeriod > 0.0f);
 
+    VkPhysicalDeviceShaderFloat16Int8Features float16Features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &float16Features,
+    };
+    vkGetPhysicalDeviceFeatures2(rtrPhysicalDevice, &features2);
+    if (!float16Features.shaderFloat16) {
+        fprintf(stderr, "device: shaderFloat16 unsupported\n");
+        return 1;
+    }
+
+    /* The shader keeps its shading state in half precision purely to
+     * shrink per-thread register footprint; geometry math stays fp32. */
+    float16Features = (VkPhysicalDeviceShaderFloat16Int8Features){
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+        .shaderFloat16 = VK_TRUE,
+    };
+
     float priority = 1.0f;
     vkCreateDevice(rtrPhysicalDevice, &(VkDeviceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &float16Features,
         .queueCreateInfoCount = 1u,
         .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -1045,6 +1072,53 @@ void rtrVulkanFrame(void)
     rtrFrameIndex++;
 }
 
+/* Counter words written by RTR_STATS shader builds; zeroed after each
+ * report so every frame stands alone. */
+static void rtrReportShaderStats(uint32_t frame)
+{
+    enum {
+        RTR_STATS_BRICK_ITERS = 5,    /* 5,6,7: primary, shadow, bounce */
+        RTR_STATS_TRAVERSALS = 12,    /* 12,13,14: primary, shadow, bounce */
+        RTR_STATS_VOXEL_ITERS = 15,
+        RTR_STATS_JUMPS = 16,
+        RTR_STATS_ENTRIES = 20,
+        RTR_STATS_REJECTS = 21,
+        RTR_STATS_HITS = 22,
+        RTR_STATS_ENV = 23,
+    };
+
+    if (!getenv("RTR_STATS")) return;
+
+    fprintf(stderr,
+            "stats[%u] trav %u/%u/%u brickit %u/%u/%u voxit %u jumps %u entries %u rejects %u hits %u env %u\n",
+            frame,
+            rtrMemoryWords[RTR_STATS_TRAVERSALS],
+            rtrMemoryWords[RTR_STATS_TRAVERSALS + 1],
+            rtrMemoryWords[RTR_STATS_TRAVERSALS + 2],
+            rtrMemoryWords[RTR_STATS_BRICK_ITERS],
+            rtrMemoryWords[RTR_STATS_BRICK_ITERS + 1],
+            rtrMemoryWords[RTR_STATS_BRICK_ITERS + 2],
+            rtrMemoryWords[RTR_STATS_VOXEL_ITERS],
+            rtrMemoryWords[RTR_STATS_JUMPS],
+            rtrMemoryWords[RTR_STATS_ENTRIES],
+            rtrMemoryWords[RTR_STATS_REJECTS],
+            rtrMemoryWords[RTR_STATS_HITS],
+            rtrMemoryWords[RTR_STATS_ENV]);
+
+    rtrMemoryWords[RTR_STATS_BRICK_ITERS] = 0u;
+    rtrMemoryWords[RTR_STATS_BRICK_ITERS + 1] = 0u;
+    rtrMemoryWords[RTR_STATS_BRICK_ITERS + 2] = 0u;
+    rtrMemoryWords[RTR_STATS_TRAVERSALS] = 0u;
+    rtrMemoryWords[RTR_STATS_TRAVERSALS + 1] = 0u;
+    rtrMemoryWords[RTR_STATS_TRAVERSALS + 2] = 0u;
+    rtrMemoryWords[RTR_STATS_VOXEL_ITERS] = 0u;
+    rtrMemoryWords[RTR_STATS_JUMPS] = 0u;
+    rtrMemoryWords[RTR_STATS_ENTRIES] = 0u;
+    rtrMemoryWords[RTR_STATS_REJECTS] = 0u;
+    rtrMemoryWords[RTR_STATS_HITS] = 0u;
+    rtrMemoryWords[RTR_STATS_ENV] = 0u;
+}
+
 static void rtrRecordExportFrame(VkCommandBuffer commandBuffer,
                                  VkImage image,
                                  VkBuffer stagingBuffer,
@@ -1183,6 +1257,7 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
         }
         vkWaitForFences(rtrDevice, 1u, &rtrInFlightFence, VK_TRUE, UINT64_MAX);
         rtrReportGpuTiming();
+        rtrReportShaderStats(frame);
         vkResetFences(rtrDevice, 1u, &rtrInFlightFence);
         fwrite(rtrExportStagingPixels, 1u, (size_t)rtrExportImageBytes, out);
         rtrFrameIndex++;

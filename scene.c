@@ -20,7 +20,7 @@
 #define RTR_SCENE_BRICK_CAPACITY \
     (RTR_SCENE_BRICK_GRID_X * RTR_SCENE_BRICK_GRID_Y * RTR_SCENE_BRICK_GRID_Z)
 #define RTR_SCENE_BRICK_WORDS 2u
-#define RTR_SCENE_DISTANCE_WORDS (RTR_SCENE_BRICK_CAPACITY / 8u)
+#define RTR_SCENE_META_WORDS (RTR_SCENE_BRICK_CAPACITY / 2u)
 #define RTR_SCENE_DISTANCE_MAX 15u
 #define RTR_SCENE_VOXEL_SIZE 0.055f
 #define RTR_SCENE_FLOOR_Y -1.0f
@@ -39,14 +39,12 @@ enum {
     RTR_SCENE_BRICK_GRID_Z_WORD = 11,
     RTR_SCENE_QUANT_MIN_WORD = 24,
     RTR_SCENE_QUANT_MAX_WORD = 27,
-    RTR_SCENE_DISTANCE_WORD = 32,
+    RTR_SCENE_BRICK_META_WORD = 32,
     RTR_SCENE_VOXEL_BRICK_WORD =
-        RTR_SCENE_DISTANCE_WORD + RTR_SCENE_DISTANCE_WORDS,
-    RTR_SCENE_BRICK_BOUNDS_WORD =
+        RTR_SCENE_BRICK_META_WORD + RTR_SCENE_META_WORDS,
+    RTR_SCENE_ENVMAP_WORD =
         RTR_SCENE_VOXEL_BRICK_WORD +
         RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS,
-    RTR_SCENE_ENVMAP_WORD =
-        RTR_SCENE_BRICK_BOUNDS_WORD + RTR_SCENE_BRICK_CAPACITY,
 };
 
 static uint32_t rtrF32Word(float value)
@@ -336,16 +334,14 @@ static void rtrStoreSceneBounds(uint32_t *words)
 /* Two-pass 26-neighbor chamfer computes the exact Chebyshev distance from
  * every empty brick to the nearest occupied one; the shader uses it to
  * jump rays across guaranteed-empty boxes instead of stepping brick by
- * brick. */
+ * brick. The distance shares a 16-bit meta record with the brick's
+ * occupied-voxel AABB so traversal reads both in one load. */
 static void rtrStoreBrickDistance(uint32_t *words, const uint8_t *dist0)
 {
     uint8_t *dist = (uint8_t *)malloc(RTR_SCENE_BRICK_CAPACITY);
 
     if (!dist) {
         fprintf(stderr, "scene: distance allocation failed\n");
-        memset(words + RTR_SCENE_DISTANCE_WORD,
-               0,
-               RTR_SCENE_DISTANCE_WORDS * sizeof(uint32_t));
         return;
     }
 
@@ -404,13 +400,11 @@ static void rtrStoreBrickDistance(uint32_t *words, const uint8_t *dist0)
         }
     }
 
-    memset(words + RTR_SCENE_DISTANCE_WORD,
-           0,
-           RTR_SCENE_DISTANCE_WORDS * sizeof(uint32_t));
     for (uint32_t i = 0u; i < RTR_SCENE_BRICK_CAPACITY; i++) {
         const uint32_t clamped = dist[i] > RTR_SCENE_DISTANCE_MAX ?
             RTR_SCENE_DISTANCE_MAX : dist[i];
-        words[RTR_SCENE_DISTANCE_WORD + i / 8u] |= clamped << ((i % 8u) * 4u);
+        words[RTR_SCENE_BRICK_META_WORD + i / 2u] |=
+            clamped << ((i % 2u) * 16u);
     }
 
     free(dist);
@@ -432,9 +426,9 @@ static uint32_t rtrStoreVoxelBricks(uint32_t *words, const uint8_t *voxels)
     memset(words + RTR_SCENE_VOXEL_BRICK_WORD,
            0,
            RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS * sizeof(uint32_t));
-    memset(words + RTR_SCENE_BRICK_BOUNDS_WORD,
+    memset(words + RTR_SCENE_BRICK_META_WORD,
            0,
-           RTR_SCENE_BRICK_CAPACITY * sizeof(uint32_t));
+           RTR_SCENE_META_WORDS * sizeof(uint32_t));
 
     for (uint32_t by = 0u; by < RTR_SCENE_BRICK_GRID_Y; by++) {
         for (uint32_t bz = 0u; bz < RTR_SCENE_BRICK_GRID_Z; bz++) {
@@ -472,13 +466,15 @@ static uint32_t rtrStoreVoxelBricks(uint32_t *words, const uint8_t *voxels)
                 const uint32_t brickIndex = rtrBrickIndex(bx, by, bz);
                 const uint32_t brickWord = RTR_SCENE_VOXEL_BRICK_WORD +
                     brickIndex * RTR_SCENE_BRICK_WORDS;
-                dist0[brickIndex] = 0u;
-                words[brickWord] = maskLo;
-                words[brickWord + 1u] = maskHi;
-                words[RTR_SCENE_BRICK_BOUNDS_WORD + brickIndex] =
+                const uint32_t bounds =
                     boundsMin[0] | (boundsMin[1] << 2u) | (boundsMin[2] << 4u) |
                     (boundsMax[0] << 6u) | (boundsMax[1] << 8u) |
                     (boundsMax[2] << 10u);
+                dist0[brickIndex] = 0u;
+                words[brickWord] = maskLo;
+                words[brickWord + 1u] = maskHi;
+                words[RTR_SCENE_BRICK_META_WORD + brickIndex / 2u] |=
+                    (bounds << 4u) << ((brickIndex % 2u) * 16u);
                 brickCount++;
             }
         }

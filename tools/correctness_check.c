@@ -12,14 +12,13 @@
 #define RTR_CHECK_BRICK_CAPACITY \
     (RTR_CHECK_BRICK_GRID_X * RTR_CHECK_BRICK_GRID_Y * RTR_CHECK_BRICK_GRID_Z)
 #define RTR_CHECK_BRICK_WORDS 2u
-#define RTR_CHECK_DISTANCE_WORDS (RTR_CHECK_BRICK_CAPACITY / 8u)
+#define RTR_CHECK_META_WORDS (RTR_CHECK_BRICK_CAPACITY / 2u)
 #define RTR_CHECK_DISTANCE_MAX 15u
 #define RTR_CHECK_ENVMAP_WORDS (1024u * 512u * 2u)
 #define RTR_CHECK_WORDS \
     (RTR_CHECK_HEADER_WORDS + \
-     RTR_CHECK_DISTANCE_WORDS + \
+     RTR_CHECK_META_WORDS + \
      RTR_CHECK_BRICK_CAPACITY * RTR_CHECK_BRICK_WORDS + \
-     RTR_CHECK_BRICK_CAPACITY + \
      RTR_CHECK_ENVMAP_WORDS)
 
 #define RTR_CHECK_BRICK_COUNT_WORD 8u
@@ -28,12 +27,9 @@
 #define RTR_CHECK_BRICK_GRID_Z_WORD 11u
 #define RTR_CHECK_SCENE_MIN_WORD 24u
 #define RTR_CHECK_SCENE_MAX_WORD 27u
-#define RTR_CHECK_DISTANCE_WORD 32u
+#define RTR_CHECK_META_WORD 32u
 #define RTR_CHECK_VOXEL_BRICK_WORD \
-    (RTR_CHECK_DISTANCE_WORD + RTR_CHECK_DISTANCE_WORDS)
-#define RTR_CHECK_BRICK_BOUNDS_WORD \
-    (RTR_CHECK_VOXEL_BRICK_WORD + \
-     RTR_CHECK_BRICK_CAPACITY * RTR_CHECK_BRICK_WORDS)
+    (RTR_CHECK_META_WORD + RTR_CHECK_META_WORDS)
 
 void rtrScene(uint32_t *words);
 
@@ -105,7 +101,9 @@ int main(void)
             i * RTR_CHECK_BRICK_WORDS;
         const uint32_t lo = words[word];
         const uint32_t hi = words[word + 1u];
-        const uint32_t stored = words[RTR_CHECK_BRICK_BOUNDS_WORD + i];
+        const uint32_t stored =
+            ((words[RTR_CHECK_META_WORD + i / 2u] >> ((i % 2u) * 16u)) >> 4u) &
+            0xfffu;
         uint32_t boundsMin[3] = {3u, 3u, 3u};
         uint32_t boundsMax[3] = {0u, 0u, 0u};
         uint32_t reference = 0u;
@@ -147,8 +145,8 @@ int main(void)
                     (by * RTR_CHECK_BRICK_GRID_Z + bz) *
                     RTR_CHECK_BRICK_GRID_X + bx;
                 const uint32_t stored =
-                    (words[RTR_CHECK_DISTANCE_WORD + i / 8u] >>
-                     ((i % 8u) * 4u)) & 0xfu;
+                    (words[RTR_CHECK_META_WORD + i / 2u] >>
+                     ((i % 2u) * 16u)) & 0xfu;
                 uint32_t reference = RTR_CHECK_DISTANCE_MAX;
 
                 for (uint32_t qy = 0u; qy < RTR_CHECK_BRICK_GRID_Y; qy++) {
