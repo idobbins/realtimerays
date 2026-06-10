@@ -1,6 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 
 #define RTR_CAMERA_DEFAULT_YAW 0.35f
@@ -25,12 +27,38 @@ static uint32_t rtrMouseDragging = 0u;
 static uint32_t rtrMouseDragActive = 0u;
 static float rtrMouseDownX = 0.0f;
 static float rtrMouseDownY = 0.0f;
+static uint32_t rtrSettingSpp = 2u;
+static uint32_t rtrSettingSppMax = 8u;
+static uint32_t rtrSettingLightSpp = 1u;
+static uint32_t rtrSettingLightSppMax = 2u;
+static uint32_t rtrSettingGiSpp = 1u;
+static uint32_t rtrSettingGiSppMax = 2u;
 
 static float rtrClamp(float value, float lo, float hi)
 {
     if (value < lo) return lo;
     if (value > hi) return hi;
     return value;
+}
+
+static uint32_t rtrClampU32(uint32_t value, uint32_t lo, uint32_t hi)
+{
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+static uint32_t rtrSettingEnv(const char *name, uint32_t fallback)
+{
+    const char *value = getenv(name);
+    return value && *value ? (uint32_t)strtoul(value, NULL, 10) : fallback;
+}
+
+static void rtrPrintSettings(void)
+{
+    printf("settings: spp %u light %u gi %u\n",
+           rtrSettingSpp, rtrSettingLightSpp, rtrSettingGiSpp);
+    fflush(stdout);
 }
 
 static void rtrEnterManualOrbit(void)
@@ -90,6 +118,24 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     rtrMouseDragActive = 0u;
     rtrMouseDownX = 0.0f;
     rtrMouseDownY = 0.0f;
+
+    /* Interactive ceilings: the renderer sizes its queues and prerecords
+     * sample waves for these maxima; env values raise them at launch. */
+    rtrSettingSpp = rtrClampU32(rtrSettingEnv("RTR_SPP", 2u), 1u,
+                                rtrSettingSppMax);
+    rtrSettingLightSppMax =
+        rtrClampU32(rtrSettingEnv("RTR_LIGHT_SPP", 1u), 2u, 4u);
+    rtrSettingGiSppMax =
+        rtrClampU32(rtrSettingEnv("RTR_GI_SPP", 1u), 2u, 4u);
+    rtrSettingLightSpp =
+        rtrClampU32(rtrSettingEnv("RTR_LIGHT_SPP", 1u), 1u,
+                    rtrSettingLightSppMax);
+    rtrSettingGiSpp = rtrClampU32(rtrSettingEnv("RTR_GI_SPP", 1u), 1u,
+                                  rtrSettingGiSppMax);
+
+    printf("controls: drag orbit, scroll zoom, space auto-orbit, "
+           "1-8 spp, l light samples, g gi chains, esc quit\n");
+    rtrPrintSettings();
     return 0;
 }
 
@@ -114,6 +160,13 @@ void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radiu
 void rtrWindowSetCameraYaw(float yaw)
 {
     rtrCameraYaw = yaw;
+}
+
+void rtrWindowRenderSettings(uint32_t *spp, uint32_t *lightSpp, uint32_t *giSpp)
+{
+    if (spp) *spp = rtrSettingSpp;
+    if (lightSpp) *lightSpp = rtrSettingLightSpp;
+    if (giSpp) *giSpp = rtrSettingGiSpp;
 }
 
 int rtrPumpEventsOnce(void)
@@ -183,11 +236,35 @@ int rtrPumpEventsOnce(void)
                                            RTR_CAMERA_MAX_RADIUS);
             }
 
+            uint32_t rtrIsSetting = 0u;
+            if (type == NSEventTypeKeyDown && ![event isARepeat]) {
+                NSString *chars =
+                    [[event charactersIgnoringModifiers] lowercaseString];
+                unichar c = [chars length] > 0 ?
+                    [chars characterAtIndex:0] : 0;
+
+                if (c >= '1' && c <= '8') {
+                    rtrSettingSpp = rtrClampU32((uint32_t)(c - '0'), 1u,
+                                                rtrSettingSppMax);
+                    rtrIsSetting = 1u;
+                } else if (c == 'l') {
+                    rtrSettingLightSpp =
+                        rtrSettingLightSpp % rtrSettingLightSppMax + 1u;
+                    rtrIsSetting = 1u;
+                } else if (c == 'g') {
+                    rtrSettingGiSpp =
+                        rtrSettingGiSpp % rtrSettingGiSppMax + 1u;
+                    rtrIsSetting = 1u;
+                }
+                if (rtrIsSetting) rtrPrintSettings();
+            }
+
             if (rtrIsSpace && ![event isARepeat]) {
                 rtrAutoOrbit = rtrAutoOrbit ? 0u : 1u;
             }
             rtrShouldQuit |= rtrIsEscape;
-            if (!(rtrIsEscape || rtrIsSpace)) [NSApp sendEvent:event];
+            if (!(rtrIsEscape || rtrIsSpace || rtrIsSetting))
+                [NSApp sendEvent:event];
         }
 
         rtrShouldQuit |= (uint32_t)(![rtrWindowHandle isVisible]);

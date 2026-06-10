@@ -953,6 +953,15 @@ void main()
 
     barrier();
 
+    /* Waves past the runtime spp are prerecorded for the interactive
+     * keys; they publish an empty queue so the depth stages die in their
+     * dead-group exits. */
+    if (pc.sampleIndex >= shSpp) {
+        if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
+            rtrStoreU32(RTR_WF_RAY_COUNT_WORD, 0u);
+        return;
+    }
+
     if (all(lessThan(p, shSize))) {
         uint pixel = uint(p.y) * uint(shSize.x) + uint(p.x);
         vec2 ham = rtrSampleHam(pc.sampleIndex);

@@ -47,6 +47,7 @@
 
 void rtrWindowCamera(uint32_t *autoOrbit, float *yaw, float *pitch, float *radius);
 void rtrWindowSetCameraYaw(float yaw);
+void rtrWindowRenderSettings(uint32_t *spp, uint32_t *lightSpp, uint32_t *giSpp);
 void rtrScene(uint32_t *words);
 
 enum {
@@ -180,6 +181,8 @@ static uint32_t rtrFrameClockReady = 0u;
 static uint32_t rtrCameraAutoReady = 0u;
 static uint32_t rtrCameraAutoWasEnabled = 0u;
 static float rtrCameraAutoBase = RTR_CAMERA_DEFAULT_YAW;
+static uint32_t rtrWindowed = 0u;
+static uint32_t rtrWaveCount = 1u;
 
 static uint32_t rtrF32Word(float value)
 {
@@ -209,11 +212,14 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
 }
 
 /* Decoupled first-hit sample budgets (wavefront only): RTR_LIGHT_SPP
- * shadow rays and RTR_GI_SPP bounce chains per primary hit. */
-static uint32_t rtrWfBudget(const char *name)
+ * shadow rays and RTR_GI_SPP bounce chains per primary hit. Queues and
+ * dispatches are sized for the cap; the windowed app keeps headroom of 2
+ * so the keys can raise budgets live, and env values raise the ceiling. */
+static uint32_t rtrWfBudgetCap(const char *name)
 {
     uint32_t value = rtrEnvU32(name, 1u);
 
+    if (rtrWindowed && value < 2u) value = 2u;
     if (value < 1u) value = 1u;
     if (value > RTR_WF_BUDGET_MAX) value = RTR_WF_BUDGET_MAX;
     return value;
@@ -221,8 +227,8 @@ static uint32_t rtrWfBudget(const char *name)
 
 static uint32_t rtrWfPixelWords(void)
 {
-    const uint32_t lightSpp = rtrWfBudget("RTR_LIGHT_SPP");
-    const uint32_t giSpp = rtrWfBudget("RTR_GI_SPP");
+    const uint32_t lightSpp = rtrWfBudgetCap("RTR_LIGHT_SPP");
+    const uint32_t giSpp = rtrWfBudgetCap("RTR_GI_SPP");
     const uint32_t shadowCap = lightSpp > giSpp ? lightSpp : giSpp;
 
     /* accum + ping-pong ray queues + hits + parity shadow queues */
@@ -429,10 +435,6 @@ static int rtrCreateMemoryBuffer(void)
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
     rtrScene(rtrMemoryWords);
-    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 8u] =
-        rtrWfBudget("RTR_LIGHT_SPP");
-    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 9u] =
-        rtrWfBudget("RTR_GI_SPP");
 
     return 0;
 }
@@ -464,6 +466,25 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(activeCameraYaw);
     rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(cameraPitch);
     rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(cameraRadius);
+
+    uint32_t spp = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
+    uint32_t lightSpp = rtrEnvU32("RTR_LIGHT_SPP", 1u);
+    uint32_t giSpp = rtrEnvU32("RTR_GI_SPP", 1u);
+
+    if (rtrWindowed)
+        rtrWindowRenderSettings(&spp, &lightSpp, &giSpp);
+    if (spp < 1u) spp = 1u;
+    if (spp > rtrWaveCount) spp = rtrWaveCount;
+    lightSpp = lightSpp < 1u ? 1u : lightSpp;
+    giSpp = giSpp < 1u ? 1u : giSpp;
+    if (lightSpp > rtrWfBudgetCap("RTR_LIGHT_SPP"))
+        lightSpp = rtrWfBudgetCap("RTR_LIGHT_SPP");
+    if (giSpp > rtrWfBudgetCap("RTR_GI_SPP"))
+        giSpp = rtrWfBudgetCap("RTR_GI_SPP");
+
+    rtrMemoryWords[RTR_MEMORY_SPP_WORD] = spp;
+    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 8u] = lightSpp;
+    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 9u] = giSpp;
 }
 
 static void rtrUpdateMemory(void)
@@ -514,8 +535,8 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
     const uint32_t pixelGroupsY =
         (rtrSwapExtent.height + RTR_TILE_Y - 1u) / RTR_TILE_Y;
     const uint32_t pixels = rtrSwapExtent.width * rtrSwapExtent.height;
-    const uint32_t lightSpp = rtrWfBudget("RTR_LIGHT_SPP");
-    const uint32_t giSpp = rtrWfBudget("RTR_GI_SPP");
+    const uint32_t lightSpp = rtrWfBudgetCap("RTR_LIGHT_SPP");
+    const uint32_t giSpp = rtrWfBudgetCap("RTR_GI_SPP");
     const uint32_t shadowCap = lightSpp > giSpp ? lightSpp : giSpp;
     const uint32_t queueGroups =
         (pixels * giSpp + RTR_WF_QUEUE_GROUP_SIZE - 1u) /
@@ -523,10 +544,6 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
     const uint32_t shadowGroups =
         (pixels * shadowCap + RTR_WF_QUEUE_GROUP_SIZE - 1u) /
         RTR_WF_QUEUE_GROUP_SIZE;
-    uint32_t spp = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
-
-    if (spp < 1u) spp = 1u;
-    if (spp > 256u) spp = 256u;
 
     vkCmdBindDescriptorSets(commandBuffer,
                             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -543,7 +560,7 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
         return;
     }
 
-    for (uint32_t sample = 0u; sample < spp; sample++) {
+    for (uint32_t sample = 0u; sample < rtrWaveCount; sample++) {
         RTRPushConstants push = {sample, 0u, 0u};
 
         vkCmdPushConstants(commandBuffer, rtrPipelineLayout,
@@ -746,6 +763,18 @@ static void rtrReportGpuTiming(void)
 int rtrVulkanInit(void *windowSurface)
 {
     const uint32_t windowed = (uint32_t)(windowSurface != NULL);
+    uint32_t envSpp = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
+
+    if (envSpp < 1u) envSpp = 1u;
+    if (envSpp > 256u) envSpp = 256u;
+    rtrWindowed = windowed;
+    /* The windowed app prerecords enough sample waves for the 1-8 keys;
+     * waves past the runtime spp no-op in raygen. */
+    rtrWaveCount = envSpp;
+    if (windowed) {
+        if (rtrWaveCount < 4u) rtrWaveCount = 4u;
+        if (rtrWaveCount > 8u) rtrWaveCount = 8u;
+    }
     rtrTimingOut = windowed ? stdout : stderr;
     clock_gettime(CLOCK_MONOTONIC, &rtrStartTime);
     rtrFrameIndex = 0u;
