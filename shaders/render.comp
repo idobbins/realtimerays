@@ -651,9 +651,56 @@ const uint RTR_WF_WORD =
 const uint RTR_WF_RAY_COUNT_WORD = RTR_WF_WORD; /* + parity */
 const uint RTR_WF_SHADOW_COUNT_WORD = RTR_WF_WORD + 2u; /* + parity */
 const uint RTR_WF_DATA_WORD = RTR_WF_WORD + 16u;
-const uint RTR_WF_RAY_STRIDE = 9u;
+const uint RTR_WF_RAY_STRIDE = 6u;
 const uint RTR_WF_HIT_STRIDE = 2u;
-const uint RTR_WF_SHADOW_STRIDE = 10u;
+const uint RTR_WF_SHADOW_STRIDE = 7u;
+
+/* Octahedral direction encoding: queue records carry unit directions in
+ * one word. The ~2e-5 quantization acts as a vanishing extra jitter on
+ * directions that are stochastic to begin with; trace and shade decode
+ * the same word, so hit reconstruction stays consistent. */
+uint rtrPackDirection(vec3 d)
+{
+    vec2 p = d.xy / (abs(d.x) + abs(d.y) + abs(d.z));
+
+    if (d.z < 0.0)
+        p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0,
+                                     p.y >= 0.0 ? 1.0 : -1.0);
+    return packSnorm2x16(p);
+}
+
+vec3 rtrUnpackDirection(uint word)
+{
+    vec2 p = unpackSnorm2x16(word);
+    vec3 d = vec3(p, 1.0 - abs(p.x) - abs(p.y));
+
+    if (d.z < 0.0)
+        d.xy = (1.0 - abs(d.yx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0,
+                                        d.y >= 0.0 ? 1.0 : -1.0);
+    return normalize(d);
+}
+
+/* RGB9E5 shared-exponent packing: throughput and pending light fit one
+ * word with HDR range and 1/512 relative precision, which feeds half
+ * precision math downstream anyway. */
+uint rtrPackRgb9e5(vec3 c)
+{
+    float maxc = clamp(max(c.r, max(c.g, c.b)), 0.0, 65408.0);
+    int e = maxc <= 1.0e-8 ? -15 : clamp(int(floor(log2(maxc))) + 1, -15, 16);
+    uvec3 m = min(uvec3(max(c, vec3(0.0)) * exp2(float(9 - e)) + 0.5),
+                  uvec3(511u));
+
+    return m.r | (m.g << 9u) | (m.b << 18u) | (uint(e + 15) << 27u);
+}
+
+vec3 rtrUnpackRgb9e5(uint word)
+{
+    float scale = exp2(float(int((word >> 27u) & 31u) - 24));
+
+    return vec3(float(word & 511u),
+                float((word >> 9u) & 511u),
+                float((word >> 18u) & 511u)) * scale;
+}
 
 uint rtrWfAccumWord(uint pixel)
 {
@@ -668,14 +715,14 @@ uint rtrWfRayWord(uint parity, uint index)
 
 uint rtrWfHitWord(uint index)
 {
-    return RTR_WF_DATA_WORD + shPixels * 21u + index * RTR_WF_HIT_STRIDE;
+    return RTR_WF_DATA_WORD + shPixels * 15u + index * RTR_WF_HIT_STRIDE;
 }
 
 /* The shadow queue is parity-buffered so shadow(d) can run concurrently
  * with trace(d+1), which resets the other parity's counters. */
 uint rtrWfShadowWord(uint parity, uint index)
 {
-    return RTR_WF_DATA_WORD + shPixels * 23u +
+    return RTR_WF_DATA_WORD + shPixels * 17u +
         (parity * shPixels + index) * RTR_WF_SHADOW_STRIDE;
 }
 
@@ -695,12 +742,9 @@ void rtrWfStoreRay(uint word, vec3 ro, vec3 rd, f16vec3 throughput, uint pixel)
     rtrStoreF32(word, ro.x);
     rtrStoreF32(word + 1u, ro.y);
     rtrStoreF32(word + 2u, ro.z);
-    rtrStoreF32(word + 3u, rd.x);
-    rtrStoreF32(word + 4u, rd.y);
-    rtrStoreF32(word + 5u, rd.z);
-    rtrStoreU32(word + 6u, packHalf2x16(vec2(vec3(throughput).rg)));
-    rtrStoreU32(word + 7u, packHalf2x16(vec2(float(throughput.b), 0.0)));
-    rtrStoreU32(word + 8u, pixel);
+    rtrStoreU32(word + 3u, rtrPackDirection(rd));
+    rtrStoreU32(word + 4u, rtrPackRgb9e5(vec3(throughput)));
+    rtrStoreU32(word + 5u, pixel);
 }
 
 uint rtrWfSampleSalt(void)
@@ -902,28 +946,34 @@ void main()
 
 void main()
 {
-    if (gl_LocalInvocationIndex == 0u)
-        rtrInitShared();
-
-    barrier();
-
     uint index = gl_GlobalInvocationID.x;
+    uint count = rtrLoadU32(RTR_WF_RAY_COUNT_WORD + pc.parity);
 
     /* The queues shade will fill are reset here: nothing else touches
      * them during this dispatch (the concurrent shadow pass uses the
      * other shadow parity), and the inter-dispatch barrier orders the
-     * reset before shade's appends. */
+     * reset before shade's appends. The reset runs before the dead-group
+     * exit so an empty queue can never leave stale counts behind. */
     if (index == 0u) {
         rtrStoreU32(RTR_WF_RAY_COUNT_WORD + (pc.parity ^ 1u), 0u);
         rtrStoreU32(RTR_WF_SHADOW_COUNT_WORD + pc.parity, 0u);
     }
 
-    if (index >= rtrLoadU32(RTR_WF_RAY_COUNT_WORD + pc.parity))
+    /* Group-uniform exit: fully dead workgroups skip the shared init. */
+    if (gl_WorkGroupID.x * gl_WorkGroupSize.x >= count)
+        return;
+
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared();
+
+    barrier();
+
+    if (index >= count)
         return;
 
     uint w = rtrWfRayWord(pc.parity, index);
     vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
-    vec3 rd = vec3(rtrLoadF32(w + 3u), rtrLoadF32(w + 4u), rtrLoadF32(w + 5u));
+    vec3 rd = rtrUnpackDirection(rtrLoadU32(w + 3u));
     float maxT = pc.depth == 0u ? RTR_INF : float(RTR_INDIRECT_MAX_T);
     RTRVoxelHit hit;
     uint hitWord = rtrWfHitWord(index);
@@ -947,6 +997,13 @@ shared uint shWfOutBase;
 
 void main()
 {
+    uint index = gl_GlobalInvocationID.x;
+    uint count = rtrLoadU32(RTR_WF_RAY_COUNT_WORD + pc.parity);
+
+    /* Group-uniform exit: fully dead workgroups skip the shared init. */
+    if (gl_WorkGroupID.x * gl_WorkGroupSize.x >= count)
+        return;
+
     if (gl_LocalInvocationIndex == 0u) {
         rtrInitShared();
         shWfShadowCount = 0u;
@@ -956,8 +1013,6 @@ void main()
     barrier();
 
     const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
-    uint index = gl_GlobalInvocationID.x;
-    uint count = rtrLoadU32(RTR_WF_RAY_COUNT_WORD + pc.parity);
     bool valid = index < count;
     bool emitShadow = false;
     bool emitBounce = false;
@@ -973,13 +1028,11 @@ void main()
     if (valid) {
         uint w = rtrWfRayWord(pc.parity, index);
         vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
-        vec3 rd = vec3(rtrLoadF32(w + 3u), rtrLoadF32(w + 4u),
-                       rtrLoadF32(w + 5u));
+        vec3 rd = rtrUnpackDirection(rtrLoadU32(w + 3u));
         uint hitWord = rtrLoadU32(rtrWfHitWord(index));
 
-        throughput = f16vec3(vec3(unpackHalf2x16(rtrLoadU32(w + 6u)),
-                                  unpackHalf2x16(rtrLoadU32(w + 7u)).x));
-        pixel = rtrLoadU32(w + 8u);
+        throughput = f16vec3(rtrUnpackRgb9e5(rtrLoadU32(w + 4u)));
+        pixel = rtrLoadU32(w + 5u);
 
         if ((hitWord & 0x80000000u) == 0u) {
             f16vec3 skyContribution = throughput * rtrSky(rd);
@@ -1064,13 +1117,10 @@ void main()
         rtrStoreF32(w, shadowRo.x);
         rtrStoreF32(w + 1u, shadowRo.y);
         rtrStoreF32(w + 2u, shadowRo.z);
-        rtrStoreF32(w + 3u, shadowRd.x);
-        rtrStoreF32(w + 4u, shadowRd.y);
-        rtrStoreF32(w + 5u, shadowRd.z);
-        rtrStoreF32(w + 6u, shadowMaxT);
-        rtrStoreU32(w + 7u, packHalf2x16(vec2(vec3(pendingDirect).rg)));
-        rtrStoreU32(w + 8u, packHalf2x16(vec2(float(pendingDirect.b), 0.0)));
-        rtrStoreU32(w + 9u, pixel);
+        rtrStoreU32(w + 3u, rtrPackDirection(shadowRd));
+        rtrStoreF32(w + 4u, shadowMaxT);
+        rtrStoreU32(w + 5u, rtrPackRgb9e5(vec3(pendingDirect)));
+        rtrStoreU32(w + 6u, pixel);
     }
     if (emitBounce) {
         rtrWfStoreRay(rtrWfRayWord(pc.parity ^ 1u, shWfOutBase + bounceSlot),
@@ -1082,28 +1132,31 @@ void main()
 
 void main()
 {
+    uint index = gl_GlobalInvocationID.x;
+    uint count = rtrLoadU32(RTR_WF_SHADOW_COUNT_WORD + pc.parity);
+
+    /* Group-uniform exit: fully dead workgroups skip the shared init. */
+    if (gl_WorkGroupID.x * gl_WorkGroupSize.x >= count)
+        return;
+
     if (gl_LocalInvocationIndex == 0u)
         rtrInitShared();
 
     barrier();
 
-    uint index = gl_GlobalInvocationID.x;
-
-    if (index >= rtrLoadU32(RTR_WF_SHADOW_COUNT_WORD + pc.parity))
+    if (index >= count)
         return;
 
     uint w = rtrWfShadowWord(pc.parity, index);
     vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
-    vec3 rd = vec3(rtrLoadF32(w + 3u), rtrLoadF32(w + 4u), rtrLoadF32(w + 5u));
-    float maxT = rtrLoadF32(w + 6u);
+    vec3 rd = rtrUnpackDirection(rtrLoadU32(w + 3u));
+    float maxT = rtrLoadF32(w + 4u);
     RTRVoxelHit blocker;
 
     if (!rtrTraceVoxels(ro, rd, maxT, RTR_STAT_CLASS_SHADOW, blocker)) {
-        f16vec3 pendingDirect =
-            f16vec3(vec3(unpackHalf2x16(rtrLoadU32(w + 7u)),
-                         unpackHalf2x16(rtrLoadU32(w + 8u)).x));
+        f16vec3 pendingDirect = f16vec3(rtrUnpackRgb9e5(rtrLoadU32(w + 5u)));
 
-        rtrWfAccumAdd(rtrLoadU32(w + 9u), pendingDirect);
+        rtrWfAccumAdd(rtrLoadU32(w + 6u), pendingDirect);
     }
 }
 

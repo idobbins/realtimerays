@@ -106,7 +106,7 @@ enum {
 
 /* Wavefront queue sizing; strides must match shaders/render.comp. */
 #define RTR_WF_HEADER_WORDS 16u
-#define RTR_WF_PIXEL_WORDS 43u
+#define RTR_WF_PIXEL_WORDS 31u
 #define RTR_WF_QUEUE_GROUP_SIZE 128u
 /* Must match the RTR_BOUNCES default in shaders/render.comp. */
 #define RTR_HOST_BOUNCES 3u
