@@ -1,6 +1,20 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
+/* RTR_RENDER_PASS selects the kernel built from this file:
+ *   0  monolith path tracer (one dispatch per frame; RTR_WAVEFRONT=0)
+ *   1  wavefront ray generation (per pixel)
+ *   2  wavefront bounce-ray trace (per queued ray)
+ *   3  wavefront shade (per queued ray; emits shadow + next-bounce rays)
+ *   4  wavefront shadow trace (per queued shadow ray)
+ *   5  wavefront resolve (per pixel)
+ * The wavefront split exists because the monolith's register footprint
+ * pins compute occupancy at 4 simdgroups/core; small per-stage kernels
+ * get their own register allocation. */
+#ifndef RTR_RENDER_PASS
+#define RTR_RENDER_PASS 0
+#endif
+
 #ifndef RTR_BOUNCES
 #define RTR_BOUNCES 3
 #endif
@@ -23,16 +37,22 @@
 
 /* Profiling build: counts traversal work into header words so the host can
  * report where GPU time goes. Counter atomics skew timing, so stats builds
- * are for counts only, never for benchmarks. */
+ * are for counts only, never for benchmarks. Monolith pass only. */
 #ifndef RTR_STATS
 #define RTR_STATS 0
 #endif
 
+#define RTR_WF_WRITABLE (RTR_STATS || RTR_RENDER_PASS != 0)
+
+#if RTR_RENDER_PASS == 2 || RTR_RENDER_PASS == 3 || RTR_RENDER_PASS == 4
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = RTR_WG_X, local_size_y = RTR_WG_Y, local_size_z = 1) in;
+#endif
 
 layout(binding = 0, rgba8) uniform writeonly image2D rtrOutImage;
 
-#if RTR_STATS
+#if RTR_WF_WRITABLE
 layout(std430, binding = 1) restrict buffer RTRMemory {
     uint rtrMem[];
 };
@@ -42,11 +62,19 @@ layout(std430, binding = 1) restrict readonly buffer RTRMemory {
 };
 #endif
 
+#if RTR_RENDER_PASS != 0
+layout(push_constant) uniform RTRPush {
+    uint sampleIndex;
+    uint depth;
+    uint parity;
+} pc;
+#endif
+
 const uint RTR_STAT_CLASS_PRIMARY = 0u;
 const uint RTR_STAT_CLASS_SHADOW = 1u;
 const uint RTR_STAT_CLASS_BOUNCE = 2u;
 
-#if RTR_STATS
+#if RTR_STATS && RTR_RENDER_PASS == 0
 const uint RTR_STAT_COUNTERS = 12u;
 /* gStats index: 0-2 brick iters by class, 3-5 traversals by class,
  * 6 voxel iters, 7 jumps, 8 brick entries, 9 AABB rejects, 10 hits,
@@ -60,6 +88,8 @@ shared uint shStats[RTR_STAT_COUNTERS];
 #define RTR_STAT_ADD(slot)
 #endif
 
+const uint RTR_WIDTH_WORD = 2u;
+const uint RTR_HEIGHT_WORD = 3u;
 const uint RTR_SPP_WORD = 4u;
 const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
@@ -103,6 +133,8 @@ const float RTR_INDIRECT_LUMINANCE_CAP = 3.0;
 #endif
 
 shared uint shSpp;
+shared ivec2 shSize;
+shared uint shPixels;
 /* Per-frame sampling shift: every frame is an independent estimate (no
  * data is reused across frames), so estimator error boils like film grain
  * instead of freezing into a pattern on the screen or the surfaces. The
@@ -125,10 +157,9 @@ shared vec3 shRayDx;
 shared vec3 shRayDy;
 
 struct RTRVoxelHit {
-    bool hit;
     float t;
+    uint axis;
     ivec3 voxel;
-    vec3 normal;
 };
 
 uint rtrLoadU32(uint word)
@@ -140,6 +171,18 @@ float rtrLoadF32(uint word)
 {
     return uintBitsToFloat(rtrLoadU32(word));
 }
+
+#if RTR_WF_WRITABLE
+void rtrStoreU32(uint word, uint value)
+{
+    rtrMem[word] = value;
+}
+
+void rtrStoreF32(uint word, float value)
+{
+    rtrMem[word] = floatBitsToUint(value);
+}
+#endif
 
 uint rtrHashU32(uint value)
 {
@@ -164,7 +207,7 @@ vec2 rtrHashToUnit2(uint h)
 
 /* Shading state runs in half precision: colors and throughput tolerate it
  * easily, and on Apple GPUs halving those live ranges is register-file
- * relief that buys simdgroup occupancy. Geometry stays fp32. */
+ * relief. Geometry stays fp32. */
 f16vec3 rtrClampLuminance(f16vec3 color, float16_t cap)
 {
     float16_t luminance = dot(max(color, f16vec3(0.0)),
@@ -277,15 +320,17 @@ void rtrCamera(float cameraYaw,
     up = cross(right, forward);
 }
 
-void rtrInitShared(vec2 szf)
+void rtrInitShared(void)
 {
     float cameraYaw = rtrLoadF32(RTR_CAMERA_YAW_WORD);
     float cameraPitch = rtrLoadF32(RTR_CAMERA_PITCH_WORD);
     float cameraRadius = rtrLoadF32(RTR_CAMERA_RADIUS_WORD);
-    float invH = 1.0 / max(szf.y, 1.0);
     uint frameHash = rtrHashU32(rtrLoadU32(RTR_FRAME_WORD) * 0x9e3779b9u +
                                 0x85ebca6bu);
 
+    shSize = ivec2(int(rtrLoadU32(RTR_WIDTH_WORD)),
+                   int(rtrLoadU32(RTR_HEIGHT_WORD)));
+    shPixels = uint(shSize.x * shSize.y);
     shSpp = clamp(rtrLoadU32(RTR_SPP_WORD), 1u, 256u);
     shFrameRot = rtrHashToUnit2(frameHash);
     shFrameSalt = rtrHashU32(frameHash);
@@ -306,9 +351,11 @@ void rtrInitShared(vec2 szf)
     shInvVoxelSize = 1.0 / shVoxelSize;
     shBrickSize = shVoxelSize * float(RTR_BRICK_SIZE);
     shInvBrickSize = 1.0 / shBrickSize;
+
+    float invH = 1.0 / max(float(shSize.y), 1.0);
     shRayBase = shForward * RTR_FOCAL +
-                shRight * ((1.0 - szf.x) * invH) +
-                shUp * ((szf.y - 1.0) * invH);
+                shRight * ((1.0 - float(shSize.x)) * invH) +
+                shUp * ((float(shSize.y) - 1.0) * invH);
     shRayDx = shRight * (2.0 * invH);
     shRayDy = shUp * (-2.0 * invH);
 }
@@ -340,11 +387,20 @@ bool rtrBoxHit(vec3 ro, vec3 invRd, vec3 bmin, vec3 bmax, out float t0, out floa
     return t0 <= t1;
 }
 
+/* The hit normal is reconstructed from the stepped axis and the ray
+ * direction, so traversal carries one uint instead of a vec3. */
+vec3 rtrHitNormal(uint axis, vec3 rd)
+{
+    vec3 n = vec3(0.0);
+
+    n[axis] = rd[axis] >= 0.0 ? -1.0 : 1.0;
+    return n;
+}
+
 /* The ray is clipped to the brick's occupied-voxel AABB before any voxel
  * walk, so rays that merely graze a brick (e.g. skimming above the floor
  * layer) bail out on the slab test. The voxel DDA itself is select-based
- * rather than branch-based, and the entry face comes from the slab axes,
- * so the hit normal needs no per-step bookkeeping upstream. */
+ * rather than branch-based. */
 bool rtrTraceBrick(vec3 ro,
                    vec3 rd,
                    vec3 invRd,
@@ -385,7 +441,7 @@ bool rtrTraceBrick(vec3 ro,
     vec3 tMax = (brickMin + nextCell * shVoxelSize - ro) * invRd;
     bool ax = tLo.x >= tLo.y && tLo.x >= tLo.z;
     bool ay = !ax && tLo.y >= tLo.z;
-    vec3 sel = vec3(ax, ay, !(ax || ay));
+    uint axis = ax ? 0u : (ay ? 1u : 2u);
     float t = t0;
 
     for (uint i = 0u; i < 16u; i++) {
@@ -394,16 +450,17 @@ bool rtrTraceBrick(vec3 ro,
 
         RTR_STAT_ADD(6u);
         if (rtrMaskBit(mask, voxel)) {
-            hit.hit = true;
             hit.t = t;
+            hit.axis = axis;
             hit.voxel = brick * int(RTR_BRICK_SIZE) + voxel;
-            hit.normal = vec3(-stepDir) * sel;
             return true;
         }
 
         bool sx = tMax.x <= tMax.y && tMax.x <= tMax.z;
         bool sy = !sx && tMax.y <= tMax.z;
-        sel = vec3(sx, sy, !(sx || sy));
+        vec3 sel = vec3(sx, sy, !(sx || sy));
+
+        axis = sx ? 0u : (sy ? 1u : 2u);
         t = sx ? tMax.x : (sy ? tMax.y : tMax.z);
         tMax += sel * tDelta;
         voxel += ivec3(sel) * stepDir;
@@ -533,7 +590,7 @@ vec3 rtrCosineHemisphere(vec3 n, vec2 u)
  * its samples on the far side and doubles penumbra variance. The
  * 2(1-cosThetaMax)/R^2 weight reduces to 1/d^2 in the far field, so the
  * brightness matches the previous point-on-sphere estimator. The shadow
- * ray itself goes through the path loop's single traversal call site. */
+ * ray itself is traced by the caller. */
 bool rtrSampleLight(vec3 p, vec3 n, vec2 u,
                     out vec3 l, out float maxT, out float scale)
 {
@@ -565,10 +622,9 @@ bool rtrSampleLight(vec3 p, vec3 n, vec2 u,
 }
 
 /* Sampling rotations are hashed from the quantized hit position rather
- * than the pixel: the grain anchors to surfaces instead of the screen, so
- * it rides with geometry under camera motion. Cells are 1/16 voxel and
- * the point is inset along the normal so face samples never straddle a
- * cell boundary. */
+ * than the pixel: the grain anchors to surfaces instead of the screen.
+ * Cells are 1/16 voxel and the point is inset along the normal so face
+ * samples never straddle a cell boundary. */
 uint rtrHashPosition(vec3 p, vec3 n)
 {
     vec3 inset = p - n * (shVoxelSize.x * 0.03125);
@@ -577,17 +633,89 @@ uint rtrHashPosition(vec3 p, vec3 n)
     return rtrHashU32(uint(q.x * 73856093 ^ q.y * 19349663 ^ q.z * 83492791));
 }
 
-/* Bounce zero is stratified (it carries nearly all the variance); deeper
- * bounces use independent hashes of surface cell and sample index.
- * Reusing one stratified coordinate across bounce dimensions samples the
- * path integral along correlated diagonals and shows up as a systematic
- * energy error, not just noise. */
+vec2 rtrSampleHam(uint sampleIndex)
+{
+    return vec2((float(sampleIndex) + 0.5) / float(shSpp),
+                rtrRadicalInverse2(sampleIndex));
+}
+
+#if RTR_RENDER_PASS != 0
+/* Wavefront layout, appended to the buffer after the envmap. Counts live
+ * in a small header; per-pixel-capacity queues follow:
+ *   accum  3 words/pixel   fp32 radiance accumulator
+ *   rays   2 x 9 words     ping-pong bounce-ray queues
+ *   hits   2 words         hit records parallel to the consumed queue
+ *   shadow 10 words        shadow-ray queue */
+const uint RTR_WF_WORD =
+    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_WF_RAY_COUNT_WORD = RTR_WF_WORD; /* + parity */
+const uint RTR_WF_SHADOW_COUNT_WORD = RTR_WF_WORD + 2u; /* + parity */
+const uint RTR_WF_DATA_WORD = RTR_WF_WORD + 16u;
+const uint RTR_WF_RAY_STRIDE = 9u;
+const uint RTR_WF_HIT_STRIDE = 2u;
+const uint RTR_WF_SHADOW_STRIDE = 10u;
+
+uint rtrWfAccumWord(uint pixel)
+{
+    return RTR_WF_DATA_WORD + pixel * 3u;
+}
+
+uint rtrWfRayWord(uint parity, uint index)
+{
+    return RTR_WF_DATA_WORD + shPixels * 3u +
+        (parity * shPixels + index) * RTR_WF_RAY_STRIDE;
+}
+
+uint rtrWfHitWord(uint index)
+{
+    return RTR_WF_DATA_WORD + shPixels * 21u + index * RTR_WF_HIT_STRIDE;
+}
+
+/* The shadow queue is parity-buffered so shadow(d) can run concurrently
+ * with trace(d+1), which resets the other parity's counters. */
+uint rtrWfShadowWord(uint parity, uint index)
+{
+    return RTR_WF_DATA_WORD + shPixels * 23u +
+        (parity * shPixels + index) * RTR_WF_SHADOW_STRIDE;
+}
+
+/* Each pixel appears at most once per queue, so accumulation needs no
+ * atomics. */
+void rtrWfAccumAdd(uint pixel, f16vec3 c)
+{
+    uint w = rtrWfAccumWord(pixel);
+
+    rtrStoreF32(w, rtrLoadF32(w) + float(c.r));
+    rtrStoreF32(w + 1u, rtrLoadF32(w + 1u) + float(c.g));
+    rtrStoreF32(w + 2u, rtrLoadF32(w + 2u) + float(c.b));
+}
+
+void rtrWfStoreRay(uint word, vec3 ro, vec3 rd, f16vec3 throughput, uint pixel)
+{
+    rtrStoreF32(word, ro.x);
+    rtrStoreF32(word + 1u, ro.y);
+    rtrStoreF32(word + 2u, ro.z);
+    rtrStoreF32(word + 3u, rd.x);
+    rtrStoreF32(word + 4u, rd.y);
+    rtrStoreF32(word + 5u, rd.z);
+    rtrStoreU32(word + 6u, packHalf2x16(vec2(vec3(throughput).rg)));
+    rtrStoreU32(word + 7u, packHalf2x16(vec2(float(throughput.b), 0.0)));
+    rtrStoreU32(word + 8u, pixel);
+}
+
+uint rtrWfSampleSalt(void)
+{
+    return (pc.sampleIndex + 1u) * 0x9e3779b9u ^ shFrameSalt;
+}
+#endif
+
+#if RTR_RENDER_PASS == 0
+
 /* The path loop has exactly one rtrTraceVoxels call site, alternating
  * between bounce rays and shadow rays: each inlined traversal context
- * costs a register-allocation bracket (Metal pipeline probe: one site
- * 448 threads/threadgroup, two sites 384), and occupancy is the
- * renderer's measured limiter. Traversals stay whole calls -- flattening
- * them into a per-step state machine was tried and ran 2.5x slower. */
+ * costs a register-allocation bracket, and occupancy is the renderer's
+ * measured limiter. Traversals stay whole calls -- flattening them into a
+ * per-step state machine was tried and ran 2.5x slower. */
 vec3 rtrTracePath(vec3 ro, vec3 rd, vec2 ham, uint sampleSalt)
 {
     const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
@@ -631,7 +759,7 @@ vec3 rtrTracePath(vec3 ro, vec3 rd, vec2 ham, uint sampleSalt)
         }
 
         vec3 hitP = ro + rd * hit.t;
-        vec3 n = dot(hit.normal, rd) < 0.0 ? hit.normal : -hit.normal;
+        vec3 n = rtrHitNormal(hit.axis, rd);
         f16vec3 albedo = rtrVoxelAlbedo(hit.voxel, hitP, n);
         uint hashLight = rtrHashPosition(hitP, n);
         uint hashHemi = rtrHashU32(hashLight);
@@ -693,8 +821,7 @@ vec3 rtrRenderPixel(ivec2 p)
     vec3 color = vec3(0.0);
 
     for (uint sampleIndex = 0u; sampleIndex < shSpp; sampleIndex++) {
-        vec2 ham = vec2((float(sampleIndex) + 0.5) * invSpp,
-                        rtrRadicalInverse2(sampleIndex));
+        vec2 ham = rtrSampleHam(sampleIndex);
         vec3 rd = rtrRayForPixel(vec2(p) + fract(ham + rotPixel + shFrameRot));
 
         color += rtrTracePath(shRo, rd, ham,
@@ -707,10 +834,9 @@ vec3 rtrRenderPixel(ivec2 p)
 void main()
 {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(rtrOutImage);
 
     if (gl_LocalInvocationIndex == 0u)
-        rtrInitShared(vec2(sz));
+        rtrInitShared();
 
 #if RTR_STATS
     for (uint i = 0u; i < RTR_STAT_COUNTERS; i++)
@@ -721,7 +847,7 @@ void main()
 
     barrier();
 
-    if (all(lessThan(p, sz)))
+    if (all(lessThan(p, shSize)))
         imageStore(rtrOutImage, p, vec4(rtrTonemap(rtrRenderPixel(p)), 1.0));
 
 #if RTR_STATS
@@ -737,3 +863,269 @@ void main()
     }
 #endif
 }
+
+#elif RTR_RENDER_PASS == 1
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared();
+
+    barrier();
+
+    if (all(lessThan(p, shSize))) {
+        uint pixel = uint(p.y) * uint(shSize.x) + uint(p.x);
+        vec2 ham = rtrSampleHam(pc.sampleIndex);
+        uint h0 = rtrHashU32(uint(p.x) * 1973u ^ uint(p.y) * 9277u ^
+                             0x9e3779b9u);
+        vec2 rotPixel = rtrHashToUnit2(h0);
+        vec3 rd = rtrRayForPixel(vec2(p) + fract(ham + rotPixel + shFrameRot));
+
+        rtrWfStoreRay(rtrWfRayWord(0u, pixel), shRo, rd, f16vec3(1.0), pixel);
+
+        if (pc.sampleIndex == 0u) {
+            uint w = rtrWfAccumWord(pixel);
+
+            rtrStoreF32(w, 0.0);
+            rtrStoreF32(w + 1u, 0.0);
+            rtrStoreF32(w + 2u, 0.0);
+        }
+    }
+
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
+        rtrStoreU32(RTR_WF_RAY_COUNT_WORD, shPixels);
+}
+
+#elif RTR_RENDER_PASS == 2
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared();
+
+    barrier();
+
+    uint index = gl_GlobalInvocationID.x;
+
+    /* The queues shade will fill are reset here: nothing else touches
+     * them during this dispatch (the concurrent shadow pass uses the
+     * other shadow parity), and the inter-dispatch barrier orders the
+     * reset before shade's appends. */
+    if (index == 0u) {
+        rtrStoreU32(RTR_WF_RAY_COUNT_WORD + (pc.parity ^ 1u), 0u);
+        rtrStoreU32(RTR_WF_SHADOW_COUNT_WORD + pc.parity, 0u);
+    }
+
+    if (index >= rtrLoadU32(RTR_WF_RAY_COUNT_WORD + pc.parity))
+        return;
+
+    uint w = rtrWfRayWord(pc.parity, index);
+    vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
+    vec3 rd = vec3(rtrLoadF32(w + 3u), rtrLoadF32(w + 4u), rtrLoadF32(w + 5u));
+    float maxT = pc.depth == 0u ? RTR_INF : float(RTR_INDIRECT_MAX_T);
+    RTRVoxelHit hit;
+    uint hitWord = rtrWfHitWord(index);
+
+    if (rtrTraceVoxels(ro, rd, maxT, RTR_STAT_CLASS_PRIMARY, hit)) {
+        rtrStoreU32(hitWord, 0x80000000u | (hit.axis << 24u) |
+                    uint(hit.voxel.x) | (uint(hit.voxel.y) << 7u) |
+                    (uint(hit.voxel.z) << 14u));
+        rtrStoreU32(hitWord + 1u, floatBitsToUint(hit.t));
+    } else {
+        rtrStoreU32(hitWord, 0u);
+    }
+}
+
+#elif RTR_RENDER_PASS == 3
+
+shared uint shWfShadowCount;
+shared uint shWfShadowBase;
+shared uint shWfOutCount;
+shared uint shWfOutBase;
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u) {
+        rtrInitShared();
+        shWfShadowCount = 0u;
+        shWfOutCount = 0u;
+    }
+
+    barrier();
+
+    const vec2 hemiJitter = vec2(RTR_HEMI_JITTER_R, RTR_HEMI_JITTER_PHI);
+    uint index = gl_GlobalInvocationID.x;
+    uint count = rtrLoadU32(RTR_WF_RAY_COUNT_WORD + pc.parity);
+    bool valid = index < count;
+    bool emitShadow = false;
+    bool emitBounce = false;
+    uint pixel = 0u;
+    vec3 shadowRo = vec3(0.0);
+    vec3 shadowRd = vec3(0.0);
+    float shadowMaxT = 0.0;
+    f16vec3 pendingDirect = f16vec3(0.0);
+    vec3 nextRo = vec3(0.0);
+    vec3 nextRd = vec3(0.0);
+    f16vec3 throughput = f16vec3(0.0);
+
+    if (valid) {
+        uint w = rtrWfRayWord(pc.parity, index);
+        vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
+        vec3 rd = vec3(rtrLoadF32(w + 3u), rtrLoadF32(w + 4u),
+                       rtrLoadF32(w + 5u));
+        uint hitWord = rtrLoadU32(rtrWfHitWord(index));
+
+        throughput = f16vec3(vec3(unpackHalf2x16(rtrLoadU32(w + 6u)),
+                                  unpackHalf2x16(rtrLoadU32(w + 7u)).x));
+        pixel = rtrLoadU32(w + 8u);
+
+        if ((hitWord & 0x80000000u) == 0u) {
+            f16vec3 skyContribution = throughput * rtrSky(rd);
+
+            if (pc.depth > 0u)
+                skyContribution =
+                    rtrClampLuminance(skyContribution,
+                                      float16_t(RTR_INDIRECT_LUMINANCE_CAP));
+            rtrWfAccumAdd(pixel, skyContribution);
+        } else {
+            float t = uintBitsToFloat(rtrLoadU32(rtrWfHitWord(index) + 1u));
+            uint axis = (hitWord >> 24u) & 3u;
+            ivec3 voxel = ivec3(int(hitWord & 127u),
+                                int((hitWord >> 7u) & 127u),
+                                int((hitWord >> 14u) & 127u));
+            vec3 hitP = ro + rd * t;
+            vec3 n = rtrHitNormal(axis, rd);
+            f16vec3 albedo = rtrVoxelAlbedo(voxel, hitP, n);
+            uint hashLight = rtrHashPosition(hitP, n);
+            uint hashHemi = rtrHashU32(hashLight);
+            uint sampleSalt = rtrWfSampleSalt();
+            vec2 ham = rtrSampleHam(pc.sampleIndex);
+            vec2 uL = pc.depth == 0u ?
+                fract(ham + rtrHashToUnit2(hashLight) + shFrameRot) :
+                rtrHashToUnit2(rtrHashU32(hashLight ^ sampleSalt));
+            vec3 l;
+            float lightT;
+            float lightScale;
+            bool lit = rtrSampleLight(hitP, n, uL, l, lightT, lightScale);
+
+            pendingDirect = throughput * albedo *
+                f16vec3(RTR_LIGHT_COLOR * lightScale);
+            if (pc.depth > 0u)
+                pendingDirect =
+                    rtrClampLuminance(pendingDirect,
+                                      float16_t(RTR_INDIRECT_LUMINANCE_CAP));
+            throughput *= albedo;
+
+            if (pc.depth + 1u < RTR_PATH_BOUNCES) {
+                vec2 uH = pc.depth == 0u ?
+                    fract(ham + rtrHashToUnit2(hashHemi) * hemiJitter +
+                          shFrameRot) :
+                    rtrHashToUnit2(rtrHashU32(hashHemi ^ sampleSalt));
+
+                nextRo = hitP + n * RTR_EPS * 8.0;
+                nextRd = rtrCosineHemisphere(n, uH);
+                emitBounce = true;
+            }
+            if (lit) {
+                shadowRo = hitP + n * RTR_EPS * 8.0;
+                shadowRd = l;
+                shadowMaxT = lightT - RTR_EPS * 8.0;
+                emitShadow = true;
+            }
+        }
+    }
+
+    uint shadowSlot = 0u;
+    uint bounceSlot = 0u;
+
+    if (emitShadow)
+        shadowSlot = atomicAdd(shWfShadowCount, 1u);
+    if (emitBounce)
+        bounceSlot = atomicAdd(shWfOutCount, 1u);
+
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0u) {
+        shWfShadowBase = atomicAdd(rtrMem[RTR_WF_SHADOW_COUNT_WORD +
+                                          pc.parity],
+                                   shWfShadowCount);
+        shWfOutBase = atomicAdd(rtrMem[RTR_WF_RAY_COUNT_WORD +
+                                       (pc.parity ^ 1u)],
+                                shWfOutCount);
+    }
+
+    barrier();
+
+    if (emitShadow) {
+        uint w = rtrWfShadowWord(pc.parity, shWfShadowBase + shadowSlot);
+
+        rtrStoreF32(w, shadowRo.x);
+        rtrStoreF32(w + 1u, shadowRo.y);
+        rtrStoreF32(w + 2u, shadowRo.z);
+        rtrStoreF32(w + 3u, shadowRd.x);
+        rtrStoreF32(w + 4u, shadowRd.y);
+        rtrStoreF32(w + 5u, shadowRd.z);
+        rtrStoreF32(w + 6u, shadowMaxT);
+        rtrStoreU32(w + 7u, packHalf2x16(vec2(vec3(pendingDirect).rg)));
+        rtrStoreU32(w + 8u, packHalf2x16(vec2(float(pendingDirect.b), 0.0)));
+        rtrStoreU32(w + 9u, pixel);
+    }
+    if (emitBounce) {
+        rtrWfStoreRay(rtrWfRayWord(pc.parity ^ 1u, shWfOutBase + bounceSlot),
+                      nextRo, nextRd, throughput, pixel);
+    }
+}
+
+#elif RTR_RENDER_PASS == 4
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared();
+
+    barrier();
+
+    uint index = gl_GlobalInvocationID.x;
+
+    if (index >= rtrLoadU32(RTR_WF_SHADOW_COUNT_WORD + pc.parity))
+        return;
+
+    uint w = rtrWfShadowWord(pc.parity, index);
+    vec3 ro = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u));
+    vec3 rd = vec3(rtrLoadF32(w + 3u), rtrLoadF32(w + 4u), rtrLoadF32(w + 5u));
+    float maxT = rtrLoadF32(w + 6u);
+    RTRVoxelHit blocker;
+
+    if (!rtrTraceVoxels(ro, rd, maxT, RTR_STAT_CLASS_SHADOW, blocker)) {
+        f16vec3 pendingDirect =
+            f16vec3(vec3(unpackHalf2x16(rtrLoadU32(w + 7u)),
+                         unpackHalf2x16(rtrLoadU32(w + 8u)).x));
+
+        rtrWfAccumAdd(rtrLoadU32(w + 9u), pendingDirect);
+    }
+}
+
+#elif RTR_RENDER_PASS == 5
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+
+    if (gl_LocalInvocationIndex == 0u)
+        rtrInitShared();
+
+    barrier();
+
+    if (any(greaterThanEqual(p, shSize)))
+        return;
+
+    uint w = rtrWfAccumWord(uint(p.y) * uint(shSize.x) + uint(p.x));
+    vec3 color = vec3(rtrLoadF32(w), rtrLoadF32(w + 1u), rtrLoadF32(w + 2u)) *
+        (1.0 / float(shSpp));
+
+    imageStore(rtrOutImage, p, vec4(rtrTonemap(color), 1.0));
+}
+
+#endif

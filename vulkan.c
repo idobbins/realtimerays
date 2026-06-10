@@ -13,6 +13,11 @@
 #include <time.h>
 
 #include "render_comp_spv.h"
+#include "render_raygen_comp_spv.h"
+#include "render_trace_comp_spv.h"
+#include "render_shade_comp_spv.h"
+#include "render_shadow_comp_spv.h"
+#include "render_resolve_comp_spv.h"
 
 #define RTR_MAX_SWAP_IMAGES 3u
 #ifndef RTR_TILE_X
@@ -91,8 +96,26 @@ enum {
 
 enum {
     RTR_PIPELINE_RENDER,
+    RTR_PIPELINE_RAYGEN,
+    RTR_PIPELINE_TRACE,
+    RTR_PIPELINE_SHADE,
+    RTR_PIPELINE_SHADOW,
+    RTR_PIPELINE_RESOLVE,
     RTR_PIPELINE_COUNT,
 };
+
+/* Wavefront queue sizing; strides must match shaders/render.comp. */
+#define RTR_WF_HEADER_WORDS 16u
+#define RTR_WF_PIXEL_WORDS 43u
+#define RTR_WF_QUEUE_GROUP_SIZE 128u
+/* Must match the RTR_BOUNCES default in shaders/render.comp. */
+#define RTR_HOST_BOUNCES 3u
+
+typedef struct {
+    uint32_t sampleIndex;
+    uint32_t depth;
+    uint32_t parity;
+} RTRPushConstants;
 
 static const VkDescriptorSetLayoutBinding rtrDescriptorBindings[RTR_DESCRIPTOR_COUNT] = {
     {
@@ -340,9 +363,15 @@ static float rtrFrameSeconds(void)
 
 static int rtrCreateMemoryBuffer(void)
 {
+    const VkDeviceSize rtrWavefrontWords =
+        (VkDeviceSize)RTR_WF_HEADER_WORDS +
+        (VkDeviceSize)rtrSwapExtent.width *
+        (VkDeviceSize)rtrSwapExtent.height *
+        (VkDeviceSize)RTR_WF_PIXEL_WORDS;
     const VkDeviceSize rtrMemorySize =
         ((VkDeviceSize)RTR_MEMORY_HEADER_WORDS +
-         (VkDeviceSize)RTR_SCENE_WORDS) *
+         (VkDeviceSize)RTR_SCENE_WORDS +
+         rtrWavefrontWords) *
         (VkDeviceSize)sizeof(uint32_t);
     if (vkCreateBuffer(rtrDevice, &(VkBufferCreateInfo){
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -423,6 +452,34 @@ static void rtrUpdateMemory(void)
                         autoOrbit, cameraYaw, cameraPitch, cameraRadius);
 }
 
+static void rtrCmdComputeBarrier(VkCommandBuffer commandBuffer)
+{
+    vkCmdPipelineBarrier(commandBuffer,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0u,
+                         0u, NULL, 1u, &(VkBufferMemoryBarrier){
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = rtrMemoryBuffer,
+        .offset = 0u,
+        .size = VK_WHOLE_SIZE,
+    }, 0u, NULL);
+}
+
+static void rtrCmdDispatchPass(VkCommandBuffer commandBuffer,
+                               uint32_t pipeline,
+                               uint32_t groupsX,
+                               uint32_t groupsY)
+{
+    vkCmdBindPipeline(commandBuffer,
+                      VK_PIPELINE_BIND_POINT_COMPUTE,
+                      rtrPipelines[pipeline]);
+    vkCmdDispatch(commandBuffer, groupsX, groupsY, 1u);
+}
+
 static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                                  VkDescriptorSet descriptorSet)
 {
@@ -430,6 +487,13 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
         (rtrSwapExtent.width + RTR_TILE_X - 1u) / RTR_TILE_X;
     const uint32_t pixelGroupsY =
         (rtrSwapExtent.height + RTR_TILE_Y - 1u) / RTR_TILE_Y;
+    const uint32_t pixels = rtrSwapExtent.width * rtrSwapExtent.height;
+    const uint32_t queueGroups =
+        (pixels + RTR_WF_QUEUE_GROUP_SIZE - 1u) / RTR_WF_QUEUE_GROUP_SIZE;
+    uint32_t spp = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
+
+    if (spp < 1u) spp = 1u;
+    if (spp > 256u) spp = 256u;
 
     vkCmdBindDescriptorSets(commandBuffer,
                             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -440,10 +504,55 @@ static void rtrCmdDispatchRender(VkCommandBuffer commandBuffer,
                             0u,
                             NULL);
 
-    vkCmdBindPipeline(commandBuffer,
-                      VK_PIPELINE_BIND_POINT_COMPUTE,
-                      rtrPipelines[RTR_PIPELINE_RENDER]);
-    vkCmdDispatch(commandBuffer, pixelGroupsX, pixelGroupsY, 1u);
+    if (!rtrEnvU32("RTR_WAVEFRONT", 1u)) {
+        rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_RENDER,
+                           pixelGroupsX, pixelGroupsY);
+        return;
+    }
+
+    for (uint32_t sample = 0u; sample < spp; sample++) {
+        RTRPushConstants push = {sample, 0u, 0u};
+
+        vkCmdPushConstants(commandBuffer, rtrPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT,
+                           0u, sizeof(push), &push);
+        rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_RAYGEN,
+                           pixelGroupsX, pixelGroupsY);
+        rtrCmdComputeBarrier(commandBuffer);
+        rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_TRACE,
+                           queueGroups, 1u);
+        rtrCmdComputeBarrier(commandBuffer);
+
+        /* shadow(d) and trace(d+1) are dispatched back to back with no
+         * barrier: they touch disjoint queues (the shadow queue is
+         * parity-buffered), so they overlap and fill each other's
+         * pipeline tails. */
+        for (uint32_t depth = 0u; depth < RTR_HOST_BOUNCES; depth++) {
+            push.depth = depth;
+            push.parity = depth & 1u;
+            vkCmdPushConstants(commandBuffer, rtrPipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT,
+                               0u, sizeof(push), &push);
+            rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_SHADE,
+                               queueGroups, 1u);
+            rtrCmdComputeBarrier(commandBuffer);
+            rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_SHADOW,
+                               queueGroups, 1u);
+            if (depth + 1u < RTR_HOST_BOUNCES) {
+                push.depth = depth + 1u;
+                push.parity = (depth + 1u) & 1u;
+                vkCmdPushConstants(commandBuffer, rtrPipelineLayout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT,
+                                   0u, sizeof(push), &push);
+                rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_TRACE,
+                                   queueGroups, 1u);
+            }
+            rtrCmdComputeBarrier(commandBuffer);
+        }
+    }
+
+    rtrCmdDispatchPass(commandBuffer, RTR_PIPELINE_RESOLVE,
+                       pixelGroupsX, pixelGroupsY);
 }
 
 static int rtrCreateTimingQueryPool(void)
@@ -803,13 +912,29 @@ int rtrVulkanInit(void *windowSurface)
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1u,
         .pSetLayouts = &rtrDescriptorSetLayout,
+        .pushConstantRangeCount = 1u,
+        .pPushConstantRanges = &(VkPushConstantRange){
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0u,
+            .size = sizeof(RTRPushConstants),
+        },
     }, NULL, &rtrPipelineLayout);
 
     const uint32_t *const shaderWords[RTR_PIPELINE_COUNT] = {
         (const uint32_t *)(const void *)renderCompSpv,
+        (const uint32_t *)(const void *)renderRaygenCompSpv,
+        (const uint32_t *)(const void *)renderTraceCompSpv,
+        (const uint32_t *)(const void *)renderShadeCompSpv,
+        (const uint32_t *)(const void *)renderShadowCompSpv,
+        (const uint32_t *)(const void *)renderResolveCompSpv,
     };
     const size_t shaderSizes[RTR_PIPELINE_COUNT] = {
         renderCompSpv_len,
+        renderRaygenCompSpv_len,
+        renderTraceCompSpv_len,
+        renderShadeCompSpv_len,
+        renderShadowCompSpv_len,
+        renderResolveCompSpv_len,
     };
 
     for (uint32_t pipeline = 0u; pipeline < RTR_PIPELINE_COUNT; pipeline++) {

@@ -70,8 +70,28 @@ build $build_dir/render.comp.spv: glslc shaders/render.comp || $build_dir/.dir
   pass = 0
 build $build_dir/render_comp_spv.h: xxd $build_dir/render.comp.spv || $build_dir/.dir
   name = renderCompSpv
+build $build_dir/render_raygen.comp.spv: glslc shaders/render.comp || $build_dir/.dir
+  pass = 1
+build $build_dir/render_raygen_comp_spv.h: xxd $build_dir/render_raygen.comp.spv || $build_dir/.dir
+  name = renderRaygenCompSpv
+build $build_dir/render_trace.comp.spv: glslc shaders/render.comp || $build_dir/.dir
+  pass = 2
+build $build_dir/render_trace_comp_spv.h: xxd $build_dir/render_trace.comp.spv || $build_dir/.dir
+  name = renderTraceCompSpv
+build $build_dir/render_shade.comp.spv: glslc shaders/render.comp || $build_dir/.dir
+  pass = 3
+build $build_dir/render_shade_comp_spv.h: xxd $build_dir/render_shade.comp.spv || $build_dir/.dir
+  name = renderShadeCompSpv
+build $build_dir/render_shadow.comp.spv: glslc shaders/render.comp || $build_dir/.dir
+  pass = 4
+build $build_dir/render_shadow_comp_spv.h: xxd $build_dir/render_shadow.comp.spv || $build_dir/.dir
+  name = renderShadowCompSpv
+build $build_dir/render_resolve.comp.spv: glslc shaders/render.comp || $build_dir/.dir
+  pass = 5
+build $build_dir/render_resolve_comp_spv.h: xxd $build_dir/render_resolve.comp.spv || $build_dir/.dir
+  name = renderResolveCompSpv
 build $build_dir/main.o: cc main.c || $build_dir/.dir
-build $build_dir/vulkan.o: cc vulkan.c | $build_dir/render_comp_spv.h || $build_dir/.dir
+build $build_dir/vulkan.o: cc vulkan.c | $build_dir/render_comp_spv.h $build_dir/render_raygen_comp_spv.h $build_dir/render_trace_comp_spv.h $build_dir/render_shade_comp_spv.h $build_dir/render_shadow_comp_spv.h $build_dir/render_resolve_comp_spv.h || $build_dir/.dir
 build $build_dir/scene.o: cc scene.c || $build_dir/.dir
 build $build_dir/macos.o: objc macos.m || $build_dir/.dir
 build $build_dir/correctness_check.o: cc tools/correctness_check.c || $build_dir/.dir
