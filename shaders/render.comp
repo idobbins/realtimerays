@@ -340,7 +340,9 @@ void rtrCamera(float cameraYaw,
     float radius = max(cameraRadius, 1.0);
     float horizontalRadius = cos(pitch) * radius;
     float targetY = shSceneKind == RTR_SCENE_KIND_CASTLE ?
-        RTR_CAMERA_CASTLE_TARGET_Y : RTR_CAMERA_FOREST_TARGET_Y;
+        RTR_CAMERA_CASTLE_TARGET_Y :
+        (shSceneKind == RTR_SCENE_KIND_CITY100K ?
+         RTR_CAMERA_CITY100K_TARGET_Y : RTR_CAMERA_FOREST_TARGET_Y);
     vec3 target = vec3(0.0, targetY, 0.0);
     ro = target +
          vec3(sin(angle) * horizontalRadius, sin(pitch) * radius,
@@ -599,10 +601,43 @@ f16vec3 rtrCastleVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
     return f16vec3(base * (0.88 + jitter * 0.12));
 }
 
+f16vec3 rtrCity100kVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
+{
+    if (voxel.y == 0)
+        return rtrFloorAlbedo(p);
+
+    uint h = rtrHashU32(uint(voxel.x * 73856093 ^
+                            voxel.y * 19349663 ^
+                            voxel.z * 83492791));
+    float jitter = float(h & 0xffffu) * (1.0 / 65535.0);
+    uint material = rtrVoxelMaterial(voxel);
+
+    if (material == RTR_MATERIAL_WOOD) {
+        vec3 copper = mix(vec3(0.42, 0.16, 0.045),
+                          vec3(0.78, 0.43, 0.11), jitter);
+        return f16vec3(mix(copper, vec3(0.90, 0.68, 0.24),
+                            max(n.y, 0.0) * 0.32));
+    }
+
+    int facadeCoord = abs(n.x) > abs(n.z) ? voxel.z : voxel.x;
+    float verticalFace = 1.0 - abs(n.y);
+    float window = verticalFace *
+        float((voxel.y % 5) == 2 || (voxel.y % 5) == 3) *
+        float((facadeCoord % 4) == 1 || (facadeCoord % 4) == 2);
+    vec3 concrete = mix(vec3(0.20, 0.23, 0.29),
+                        vec3(0.42, 0.46, 0.52), jitter * 0.65);
+    vec3 glass = mix(vec3(0.08, 0.24, 0.34),
+                     vec3(0.30, 0.57, 0.68), jitter);
+
+    return f16vec3(mix(concrete, glass, window * 0.72));
+}
+
 f16vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
 {
     if (shSceneKind == RTR_SCENE_KIND_CASTLE)
         return rtrCastleVoxelAlbedo(voxel, p, n);
+    if (shSceneKind == RTR_SCENE_KIND_CITY100K)
+        return rtrCity100kVoxelAlbedo(voxel, p, n);
 
     uint material = rtrVoxelMaterial(voxel);
     uint h = rtrHashU32(uint(voxel.x * 73856093 ^

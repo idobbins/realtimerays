@@ -269,6 +269,63 @@ static void rtrBuildCastleScene(uint8_t *voxels)
         rtrFillCastleBox(voxels, 22, 3, z, 26, 7, z + 3);
 }
 
+/* Each tower is a one-voxel 16x16 shell with a full roof, a two-voxel
+ * doorway, and a one-voxel antenna. The heights sum to 1,162, so the
+ * towers contain 60 * 1,162 + 195 * 24 = 74,400 voxels above a full
+ * 25,600-voxel ground plane. */
+static void rtrBuildCity100kScene(uint8_t *voxels)
+{
+    static const uint8_t towerHeights[4][6] = {
+        {38u, 42u, 47u, 51u, 44u, 40u},
+        {45u, 52u, 58u, 62u, 55u, 47u},
+        {47u, 55u, 62u, 58u, 52u, 45u},
+        {40u, 44u, 51u, 47u, 42u, 38u},
+    };
+
+    memset(voxels, 0, RTR_SCENE_VOXEL_COUNT);
+    rtrFillBoxMaterial(voxels,
+                       0, 0, 0,
+                       (int32_t)RTR_SCENE_VOXEL_GRID_X - 1,
+                       0,
+                       (int32_t)RTR_SCENE_VOXEL_GRID_Z - 1,
+                       (uint8_t)RTR_CELL_GROUND);
+
+    for (int32_t row = 0; row < 4; row++) {
+        for (int32_t column = 0; column < 6; column++) {
+            const int32_t x0 = 12 + column * 24;
+            const int32_t z0 = 24 + row * 32;
+            const int32_t height = towerHeights[row][column];
+
+            rtrFillBoxMaterial(voxels,
+                               x0, 1, z0,
+                               x0, height, z0 + 15,
+                               (uint8_t)RTR_CELL_STONE);
+            rtrFillBoxMaterial(voxels,
+                               x0 + 15, 1, z0,
+                               x0 + 15, height, z0 + 15,
+                               (uint8_t)RTR_CELL_STONE);
+            rtrFillBoxMaterial(voxels,
+                               x0 + 1, 1, z0,
+                               x0 + 14, height, z0,
+                               (uint8_t)RTR_CELL_STONE);
+            rtrFillBoxMaterial(voxels,
+                               x0 + 1, 1, z0 + 15,
+                               x0 + 14, height, z0 + 15,
+                               (uint8_t)RTR_CELL_STONE);
+            rtrFillBoxMaterial(voxels,
+                               x0, height, z0,
+                               x0 + 15, height, z0 + 15,
+                               (uint8_t)RTR_CELL_WOOD);
+            rtrClearBox(voxels,
+                        x0 + 7, 1, z0,
+                        x0 + 7, 2, z0);
+            rtrPutCell(voxels,
+                       x0 + 7, height + 1, z0 + 7,
+                       (uint8_t)RTR_CELL_WOOD);
+        }
+    }
+}
+
 typedef struct {
     int32_t x;
     int32_t z;
@@ -970,7 +1027,8 @@ void rtrSceneBuild(uint32_t *words, uint32_t sceneKind)
     uint8_t *voxels = (uint8_t *)malloc(RTR_SCENE_VOXEL_COUNT);
     uint32_t brickCount = 0u;
 
-    if (sceneKind != RTR_SCENE_KIND_CASTLE)
+    if (sceneKind != RTR_SCENE_KIND_CASTLE &&
+        sceneKind != RTR_SCENE_KIND_CITY100K)
         sceneKind = RTR_SCENE_KIND_FOREST;
     words[RTR_SCENE_BRICK_COUNT_WORD] = 0u;
     words[RTR_SCENE_BRICK_GRID_X_WORD] = RTR_SCENE_BRICK_GRID_X;
@@ -988,6 +1046,8 @@ void rtrSceneBuild(uint32_t *words, uint32_t sceneKind)
 
     if (sceneKind == RTR_SCENE_KIND_CASTLE)
         rtrBuildCastleScene(voxels);
+    else if (sceneKind == RTR_SCENE_KIND_CITY100K)
+        rtrBuildCity100kScene(voxels);
     else
         rtrBuildForestScene(voxels);
     brickCount = rtrStoreVoxelBricks(words, voxels);
@@ -997,11 +1057,17 @@ void rtrSceneBuild(uint32_t *words, uint32_t sceneKind)
     free(voxels);
 }
 
+uint32_t rtrSceneKindFromName(const char *scene)
+{
+    if (scene && strcmp(scene, "castle") == 0)
+        return RTR_SCENE_KIND_CASTLE;
+    if (scene && (strcmp(scene, "city100k") == 0 ||
+                  strcmp(scene, "100k") == 0))
+        return RTR_SCENE_KIND_CITY100K;
+    return RTR_SCENE_KIND_FOREST;
+}
+
 void rtrScene(uint32_t *words)
 {
-    const char *scene = getenv("RTR_SCENE");
-    const uint32_t sceneKind = scene && strcmp(scene, "castle") == 0 ?
-        RTR_SCENE_KIND_CASTLE : RTR_SCENE_KIND_FOREST;
-
-    rtrSceneBuild(words, sceneKind);
+    rtrSceneBuild(words, rtrSceneKindFromName(getenv("RTR_SCENE")));
 }

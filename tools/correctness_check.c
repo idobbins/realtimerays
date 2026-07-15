@@ -10,12 +10,14 @@
 #define RTR_CHECK_GUARD_WORDS 32u
 #define RTR_CHECK_FOREST_HASH UINT64_C(0x47628b2a6883fe07)
 #define RTR_CHECK_CASTLE_HASH UINT64_C(0x1f8f56b48167f060)
+#define RTR_CHECK_CITY100K_HASH UINT64_C(0x5242fe6f07e5358f)
 
 #if RTR_LAYOUT_SCENE_KIND_WORD != 31u
 #error "scene kind collides with live configuration or profiling header words"
 #endif
 
 void rtrSceneBuild(uint32_t *words, uint32_t sceneKind);
+uint32_t rtrSceneKindFromName(const char *scene);
 
 static float rtrCheckLoadF32(const uint32_t *words, uint32_t word)
 {
@@ -104,6 +106,20 @@ static int rtrCheckHitPacking(void)
                 return 1;
             }
         }
+    }
+    return 0;
+}
+
+static int rtrCheckSceneNames(void)
+{
+    if (rtrSceneKindFromName(NULL) != RTR_SCENE_KIND_FOREST ||
+        rtrSceneKindFromName("forest") != RTR_SCENE_KIND_FOREST ||
+        rtrSceneKindFromName("unknown") != RTR_SCENE_KIND_FOREST ||
+        rtrSceneKindFromName("castle") != RTR_SCENE_KIND_CASTLE ||
+        rtrSceneKindFromName("city100k") != RTR_SCENE_KIND_CITY100K ||
+        rtrSceneKindFromName("100k") != RTR_SCENE_KIND_CITY100K) {
+        fprintf(stderr, "correctness: scene name parsing failed\n");
+        return 1;
     }
     return 0;
 }
@@ -406,6 +422,20 @@ static int rtrCheckScene(uint32_t sceneKind,
                     materialCounts[2], materialCounts[3]);
             failed = 1;
         }
+    } else if (sceneKind == RTR_SCENE_KIND_CITY100K) {
+        if (brickCount != 5064u || occupiedVoxels != 100000u ||
+            materialCounts[RTR_MATERIAL_GROUND] != 25600u ||
+            materialCounts[RTR_MATERIAL_WOOD] != 6168u ||
+            materialCounts[RTR_MATERIAL_FOLIAGE] != 0u ||
+            materialCounts[RTR_MATERIAL_STONE] != 68232u ||
+            maxOccupiedY != 63u) {
+            fprintf(stderr,
+                    "correctness: city100k regression bricks=%u voxels=%u max_y=%u mats=%u/%u/%u/%u\n",
+                    brickCount, occupiedVoxels, maxOccupiedY,
+                    materialCounts[0], materialCounts[1],
+                    materialCounts[2], materialCounts[3]);
+            failed = 1;
+        }
     } else {
         if (brickCount < 2300u || brickCount > 3000u ||
             occupiedVoxels < 40000u || occupiedVoxels > 65000u ||
@@ -440,18 +470,21 @@ static int rtrCheckScene(uint32_t sceneKind,
     return failed;
 }
 
-static int rtrCheckForestDeterminism(uint64_t referenceHash)
+static int rtrCheckSceneDeterminism(uint32_t sceneKind,
+                                    const char *name,
+                                    uint64_t referenceHash)
 {
     uint32_t *words = (uint32_t *)calloc((size_t)RTR_LAYOUT_WF_WORD,
                                         sizeof(*words));
     uint64_t hash;
 
     if (!words) return 1;
-    rtrSceneBuild(words, RTR_SCENE_KIND_FOREST);
+    rtrSceneBuild(words, sceneKind);
     hash = rtrCheckGeometryHash(words);
     free(words);
     if (hash != referenceHash) {
-        fprintf(stderr, "correctness: forest generation is not deterministic\n");
+        fprintf(stderr, "correctness: %s generation is not deterministic\n",
+                name);
         return 1;
     }
     return 0;
@@ -473,15 +506,24 @@ int main(void)
 {
     uint64_t forestHash = 0u;
     uint64_t castleHash = 0u;
+    uint64_t city100kHash = 0u;
     int failed = 0;
 
     failed |= rtrCheckHitPacking();
+    failed |= rtrCheckSceneNames();
     failed |= rtrCheckScene(RTR_SCENE_KIND_FOREST, "forest", &forestHash);
-    failed |= rtrCheckForestDeterminism(forestHash);
+    failed |= rtrCheckSceneDeterminism(RTR_SCENE_KIND_FOREST,
+                                       "forest", forestHash);
     failed |= rtrCheckGeometryRegression("forest", forestHash,
                                          RTR_CHECK_FOREST_HASH);
     failed |= rtrCheckScene(RTR_SCENE_KIND_CASTLE, "castle", &castleHash);
     failed |= rtrCheckGeometryRegression("castle", castleHash,
                                          RTR_CHECK_CASTLE_HASH);
+    failed |= rtrCheckScene(RTR_SCENE_KIND_CITY100K,
+                            "city100k", &city100kHash);
+    failed |= rtrCheckSceneDeterminism(RTR_SCENE_KIND_CITY100K,
+                                       "city100k", city100kHash);
+    failed |= rtrCheckGeometryRegression("city100k", city100kHash,
+                                         RTR_CHECK_CITY100K_HASH);
     return failed ? 1 : 0;
 }

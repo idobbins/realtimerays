@@ -56,6 +56,7 @@
 #define RTR_LAYOUT_SCENE_KIND_WORD 31u
 #define RTR_SCENE_KIND_FOREST 0u
 #define RTR_SCENE_KIND_CASTLE 1u
+#define RTR_SCENE_KIND_CITY100K 2u
 
 /* Packed GPU material IDs. CPU staging cells use these values plus one so
  * zero can continue to mean empty. */

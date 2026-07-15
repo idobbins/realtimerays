@@ -198,22 +198,32 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
     return end != value ? (uint32_t)parsed : fallback;
 }
 
-static uint32_t rtrCastleSceneActive(void)
+static uint32_t rtrActiveSceneKind(void)
 {
-    return rtrMemoryWords &&
-        rtrMemoryWords[RTR_LAYOUT_SCENE_KIND_WORD] == RTR_SCENE_KIND_CASTLE;
+    return rtrMemoryWords ? rtrMemoryWords[RTR_LAYOUT_SCENE_KIND_WORD] :
+        RTR_SCENE_KIND_FOREST;
 }
 
 static float rtrDefaultCameraPitch(void)
 {
-    return rtrCastleSceneActive() ? RTR_CAMERA_CASTLE_DEFAULT_PITCH :
-        RTR_CAMERA_FOREST_DEFAULT_PITCH;
+    const uint32_t sceneKind = rtrActiveSceneKind();
+
+    if (sceneKind == RTR_SCENE_KIND_CASTLE)
+        return RTR_CAMERA_CASTLE_DEFAULT_PITCH;
+    if (sceneKind == RTR_SCENE_KIND_CITY100K)
+        return RTR_CAMERA_CITY100K_DEFAULT_PITCH;
+    return RTR_CAMERA_FOREST_DEFAULT_PITCH;
 }
 
 static float rtrDefaultCameraRadius(void)
 {
-    return rtrCastleSceneActive() ? RTR_CAMERA_CASTLE_DEFAULT_RADIUS :
-        RTR_CAMERA_FOREST_DEFAULT_RADIUS;
+    const uint32_t sceneKind = rtrActiveSceneKind();
+
+    if (sceneKind == RTR_SCENE_KIND_CASTLE)
+        return RTR_CAMERA_CASTLE_DEFAULT_RADIUS;
+    if (sceneKind == RTR_SCENE_KIND_CITY100K)
+        return RTR_CAMERA_CITY100K_DEFAULT_RADIUS;
+    return RTR_CAMERA_FOREST_DEFAULT_RADIUS;
 }
 
 /* Decoupled first-hit sample budgets (wavefront only): RTR_LIGHT_SPP

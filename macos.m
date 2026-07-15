@@ -4,9 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <string.h>
 
 #include "camera_defaults.h"
+#include "scene_layout.h"
+
+uint32_t rtrSceneKindFromName(const char *scene);
 
 #define RTR_CAMERA_DEFAULT_PITCH RTR_CAMERA_FOREST_DEFAULT_PITCH
 #define RTR_CAMERA_DEFAULT_RADIUS RTR_CAMERA_FOREST_DEFAULT_RADIUS
@@ -115,10 +117,13 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     rtrMouseX = -1.0f;
     rtrMouseY = -1.0f;
     rtrCameraYaw = RTR_CAMERA_DEFAULT_YAW;
-    const char *scene = getenv("RTR_SCENE");
-    if (scene && strcmp(scene, "castle") == 0) {
+    const uint32_t sceneKind = rtrSceneKindFromName(getenv("RTR_SCENE"));
+    if (sceneKind == RTR_SCENE_KIND_CASTLE) {
         rtrCameraPitch = RTR_CAMERA_CASTLE_DEFAULT_PITCH;
         rtrCameraRadius = RTR_CAMERA_CASTLE_DEFAULT_RADIUS;
+    } else if (sceneKind == RTR_SCENE_KIND_CITY100K) {
+        rtrCameraPitch = RTR_CAMERA_CITY100K_DEFAULT_PITCH;
+        rtrCameraRadius = RTR_CAMERA_CITY100K_DEFAULT_RADIUS;
     } else {
         rtrCameraPitch = RTR_CAMERA_FOREST_DEFAULT_PITCH;
         rtrCameraRadius = RTR_CAMERA_FOREST_DEFAULT_RADIUS;
