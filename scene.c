@@ -7,6 +7,9 @@
 #ifndef RTR_SCENE_HDRI_PATH
 #define RTR_SCENE_HDRI_PATH "assets/hdri/spaichingen_hill_1024x512_rgba16f.bin"
 #endif
+#ifndef RTR_SCENE_BLUE_NOISE_PATH
+#define RTR_SCENE_BLUE_NOISE_PATH "assets/blue_noise/spp1_128x128x8.bin"
+#endif
 
 #define RTR_SCENE_BRICK_SIZE 4u
 #define RTR_SCENE_BRICK_GRID_X 32u
@@ -31,6 +34,7 @@
 #define RTR_SCENE_ENVMAP_WIDTH 1024u
 #define RTR_SCENE_ENVMAP_HEIGHT 512u
 #define RTR_SCENE_ENVMAP_WORDS (RTR_SCENE_ENVMAP_WIDTH * RTR_SCENE_ENVMAP_HEIGHT * 2u)
+#define RTR_SCENE_BLUE_NOISE_WORDS (128u * 128u * 2u)
 
 enum {
     RTR_SCENE_BRICK_COUNT_WORD = 8,
@@ -45,6 +49,8 @@ enum {
     RTR_SCENE_ENVMAP_WORD =
         RTR_SCENE_VOXEL_BRICK_WORD +
         RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS,
+    RTR_SCENE_BLUE_NOISE_WORD =
+        RTR_SCENE_ENVMAP_WORD + RTR_SCENE_ENVMAP_WORDS,
 };
 
 static uint32_t rtrF32Word(float value)
@@ -309,6 +315,33 @@ static void rtrStoreEnvironment(uint32_t *words)
                             RTR_SCENE_ENVMAP_WORDS);
 }
 
+static void rtrStoreBlueNoise(uint32_t *words)
+{
+    FILE *file = fopen(RTR_SCENE_BLUE_NOISE_PATH, "rb");
+    size_t readCount = 0u;
+
+    if (file) {
+        readCount = fread(words + RTR_SCENE_BLUE_NOISE_WORD,
+                          sizeof(uint32_t),
+                          RTR_SCENE_BLUE_NOISE_WORDS,
+                          file);
+        fclose(file);
+    }
+    if (readCount == RTR_SCENE_BLUE_NOISE_WORDS) return;
+
+    fprintf(stderr, "scene: failed to read %s, using hashed samples\n",
+            RTR_SCENE_BLUE_NOISE_PATH);
+    for (uint32_t i = 0u; i < RTR_SCENE_BLUE_NOISE_WORDS; i++) {
+        uint32_t x = i + 0x9e3779b9u;
+
+        x ^= x >> 16u;
+        x *= 0x7feb352du;
+        x ^= x >> 15u;
+        x *= 0x846ca68bu;
+        words[RTR_SCENE_BLUE_NOISE_WORD + i] = x ^ (x >> 16u);
+    }
+}
+
 static void rtrStoreSceneBounds(uint32_t *words)
 {
     const float extentX = (float)RTR_SCENE_VOXEL_GRID_X * RTR_SCENE_VOXEL_SIZE;
@@ -496,6 +529,7 @@ void rtrScene(uint32_t *words)
     words[RTR_SCENE_BRICK_GRID_Y_WORD] = RTR_SCENE_BRICK_GRID_Y;
     words[RTR_SCENE_BRICK_GRID_Z_WORD] = RTR_SCENE_BRICK_GRID_Z;
     rtrStoreSceneBounds(words);
+    rtrStoreBlueNoise(words);
 
     if (!voxels) {
         fprintf(stderr, "scene: voxel allocation failed\n");

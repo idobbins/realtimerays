@@ -1,0 +1,10 @@
+spp1_128x128x8.bin contains the 1-spp SCRAMBLING_TILE bytes from
+Jasper Bekkers' MIT-licensed blue-noise-sampler repository at commit
+b1720f637a3580c8711580873dcf84cce82f6504.
+
+https://github.com/Jasper-Bekkers/blue-noise-sampler
+
+The tables implement the sampler described by Eric Heitz, Laurent Belcour,
+Victor Ostromoukhov, David Coeurjolly, and Jean-Claude Iehl in "A
+Low-Discrepancy Sampler that Distributes Monte Carlo Errors as a Blue Noise
+in Screen Space" (SIGGRAPH 2019).

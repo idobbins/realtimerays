@@ -114,8 +114,9 @@ const uint RTR_ENVMAP_WIDTH = 1024u;
 const uint RTR_ENVMAP_HEIGHT = 512u;
 const uint RTR_ENVMAP_WORD =
     RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
-const uint RTR_WF_WORD =
+const uint RTR_BLUE_NOISE_WORD =
     RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
+const uint RTR_WF_WORD = RTR_BLUE_NOISE_WORD + 128u * 128u * 2u;
 const uint RTR_WF_LIGHT_SPP_WORD = RTR_WF_WORD + 8u;
 const uint RTR_WF_GI_SPP_WORD = RTR_WF_WORD + 9u;
 const uint RTR_BUDGET_MAX = 4u;
@@ -249,9 +250,7 @@ uvec2 rtrBrickMask(uint brickIndex)
 bool rtrMaskBit(uvec2 mask, ivec3 local)
 {
     uint bit = uint(local.x + local.z * 4 + local.y * 16);
-    if (bit < 32u)
-        return (mask.x & (1u << bit)) != 0u;
-    return (mask.y & (1u << (bit - 32u))) != 0u;
+    return (mask[bit >> 5u] & (1u << (bit & 31u))) != 0u;
 }
 
 f16vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
@@ -646,6 +645,20 @@ vec2 rtrSampleHam(uint sampleIndex)
 {
     return vec2((float(sampleIndex) + 0.5) / float(shSpp),
                 rtrRadicalInverse2(sampleIndex));
+}
+
+/* Eight optimized dimensions for the 128x128 1-spp screen-space tile.
+ * Four bytes share each word: direct light uses group 0.xy and the first
+ * two GI chains use group 1.xy/zw. */
+vec4 rtrBlueNoise4(uint tile, uint group)
+{
+    uint scramble = rtrLoadU32(RTR_BLUE_NOISE_WORD + tile * 2u + group);
+    uint sobol = group == 0u ? 0x4648e220u : 0x4bf6ab39u;
+    uint sample4 = sobol ^ scramble;
+    uvec4 value = uvec4(sample4, sample4 >> 8u,
+                        sample4 >> 16u, sample4 >> 24u) & 255u;
+
+    return (vec4(value) + 0.5) * (1.0 / 256.0);
 }
 
 #if RTR_RENDER_PASS != 0
@@ -1097,6 +1110,15 @@ void main()
             uint hashHemi = rtrHashU32(hashLight);
             uint sampleSalt = rtrWfSampleSalt();
             vec2 ham = rtrSampleHam(pc.sampleIndex);
+            uint blueTile = 0u;
+
+            if (pc.depth == 0u && shSpp == 1u) {
+                uint pixelY = pixel / uint(shSize.x);
+                uint pixelX = pixel - pixelY * uint(shSize.x);
+
+                blueTile = ((pixelX + shFrameSalt) & 127u) +
+                    ((pixelY + (shFrameSalt >> 16u)) & 127u) * 128u;
+            }
 
             /* Direct light: at the first hit the budget splits the light
              * estimator into several cheap shadow rays, each weighted
@@ -1104,9 +1126,13 @@ void main()
             uint lightSamples = pc.depth == 0u ? shLightSpp : 1u;
             f16vec3 directBase = throughput * albedo *
                 f16vec3(float16_t(1.0 / float(lightSamples)));
-            vec2 uLBase = pc.depth == 0u ?
-                fract(ham + rtrHashToUnit2(hashLight) + shFrameRot) :
-                rtrHashToUnit2(rtrHashU32(hashLight ^ sampleSalt));
+            vec2 uLBase;
+            if (pc.depth == 0u) {
+                uLBase = shSpp == 1u ? rtrBlueNoise4(blueTile, 0u).xy :
+                    fract(ham + rtrHashToUnit2(hashLight) + shFrameRot);
+            } else {
+                uLBase = rtrHashToUnit2(rtrHashU32(hashLight ^ sampleSalt));
+            }
 
             for (uint i = 0u; i < lightSamples; i++) {
                 vec2 uL = i == 0u ?
@@ -1137,17 +1163,27 @@ void main()
                 (pc.depth == 0u ? shGiSpp : 1u) : 0u;
 
             if (giChains > 0u) {
-                vec2 uHBase = pc.depth == 0u ?
-                    fract(ham + rtrHashToUnit2(hashHemi) * hemiJitter +
-                          shFrameRot) :
-                    rtrHashToUnit2(rtrHashU32(hashHemi ^ sampleSalt));
+                vec4 blueH = pc.depth == 0u && shSpp == 1u ?
+                    rtrBlueNoise4(blueTile, 1u) : vec4(0.0);
+                vec2 uHBase;
+
+                if (pc.depth == 0u) {
+                    uHBase = shSpp == 1u ? blueH.xy :
+                        fract(ham + rtrHashToUnit2(hashHemi) * hemiJitter +
+                              shFrameRot);
+                } else {
+                    uHBase =
+                        rtrHashToUnit2(rtrHashU32(hashHemi ^ sampleSalt));
+                }
 
                 chainThroughput =
                     rtrPackRgb9e5(vec3(throughput * albedo) /
                                   float(giChains));
                 for (uint j = 0u; j < giChains; j++) {
-                    vec2 uH = j == 0u ?
-                        uHBase : fract(uHBase + rtrBudgetShift(j));
+                    vec2 uH = pc.depth == 0u && shSpp == 1u && j == 1u ?
+                        blueH.zw :
+                        (j == 0u ? uHBase :
+                         fract(uHBase + rtrBudgetShift(j)));
 
                     bounceDir[bounceEmits] =
                         rtrPackDirection(rtrCosineHemisphere(n, uH));

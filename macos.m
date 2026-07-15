@@ -13,6 +13,8 @@
 #define RTR_CAMERA_MIN_RADIUS 1.2f
 #define RTR_CAMERA_MAX_RADIUS 9.0f
 #define RTR_MOUSE_DRAG_THRESHOLD 4.0f
+#define RTR_DEFAULT_SPP 1u
+#define RTR_DEFAULT_GI_SPP 2u
 
 static NSWindow *rtrWindowHandle = nil;
 static void *rtrSurfaceLayer = NULL;
@@ -27,11 +29,11 @@ static uint32_t rtrMouseDragging = 0u;
 static uint32_t rtrMouseDragActive = 0u;
 static float rtrMouseDownX = 0.0f;
 static float rtrMouseDownY = 0.0f;
-static uint32_t rtrSettingSpp = 2u;
+static uint32_t rtrSettingSpp = RTR_DEFAULT_SPP;
 static uint32_t rtrSettingSppMax = 8u;
 static uint32_t rtrSettingLightSpp = 1u;
 static uint32_t rtrSettingLightSppMax = 2u;
-static uint32_t rtrSettingGiSpp = 1u;
+static uint32_t rtrSettingGiSpp = RTR_DEFAULT_GI_SPP;
 static uint32_t rtrSettingGiSppMax = 2u;
 
 static float rtrClamp(float value, float lo, float hi)
@@ -121,17 +123,19 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
 
     /* Interactive ceilings: the renderer sizes its queues and prerecords
      * sample waves for these maxima; env values raise them at launch. */
-    rtrSettingSpp = rtrClampU32(rtrSettingEnv("RTR_SPP", 2u), 1u,
-                                rtrSettingSppMax);
+    rtrSettingSpp =
+        rtrClampU32(rtrSettingEnv("RTR_SPP", RTR_DEFAULT_SPP), 1u,
+                    rtrSettingSppMax);
     rtrSettingLightSppMax =
         rtrClampU32(rtrSettingEnv("RTR_LIGHT_SPP", 1u), 2u, 4u);
     rtrSettingGiSppMax =
-        rtrClampU32(rtrSettingEnv("RTR_GI_SPP", 1u), 2u, 4u);
+        rtrClampU32(rtrSettingEnv("RTR_GI_SPP", RTR_DEFAULT_GI_SPP), 2u, 4u);
     rtrSettingLightSpp =
         rtrClampU32(rtrSettingEnv("RTR_LIGHT_SPP", 1u), 1u,
                     rtrSettingLightSppMax);
-    rtrSettingGiSpp = rtrClampU32(rtrSettingEnv("RTR_GI_SPP", 1u), 1u,
-                                  rtrSettingGiSppMax);
+    rtrSettingGiSpp =
+        rtrClampU32(rtrSettingEnv("RTR_GI_SPP", RTR_DEFAULT_GI_SPP), 1u,
+                    rtrSettingGiSppMax);
 
     printf("controls: drag orbit, scroll zoom, space auto-orbit, "
            "1-8 spp, l light samples, g gi chains, esc quit\n");

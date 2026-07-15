@@ -38,10 +38,11 @@
 #define RTR_ENVMAP_WIDTH 1024u
 #define RTR_ENVMAP_HEIGHT 512u
 #define RTR_ENVMAP_WORDS (RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u)
+#define RTR_BLUE_NOISE_WORDS (128u * 128u * 2u)
 #define RTR_SCENE_WORDS \
     (RTR_SCENE_META_WORDS + \
      RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS + \
-     RTR_ENVMAP_WORDS)
+     RTR_ENVMAP_WORDS + RTR_BLUE_NOISE_WORDS)
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
@@ -63,7 +64,8 @@ enum {
     RTR_MEMORY_FRAME_WORD = 30,
 };
 
-#define RTR_DEFAULT_SPP 2u
+#define RTR_DEFAULT_SPP 1u
+#define RTR_DEFAULT_GI_SPP 2u
 
 enum {
     RTR_CAMERA_AUTO_DEFAULT = 1u,
@@ -217,7 +219,9 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
  * so the keys can raise budgets live, and env values raise the ceiling. */
 static uint32_t rtrWfBudgetCap(const char *name)
 {
-    uint32_t value = rtrEnvU32(name, 1u);
+    const uint32_t fallback = strcmp(name, "RTR_GI_SPP") == 0 ?
+        RTR_DEFAULT_GI_SPP : 1u;
+    uint32_t value = rtrEnvU32(name, fallback);
 
     if (rtrWindowed && value < 2u) value = 2u;
     if (value < 1u) value = 1u;
@@ -427,7 +431,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 34u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 35u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_SPP_WORD] = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
@@ -469,7 +473,7 @@ static void rtrUpdateMemoryWith(float time,
 
     uint32_t spp = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
     uint32_t lightSpp = rtrEnvU32("RTR_LIGHT_SPP", 1u);
-    uint32_t giSpp = rtrEnvU32("RTR_GI_SPP", 1u);
+    uint32_t giSpp = rtrEnvU32("RTR_GI_SPP", RTR_DEFAULT_GI_SPP);
 
     if (rtrWindowed)
         rtrWindowRenderSettings(&spp, &lightSpp, &giSpp);
