@@ -1,5 +1,10 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+
+#define RTR_GLSL 1
+#include "../scene_layout.h"
+#include "../camera_defaults.h"
 
 /* RTR_RENDER_PASS selects the kernel built from this file:
  *   0  monolith path tracer (one dispatch per frame; RTR_WAVEFRONT=0)
@@ -95,28 +100,29 @@ const uint RTR_CAMERA_YAW_WORD = 17u;
 const uint RTR_CAMERA_PITCH_WORD = 18u;
 const uint RTR_CAMERA_RADIUS_WORD = 19u;
 const uint RTR_FRAME_WORD = 30u;
+const uint RTR_SCENE_KIND_WORD = RTR_LAYOUT_SCENE_KIND_WORD;
 
-const uint RTR_BRICK_SIZE = 4u;
-const uint RTR_BRICK_GRID_X = 32u;
-const uint RTR_BRICK_GRID_Y = 12u;
-const uint RTR_BRICK_GRID_Z = 32u;
+const uint RTR_BRICK_SIZE = RTR_LAYOUT_BRICK_SIZE;
+const uint RTR_BRICK_GRID_X = RTR_LAYOUT_BRICK_GRID_X;
+const uint RTR_BRICK_GRID_Y = RTR_LAYOUT_BRICK_GRID_Y;
+const uint RTR_BRICK_GRID_Z = RTR_LAYOUT_BRICK_GRID_Z;
 const uint RTR_VOXEL_GRID_X = RTR_BRICK_GRID_X * RTR_BRICK_SIZE;
 const uint RTR_VOXEL_GRID_Y = RTR_BRICK_GRID_Y * RTR_BRICK_SIZE;
 const uint RTR_VOXEL_GRID_Z = RTR_BRICK_GRID_Z * RTR_BRICK_SIZE;
 const uint RTR_BRICK_CAPACITY = RTR_BRICK_GRID_X * RTR_BRICK_GRID_Y * RTR_BRICK_GRID_Z;
-const uint RTR_BRICK_WORDS = 2u;
+const uint RTR_BRICK_WORDS = RTR_LAYOUT_BRICK_WORDS;
+const uint RTR_MATERIAL_WORDS_PER_BRICK =
+    RTR_LAYOUT_MATERIAL_WORDS_PER_BRICK;
 const uint RTR_SCENE_MIN_WORD = 24u;
 const uint RTR_SCENE_MAX_WORD = 27u;
-const uint RTR_BRICK_META_WORD = 32u;
-const uint RTR_VOXEL_BRICK_WORD =
-    RTR_BRICK_META_WORD + RTR_BRICK_CAPACITY / 2u;
-const uint RTR_ENVMAP_WIDTH = 1024u;
-const uint RTR_ENVMAP_HEIGHT = 512u;
-const uint RTR_ENVMAP_WORD =
-    RTR_VOXEL_BRICK_WORD + RTR_BRICK_CAPACITY * RTR_BRICK_WORDS;
-const uint RTR_BLUE_NOISE_WORD =
-    RTR_ENVMAP_WORD + RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u;
-const uint RTR_WF_WORD = RTR_BLUE_NOISE_WORD + 128u * 128u * 2u;
+const uint RTR_BRICK_META_WORD = RTR_LAYOUT_META_WORD;
+const uint RTR_VOXEL_BRICK_WORD = RTR_LAYOUT_VOXEL_BRICK_WORD;
+const uint RTR_MATERIAL_WORD = RTR_LAYOUT_MATERIAL_WORD;
+const uint RTR_ENVMAP_WIDTH = RTR_LAYOUT_ENVMAP_WIDTH;
+const uint RTR_ENVMAP_HEIGHT = RTR_LAYOUT_ENVMAP_HEIGHT;
+const uint RTR_ENVMAP_WORD = RTR_LAYOUT_ENVMAP_WORD;
+const uint RTR_BLUE_NOISE_WORD = RTR_LAYOUT_BLUE_NOISE_WORD;
+const uint RTR_WF_WORD = RTR_LAYOUT_WF_WORD;
 const uint RTR_WF_LIGHT_SPP_WORD = RTR_WF_WORD + 8u;
 const uint RTR_WF_GI_SPP_WORD = RTR_WF_WORD + 9u;
 const uint RTR_BUDGET_MAX = 4u;
@@ -127,7 +133,6 @@ const float RTR_FOCAL = 1.35;
 const float RTR_INV_PI = 0.31830988618;
 const float RTR_ENVMAP_LUMINANCE_CAP = 12.0;
 const float RTR_FLOOR_Y = -1.0;
-const vec3 RTR_CAMERA_TARGET = vec3(0.0, -0.12, 0.0);
 const vec3 RTR_LIGHT_POS = vec3(-2.8, 4.4, -2.4);
 const vec3 RTR_LIGHT_COLOR = vec3(18.0, 14.0, 9.0);
 const float RTR_LIGHT_RADIUS = 0.7;
@@ -141,6 +146,7 @@ const float RTR_INDIRECT_LUMINANCE_CAP = 3.0;
 shared uint shSpp;
 shared uint shLightSpp;
 shared uint shGiSpp;
+shared uint shSceneKind;
 shared ivec2 shSize;
 shared uint shPixels;
 /* Per-frame sampling shift: every frame is an independent estimate (no
@@ -253,6 +259,22 @@ bool rtrMaskBit(uvec2 mask, ivec3 local)
     return (mask[bit >> 5u] & (1u << (bit & 31u))) != 0u;
 }
 
+/* Material payload is deliberately separate from the traversal masks. The
+ * trace and shadow stages touch occupancy only; shading resolves this two-bit
+ * ID after a confirmed hit. */
+uint rtrVoxelMaterial(ivec3 voxel)
+{
+    ivec3 brick = voxel / int(RTR_BRICK_SIZE);
+    ivec3 local = voxel - brick * int(RTR_BRICK_SIZE);
+    uint bit = uint(local.x + local.z * 4 + local.y * 16);
+    uint word = RTR_MATERIAL_WORD +
+        rtrBrickMapIndex(brick) * RTR_MATERIAL_WORDS_PER_BRICK +
+        (bit >> 4u);
+    uint shift = (bit & 15u) * 2u;
+
+    return (rtrLoadU32(word) >> shift) & 3u;
+}
+
 f16vec3 rtrEnvironmentSample(vec3 rd, uint baseWord, uint mapWidth, uint mapHeight, float cap)
 {
     const float invTwoPi = 0.15915494309;
@@ -317,11 +339,14 @@ void rtrCamera(float cameraYaw,
     float pitch = clamp(cameraPitch, 0.08, 1.15);
     float radius = max(cameraRadius, 1.0);
     float horizontalRadius = cos(pitch) * radius;
-    ro = RTR_CAMERA_TARGET +
+    float targetY = shSceneKind == RTR_SCENE_KIND_CASTLE ?
+        RTR_CAMERA_CASTLE_TARGET_Y : RTR_CAMERA_FOREST_TARGET_Y;
+    vec3 target = vec3(0.0, targetY, 0.0);
+    ro = target +
          vec3(sin(angle) * horizontalRadius, sin(pitch) * radius,
               cos(angle) * horizontalRadius);
 
-    forward = normalize(RTR_CAMERA_TARGET - ro);
+    forward = normalize(target - ro);
     right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
     up = cross(right, forward);
 }
@@ -340,6 +365,7 @@ void rtrInitShared(void)
     shSpp = clamp(rtrLoadU32(RTR_SPP_WORD), 1u, 256u);
     shLightSpp = clamp(rtrLoadU32(RTR_WF_LIGHT_SPP_WORD), 1u, RTR_BUDGET_MAX);
     shGiSpp = clamp(rtrLoadU32(RTR_WF_GI_SPP_WORD), 1u, RTR_BUDGET_MAX);
+    shSceneKind = rtrLoadU32(RTR_SCENE_KIND_WORD);
     shFrameRot = rtrHashToUnit2(frameHash);
     shFrameSalt = rtrHashU32(frameHash);
 
@@ -497,7 +523,9 @@ bool rtrTraceVoxels(vec3 ro, vec3 rd, float maxT, uint statClass,
     tExit = min(tExit, maxT);
     float t = tEnter;
 
-    for (uint i = 0u; i < 72u; i++) {
+    for (uint i = 0u;
+         i < RTR_BRICK_GRID_X + RTR_BRICK_GRID_Y + RTR_BRICK_GRID_Z + 12u;
+         i++) {
         if (t > tExit)
             break;
 
@@ -550,7 +578,7 @@ f16vec3 rtrFloorAlbedo(vec3 p)
     return f16vec3(base * (1.0 - grout * 0.18));
 }
 
-f16vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
+f16vec3 rtrCastleVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
 {
     if (voxel.y == 0)
         return rtrFloorAlbedo(p);
@@ -569,6 +597,48 @@ f16vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
     vec3 base = mix(mix(stone, cap, top * 0.35), trim, trimMask);
 
     return f16vec3(base * (0.88 + jitter * 0.12));
+}
+
+f16vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
+{
+    if (shSceneKind == RTR_SCENE_KIND_CASTLE)
+        return rtrCastleVoxelAlbedo(voxel, p, n);
+
+    uint material = rtrVoxelMaterial(voxel);
+    uint h = rtrHashU32(uint(voxel.x * 73856093 ^
+                            voxel.y * 19349663 ^
+                            voxel.z * 83492791));
+    float jitter = float(h & 0xffffu) * (1.0 / 65535.0);
+    float top = max(n.y, 0.0);
+    vec3 base;
+
+    if (material == RTR_MATERIAL_GROUND) {
+        float pathCenter = sin(p.z * 1.15) * 0.32;
+        float path = 1.0 - smoothstep(0.24, 0.52,
+                                      abs(p.x - pathCenter));
+        vec3 moss = mix(vec3(0.075, 0.14, 0.035),
+                        vec3(0.16, 0.29, 0.075), jitter);
+        vec3 soil = mix(vec3(0.12, 0.065, 0.025),
+                        vec3(0.23, 0.13, 0.045), jitter);
+        base = mix(moss, soil, path * 0.92) * (0.86 + top * 0.14);
+    } else if (material == RTR_MATERIAL_WOOD) {
+        float grain = 0.5 + 0.5 * sin(p.y * 31.0 + float(h & 15u));
+        base = mix(vec3(0.12, 0.052, 0.018),
+                   vec3(0.29, 0.14, 0.045),
+                   jitter * 0.65 + grain * 0.20);
+        base = mix(base, vec3(0.36, 0.20, 0.075), top * 0.24);
+    } else if (material == RTR_MATERIAL_FOLIAGE) {
+        vec3 shadowLeaf = vec3(0.035, 0.105, 0.020);
+        vec3 sunLeaf = vec3(0.15, 0.34, 0.055);
+        base = mix(shadowLeaf, sunLeaf,
+                   0.25 + jitter * 0.38 + top * 0.30);
+    } else {
+        base = mix(vec3(0.20, 0.22, 0.18),
+                   vec3(0.38, 0.40, 0.34), jitter * 0.65);
+        base = mix(base, vec3(0.44, 0.45, 0.38), top * 0.18);
+    }
+
+    return f16vec3(base);
 }
 
 vec3 rtrTonemap(vec3 color)
@@ -662,7 +732,7 @@ vec4 rtrBlueNoise4(uint tile, uint group)
 }
 
 #if RTR_RENDER_PASS != 0
-/* Wavefront layout, appended to the buffer after the envmap. Counts live
+/* Wavefront layout, appended after the packed scene assets. Counts live
  * in a small header; per-pixel-capacity queues follow:
  *   accum  3 words/pixel   fp32 radiance accumulator
  *   rays   2 x 9 words     ping-pong bounce-ray queues
@@ -1036,8 +1106,8 @@ void main()
 
     if (rtrTraceVoxels(ro, rd, maxT, RTR_STAT_CLASS_PRIMARY, hit)) {
         rtrStoreU32(hitWord, 0x80000000u | (hit.axis << 24u) |
-                    uint(hit.voxel.x) | (uint(hit.voxel.y) << 7u) |
-                    (uint(hit.voxel.z) << 14u));
+                    uint(hit.voxel.x) | (uint(hit.voxel.y) << 8u) |
+                    (uint(hit.voxel.z) << 16u));
         rtrStoreU32(hitWord + 1u, floatBitsToUint(hit.t));
     } else {
         rtrStoreU32(hitWord, 0u);
@@ -1100,9 +1170,9 @@ void main()
         } else {
             float t = uintBitsToFloat(rtrLoadU32(rtrWfHitWord(index) + 1u));
             uint axis = (hitWord >> 24u) & 3u;
-            ivec3 voxel = ivec3(int(hitWord & 127u),
-                                int((hitWord >> 7u) & 127u),
-                                int((hitWord >> 14u) & 127u));
+            ivec3 voxel = ivec3(int(hitWord & 255u),
+                                int((hitWord >> 8u) & 255u),
+                                int((hitWord >> 16u) & 255u));
             vec3 hitP = ro + rd * t;
             vec3 n = rtrHitNormal(axis, rd);
             f16vec3 albedo = rtrVoxelAlbedo(voxel, hitP, n);

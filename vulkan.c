@@ -12,6 +12,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "scene_layout.h"
+#include "camera_defaults.h"
 #include "render_comp_spv.h"
 #include "render_raygen_comp_spv.h"
 #include "render_trace_comp_spv.h"
@@ -26,23 +28,8 @@
 #ifndef RTR_TILE_Y
 #define RTR_TILE_Y 8u
 #endif
-#define RTR_MEMORY_HEADER_WORDS 32u
-#define RTR_SCENE_BRICK_SIZE 4u
-#define RTR_SCENE_BRICK_GRID_X 32u
-#define RTR_SCENE_BRICK_GRID_Y 12u
-#define RTR_SCENE_BRICK_GRID_Z 32u
-#define RTR_SCENE_BRICK_CAPACITY \
-    (RTR_SCENE_BRICK_GRID_X * RTR_SCENE_BRICK_GRID_Y * RTR_SCENE_BRICK_GRID_Z)
-#define RTR_SCENE_BRICK_WORDS 2u
-#define RTR_SCENE_META_WORDS (RTR_SCENE_BRICK_CAPACITY / 2u)
-#define RTR_ENVMAP_WIDTH 1024u
-#define RTR_ENVMAP_HEIGHT 512u
-#define RTR_ENVMAP_WORDS (RTR_ENVMAP_WIDTH * RTR_ENVMAP_HEIGHT * 2u)
-#define RTR_BLUE_NOISE_WORDS (128u * 128u * 2u)
-#define RTR_SCENE_WORDS \
-    (RTR_SCENE_META_WORDS + \
-     RTR_SCENE_BRICK_CAPACITY * RTR_SCENE_BRICK_WORDS + \
-     RTR_ENVMAP_WORDS + RTR_BLUE_NOISE_WORDS)
+#define RTR_MEMORY_HEADER_WORDS RTR_LAYOUT_MEMORY_HEADER_WORDS
+#define RTR_SCENE_WORDS RTR_LAYOUT_SCENE_WORDS
 #define RTR_MEMORY_MAGIC 0x30525452u
 #define RTR_TIMING_WINDOW 100u
 
@@ -71,9 +58,6 @@ enum {
     RTR_CAMERA_AUTO_DEFAULT = 1u,
 };
 
-#define RTR_CAMERA_DEFAULT_YAW 0.35f
-#define RTR_CAMERA_DEFAULT_PITCH 0.473f
-#define RTR_CAMERA_DEFAULT_RADIUS 2.35f
 #define RTR_CAMERA_AUTO_SPEED 0.08f
 #define RTR_FRAME_TIME_CLAMP_SECONDS (1.0 / 20.0)
 
@@ -183,6 +167,7 @@ static uint32_t rtrFrameClockReady = 0u;
 static uint32_t rtrCameraAutoReady = 0u;
 static uint32_t rtrCameraAutoWasEnabled = 0u;
 static float rtrCameraAutoBase = RTR_CAMERA_DEFAULT_YAW;
+static float rtrCameraAutoSpeed = RTR_CAMERA_AUTO_SPEED;
 static uint32_t rtrWindowed = 0u;
 static uint32_t rtrWaveCount = 1u;
 
@@ -211,6 +196,24 @@ static uint32_t rtrEnvU32(const char *name, uint32_t fallback)
     char *end = NULL;
     const unsigned long parsed = strtoul(value, &end, 10);
     return end != value ? (uint32_t)parsed : fallback;
+}
+
+static uint32_t rtrCastleSceneActive(void)
+{
+    return rtrMemoryWords &&
+        rtrMemoryWords[RTR_LAYOUT_SCENE_KIND_WORD] == RTR_SCENE_KIND_CASTLE;
+}
+
+static float rtrDefaultCameraPitch(void)
+{
+    return rtrCastleSceneActive() ? RTR_CAMERA_CASTLE_DEFAULT_PITCH :
+        RTR_CAMERA_FOREST_DEFAULT_PITCH;
+}
+
+static float rtrDefaultCameraRadius(void)
+{
+    return rtrCastleSceneActive() ? RTR_CAMERA_CASTLE_DEFAULT_RADIUS :
+        RTR_CAMERA_FOREST_DEFAULT_RADIUS;
 }
 
 /* Decoupled first-hit sample budgets (wavefront only): RTR_LIGHT_SPP
@@ -431,14 +434,17 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 35u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 36u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_SPP_WORD] = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);
-    rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
-    rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_PITCH);
-    rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] = rtrF32Word(RTR_CAMERA_DEFAULT_RADIUS);
     rtrScene(rtrMemoryWords);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_YAW_WORD] =
+        rtrF32Word(RTR_CAMERA_DEFAULT_YAW);
+    rtrMemoryWords[RTR_MEMORY_CAMERA_PITCH_WORD] =
+        rtrF32Word(rtrDefaultCameraPitch());
+    rtrMemoryWords[RTR_MEMORY_CAMERA_RADIUS_WORD] =
+        rtrF32Word(rtrDefaultCameraRadius());
 
     return 0;
 }
@@ -454,15 +460,15 @@ static void rtrUpdateMemoryWith(float time,
     rtrMemoryWords[RTR_MEMORY_FRAME_WORD] = rtrFrameIndex;
     if (!rtrCameraAutoReady) {
         rtrCameraAutoBase = cameraYaw -
-            (autoOrbit ? time * RTR_CAMERA_AUTO_SPEED : 0.0f);
+            (autoOrbit ? time * rtrCameraAutoSpeed : 0.0f);
         rtrCameraAutoWasEnabled = autoOrbit;
         rtrCameraAutoReady = 1u;
     } else if (autoOrbit && !rtrCameraAutoWasEnabled) {
-        rtrCameraAutoBase = cameraYaw - time * RTR_CAMERA_AUTO_SPEED;
+        rtrCameraAutoBase = cameraYaw - time * rtrCameraAutoSpeed;
     }
 
     const float activeCameraYaw = autoOrbit ?
-        rtrCameraAutoBase + time * RTR_CAMERA_AUTO_SPEED : cameraYaw;
+        rtrCameraAutoBase + time * rtrCameraAutoSpeed : cameraYaw;
     if (autoOrbit)
         rtrWindowSetCameraYaw(activeCameraYaw);
     rtrCameraAutoWasEnabled = autoOrbit;
@@ -487,16 +493,16 @@ static void rtrUpdateMemoryWith(float time,
         giSpp = rtrWfBudgetCap("RTR_GI_SPP");
 
     rtrMemoryWords[RTR_MEMORY_SPP_WORD] = spp;
-    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 8u] = lightSpp;
-    rtrMemoryWords[RTR_MEMORY_HEADER_WORDS + RTR_SCENE_WORDS + 9u] = giSpp;
+    rtrMemoryWords[RTR_LAYOUT_WF_WORD + 8u] = lightSpp;
+    rtrMemoryWords[RTR_LAYOUT_WF_WORD + 9u] = giSpp;
 }
 
 static void rtrUpdateMemory(void)
 {
     uint32_t autoOrbit = RTR_CAMERA_AUTO_DEFAULT;
     float cameraYaw = RTR_CAMERA_DEFAULT_YAW;
-    float cameraPitch = RTR_CAMERA_DEFAULT_PITCH;
-    float cameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
+    float cameraPitch = rtrDefaultCameraPitch();
+    float cameraRadius = rtrDefaultCameraRadius();
 
     rtrWindowCamera(&autoOrbit, &cameraYaw, &cameraPitch, &cameraRadius);
     rtrUpdateMemoryWith(rtrFrameSeconds(),
@@ -788,6 +794,8 @@ int rtrVulkanInit(void *windowSurface)
     rtrCameraAutoReady = 0u;
     rtrCameraAutoWasEnabled = 0u;
     rtrCameraAutoBase = RTR_CAMERA_DEFAULT_YAW;
+    rtrCameraAutoSpeed =
+        rtrEnvF32("RTR_CAMERA_ORBIT_SPEED", RTR_CAMERA_AUTO_SPEED);
 
     vkCreateInstance(&(VkInstanceCreateInfo){
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -1420,9 +1428,9 @@ int rtrVulkanWriteFrames(FILE *out, uint32_t width, uint32_t height, uint32_t fr
     const float cameraYaw =
         rtrEnvF32("RTR_XPOST_CAMERA_YAW", RTR_CAMERA_DEFAULT_YAW);
     const float cameraPitch =
-        rtrEnvF32("RTR_XPOST_CAMERA_PITCH", RTR_CAMERA_DEFAULT_PITCH);
+        rtrEnvF32("RTR_XPOST_CAMERA_PITCH", rtrDefaultCameraPitch());
     const float cameraRadius =
-        rtrEnvF32("RTR_XPOST_CAMERA_RADIUS", RTR_CAMERA_DEFAULT_RADIUS);
+        rtrEnvF32("RTR_XPOST_CAMERA_RADIUS", rtrDefaultCameraRadius());
 
     VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (uint32_t frame = 0u; frame < frames; frame++) {

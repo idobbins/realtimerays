@@ -4,10 +4,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
-#define RTR_CAMERA_DEFAULT_YAW 0.35f
-#define RTR_CAMERA_DEFAULT_PITCH 0.473f
-#define RTR_CAMERA_DEFAULT_RADIUS 2.35f
+#include "camera_defaults.h"
+
+#define RTR_CAMERA_DEFAULT_PITCH RTR_CAMERA_FOREST_DEFAULT_PITCH
+#define RTR_CAMERA_DEFAULT_RADIUS RTR_CAMERA_FOREST_DEFAULT_RADIUS
 #define RTR_CAMERA_MIN_PITCH 0.08f
 #define RTR_CAMERA_MAX_PITCH 1.15f
 #define RTR_CAMERA_MIN_RADIUS 1.2f
@@ -113,8 +115,14 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     rtrMouseX = -1.0f;
     rtrMouseY = -1.0f;
     rtrCameraYaw = RTR_CAMERA_DEFAULT_YAW;
-    rtrCameraPitch = RTR_CAMERA_DEFAULT_PITCH;
-    rtrCameraRadius = RTR_CAMERA_DEFAULT_RADIUS;
+    const char *scene = getenv("RTR_SCENE");
+    if (scene && strcmp(scene, "castle") == 0) {
+        rtrCameraPitch = RTR_CAMERA_CASTLE_DEFAULT_PITCH;
+        rtrCameraRadius = RTR_CAMERA_CASTLE_DEFAULT_RADIUS;
+    } else {
+        rtrCameraPitch = RTR_CAMERA_FOREST_DEFAULT_PITCH;
+        rtrCameraRadius = RTR_CAMERA_FOREST_DEFAULT_RADIUS;
+    }
     rtrAutoOrbit = 1u;
     rtrMouseDragging = 0u;
     rtrMouseDragActive = 0u;

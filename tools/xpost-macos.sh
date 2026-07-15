@@ -16,6 +16,10 @@ fps="${XPOST_FPS:-30}"
 width="${XPOST_WIDTH:-1920}"
 height="${XPOST_HEIGHT:-1080}"
 frames="${XPOST_FRAMES:-$((seconds * fps))}"
+video_bitrate="${XPOST_VIDEO_BITRATE:-8M}"
+video_maxrate="${XPOST_VIDEO_MAXRATE:-12M}"
+video_bufsize="${XPOST_VIDEO_BUFSIZE:-16M}"
+keyframe_interval="${XPOST_KEYFRAME_INTERVAL:-$((fps * 2))}"
 
 if (( width % 2 != 0 || height % 2 != 0 )); then
     printf 'XPOST_WIDTH and XPOST_HEIGHT must be even for yuv420p MP4 output\n' >&2
@@ -54,14 +58,17 @@ printf 'Rendering %ux%u %s frames @ %s fps to %s\n' "$width" "$height" "$frames"
     else
         "$bin" --xpost-raw "$width" "$height" "$frames" "$fps"
     fi
-} 2> >(tee -a "$stats_out" >&2) | ffmpeg -hide_banner -loglevel error -y \
+} 2>> "$stats_out" | ffmpeg -hide_banner -loglevel error -y \
     -f rawvideo -pix_fmt rgba -s "${width}x${height}" -r "$fps" -i - \
-    -c:v libx264 -profile:v high -level 4.0 -preset "${XPOST_PRESET:-slow}" -crf "${XPOST_CRF:-20}" \
+    -c:v libx264 -profile:v high -level 4.0 -preset "${XPOST_PRESET:-slow}" \
+    -b:v "$video_bitrate" -maxrate "$video_maxrate" -bufsize "$video_bufsize" \
+    -g "$keyframe_interval" -keyint_min "$keyframe_interval" -sc_threshold 0 \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
     -pix_fmt yuv420p \
     -tag:v avc1 \
     -movflags +faststart \
     -an \
-    "$mp4_out" 2> >(tee -a "$stats_out" >&2)
+    "$mp4_out" 2>> "$stats_out"
 
 mp4_bytes="$(wc -c < "$mp4_out" | tr -d ' ')"
 {
