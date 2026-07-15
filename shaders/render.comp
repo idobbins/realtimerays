@@ -339,10 +339,13 @@ void rtrCamera(float cameraYaw,
     float pitch = clamp(cameraPitch, 0.08, 1.15);
     float radius = max(cameraRadius, 1.0);
     float horizontalRadius = cos(pitch) * radius;
-    float targetY = shSceneKind == RTR_SCENE_KIND_CASTLE ?
-        RTR_CAMERA_CASTLE_TARGET_Y :
-        (shSceneKind == RTR_SCENE_KIND_CITY100K ?
-         RTR_CAMERA_CITY100K_TARGET_Y : RTR_CAMERA_FOREST_TARGET_Y);
+    float targetY = RTR_CAMERA_FOREST_TARGET_Y;
+    if (shSceneKind == RTR_SCENE_KIND_CASTLE)
+        targetY = RTR_CAMERA_CASTLE_TARGET_Y;
+    else if (shSceneKind == RTR_SCENE_KIND_CITY100K)
+        targetY = RTR_CAMERA_CITY100K_TARGET_Y;
+    else if (shSceneKind == RTR_SCENE_KIND_WORLD)
+        targetY = RTR_CAMERA_WORLD_TARGET_Y;
     vec3 target = vec3(0.0, targetY, 0.0);
     ro = target +
          vec3(sin(angle) * horizontalRadius, sin(pitch) * radius,
@@ -632,12 +635,49 @@ f16vec3 rtrCity100kVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
     return f16vec3(mix(concrete, glass, window * 0.72));
 }
 
+f16vec3 rtrWorldVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
+{
+    uint material = rtrVoxelMaterial(voxel);
+    uint h = rtrHashU32(uint(voxel.x * 73856093 ^
+                            voxel.y * 19349663 ^
+                            voxel.z * 83492791));
+    float jitter = float(h & 0xffffu) * (1.0 / 65535.0);
+    float top = max(n.y, 0.0);
+    vec3 base;
+
+    if (material == RTR_MATERIAL_GROUND) {
+        vec3 dirt = mix(vec3(0.22, 0.095, 0.030),
+                        vec3(0.36, 0.19, 0.055), jitter);
+        vec3 grass = mix(vec3(0.11, 0.30, 0.035),
+                         vec3(0.26, 0.52, 0.075), jitter);
+        base = mix(dirt, grass, step(0.5, top));
+    } else if (material == RTR_MATERIAL_WOOD) {
+        vec3 bark = mix(vec3(0.20, 0.075, 0.018),
+                        vec3(0.38, 0.18, 0.045), jitter);
+        vec3 rings = mix(vec3(0.45, 0.24, 0.075),
+                         vec3(0.64, 0.39, 0.12), jitter);
+        base = mix(bark, rings, step(0.5, top));
+    } else if (material == RTR_MATERIAL_FOLIAGE) {
+        base = mix(vec3(0.055, 0.22, 0.025),
+                   vec3(0.16, 0.46, 0.055),
+                   0.30 + jitter * 0.45 + top * 0.20);
+    } else {
+        base = mix(vec3(0.29, 0.30, 0.32),
+                   vec3(0.49, 0.50, 0.51), jitter * 0.70);
+        base *= 0.90 + top * 0.10;
+    }
+
+    return f16vec3(base);
+}
+
 f16vec3 rtrVoxelAlbedo(ivec3 voxel, vec3 p, vec3 n)
 {
     if (shSceneKind == RTR_SCENE_KIND_CASTLE)
         return rtrCastleVoxelAlbedo(voxel, p, n);
     if (shSceneKind == RTR_SCENE_KIND_CITY100K)
         return rtrCity100kVoxelAlbedo(voxel, p, n);
+    if (shSceneKind == RTR_SCENE_KIND_WORLD)
+        return rtrWorldVoxelAlbedo(voxel, p, n);
 
     uint material = rtrVoxelMaterial(voxel);
     uint h = rtrHashU32(uint(voxel.x * 73856093 ^

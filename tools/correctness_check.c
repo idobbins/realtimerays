@@ -8,9 +8,10 @@
 
 #define RTR_CHECK_DISTANCE_MAX 15u
 #define RTR_CHECK_GUARD_WORDS 32u
-#define RTR_CHECK_FOREST_HASH UINT64_C(0x47628b2a6883fe07)
-#define RTR_CHECK_CASTLE_HASH UINT64_C(0x1f8f56b48167f060)
-#define RTR_CHECK_CITY100K_HASH UINT64_C(0x5242fe6f07e5358f)
+#define RTR_CHECK_FOREST_HASH UINT64_C(0x6578325ae75c4518)
+#define RTR_CHECK_CASTLE_HASH UINT64_C(0xa313ba0b00a8456a)
+#define RTR_CHECK_CITY100K_HASH UINT64_C(0x1b2be050a17376c1)
+#define RTR_CHECK_WORLD_HASH UINT64_C(0x77c399716ad60cb7)
 
 #if RTR_LAYOUT_SCENE_KIND_WORD != 31u
 #error "scene kind collides with live configuration or profiling header words"
@@ -117,7 +118,9 @@ static int rtrCheckSceneNames(void)
         rtrSceneKindFromName("unknown") != RTR_SCENE_KIND_FOREST ||
         rtrSceneKindFromName("castle") != RTR_SCENE_KIND_CASTLE ||
         rtrSceneKindFromName("city100k") != RTR_SCENE_KIND_CITY100K ||
-        rtrSceneKindFromName("100k") != RTR_SCENE_KIND_CITY100K) {
+        rtrSceneKindFromName("100k") != RTR_SCENE_KIND_CITY100K ||
+        rtrSceneKindFromName("world") != RTR_SCENE_KIND_WORLD ||
+        rtrSceneKindFromName("minecraft") != RTR_SCENE_KIND_WORLD) {
         fprintf(stderr, "correctness: scene name parsing failed\n");
         return 1;
     }
@@ -133,9 +136,11 @@ static int rtrCheckScene(uint32_t sceneKind,
     uint32_t *words = (uint32_t *)malloc(wordCount * sizeof(*words));
     uint8_t *occupied =
         (uint8_t *)calloc((size_t)RTR_LAYOUT_BRICK_CAPACITY, 1u);
-    uint32_t *occupiedList =
+    uint8_t *referenceDistance =
+        (uint8_t *)malloc((size_t)RTR_LAYOUT_BRICK_CAPACITY);
+    uint32_t *distanceQueue =
         (uint32_t *)malloc((size_t)RTR_LAYOUT_BRICK_CAPACITY *
-                           sizeof(*occupiedList));
+                           sizeof(*distanceQueue));
     uint32_t brickCount;
     uint32_t occupiedBricks = 0u;
     uint32_t occupiedVoxels = 0u;
@@ -154,13 +159,16 @@ static int rtrCheckScene(uint32_t sceneKind,
     uint32_t isolatedFoliage = 0u;
     int failed = 0;
 
-    if (!(words && occupied && occupiedList)) {
+    if (!(words && occupied && referenceDistance && distanceQueue)) {
         fprintf(stderr, "correctness: allocation failed\n");
         free(words);
         free(occupied);
-        free(occupiedList);
+        free(referenceDistance);
+        free(distanceQueue);
         return 1;
     }
+
+    memset(referenceDistance, 255, (size_t)RTR_LAYOUT_BRICK_CAPACITY);
 
     for (size_t i = 0u; i < wordCount; i++) words[i] = 0xa5a5a5a5u;
     for (uint32_t i = 0u; i < RTR_CHECK_GUARD_WORDS; i++)
@@ -205,7 +213,10 @@ static int rtrCheckScene(uint32_t sceneKind,
                 uint32_t referenceBounds = 0u;
 
                 occupied[brick] = (lo || hi) ? 1u : 0u;
-                if (occupied[brick]) occupiedList[occupiedBricks++] = brick;
+                if (occupied[brick]) {
+                    referenceDistance[brick] = 0u;
+                    distanceQueue[occupiedBricks++] = brick;
+                }
                 occupiedVoxels += rtrCheckPopcount(lo) + rtrCheckPopcount(hi);
 
                 for (uint32_t bit = 0u; bit < 64u; bit++) {
@@ -255,6 +266,44 @@ static int rtrCheckScene(uint32_t sceneKind,
         }
     }
 
+    {
+        uint32_t queueHead = 0u;
+        uint32_t queueTail = occupiedBricks;
+
+        while (queueHead < queueTail) {
+            const uint32_t brick = distanceQueue[queueHead++];
+            const uint32_t bx = brick % RTR_LAYOUT_BRICK_GRID_X;
+            const uint32_t yz = brick / RTR_LAYOUT_BRICK_GRID_X;
+            const uint32_t bz = yz % RTR_LAYOUT_BRICK_GRID_Z;
+            const uint32_t by = yz / RTR_LAYOUT_BRICK_GRID_Z;
+            const uint8_t next = (uint8_t)(referenceDistance[brick] + 1u);
+
+            for (int32_t dy = -1; dy <= 1; dy++) {
+                for (int32_t dz = -1; dz <= 1; dz++) {
+                    for (int32_t dx = -1; dx <= 1; dx++) {
+                        const int32_t nx = (int32_t)bx + dx;
+                        const int32_t ny = (int32_t)by + dy;
+                        const int32_t nz = (int32_t)bz + dz;
+                        uint32_t neighbor;
+
+                        if ((dx == 0 && dy == 0 && dz == 0) ||
+                            nx < 0 || ny < 0 || nz < 0 ||
+                            nx >= (int32_t)RTR_LAYOUT_BRICK_GRID_X ||
+                            ny >= (int32_t)RTR_LAYOUT_BRICK_GRID_Y ||
+                            nz >= (int32_t)RTR_LAYOUT_BRICK_GRID_Z)
+                            continue;
+                        neighbor = rtrCheckBrickIndex((uint32_t)nx,
+                                                      (uint32_t)ny,
+                                                      (uint32_t)nz);
+                        if (referenceDistance[neighbor] <= next) continue;
+                        referenceDistance[neighbor] = next;
+                        distanceQueue[queueTail++] = neighbor;
+                    }
+                }
+            }
+        }
+    }
+
     for (uint32_t by = 0u; by < RTR_LAYOUT_BRICK_GRID_Y; by++) {
         for (uint32_t bz = 0u; bz < RTR_LAYOUT_BRICK_GRID_Z; bz++) {
             for (uint32_t bx = 0u; bx < RTR_LAYOUT_BRICK_GRID_X; bx++) {
@@ -262,35 +311,27 @@ static int rtrCheckScene(uint32_t sceneKind,
                 const uint32_t stored =
                     (words[RTR_LAYOUT_META_WORD + brick / 2u] >>
                      ((brick & 1u) * 16u)) & 0xfu;
-                uint32_t reference = RTR_CHECK_DISTANCE_MAX;
-
-                for (uint32_t j = 0u; j < occupiedBricks; j++) {
-                    const uint32_t other = occupiedList[j];
-                    const uint32_t qx = other % RTR_LAYOUT_BRICK_GRID_X;
-                    const uint32_t yz = other / RTR_LAYOUT_BRICK_GRID_X;
-                    const uint32_t qz = yz % RTR_LAYOUT_BRICK_GRID_Z;
-                    const uint32_t qy = yz / RTR_LAYOUT_BRICK_GRID_Z;
-                    const uint32_t dx = qx > bx ? qx - bx : bx - qx;
-                    const uint32_t dy = qy > by ? qy - by : by - qy;
-                    const uint32_t dz = qz > bz ? qz - bz : bz - qz;
-                    uint32_t distance = dx > dy ? dx : dy;
-
-                    if (dz > distance) distance = dz;
-                    if (distance < reference) reference = distance;
-                }
+                const uint32_t reference =
+                    referenceDistance[brick] > RTR_CHECK_DISTANCE_MAX ?
+                    RTR_CHECK_DISTANCE_MAX : referenceDistance[brick];
                 if (stored != reference) distanceMismatches++;
             }
         }
     }
 
-    const uint32_t floorMinBx = sceneKind == RTR_SCENE_KIND_CASTLE ?
-        (RTR_LAYOUT_VOXEL_GRID_X - 128u) / (2u * RTR_LAYOUT_BRICK_SIZE) : 0u;
-    const uint32_t floorMinBz = sceneKind == RTR_SCENE_KIND_CASTLE ?
-        (RTR_LAYOUT_VOXEL_GRID_Z - 128u) / (2u * RTR_LAYOUT_BRICK_SIZE) : 0u;
-    const uint32_t floorMaxBx = sceneKind == RTR_SCENE_KIND_CASTLE ?
-        floorMinBx + 128u / RTR_LAYOUT_BRICK_SIZE : RTR_LAYOUT_BRICK_GRID_X;
-    const uint32_t floorMaxBz = sceneKind == RTR_SCENE_KIND_CASTLE ?
-        floorMinBz + 128u / RTR_LAYOUT_BRICK_SIZE : RTR_LAYOUT_BRICK_GRID_Z;
+    const uint32_t floorSize = sceneKind == RTR_SCENE_KIND_CASTLE ? 128u :
+        (sceneKind == RTR_SCENE_KIND_WORLD ?
+         RTR_LAYOUT_VOXEL_GRID_X : 160u);
+    const uint32_t floorMinBx =
+        (RTR_LAYOUT_VOXEL_GRID_X - floorSize) /
+        (2u * RTR_LAYOUT_BRICK_SIZE);
+    const uint32_t floorMinBz =
+        (RTR_LAYOUT_VOXEL_GRID_Z - floorSize) /
+        (2u * RTR_LAYOUT_BRICK_SIZE);
+    const uint32_t floorMaxBx =
+        floorMinBx + floorSize / RTR_LAYOUT_BRICK_SIZE;
+    const uint32_t floorMaxBz =
+        floorMinBz + floorSize / RTR_LAYOUT_BRICK_SIZE;
 
     for (uint32_t bz = 0u; bz < RTR_LAYOUT_BRICK_GRID_Z; bz++) {
         for (uint32_t bx = 0u; bx < RTR_LAYOUT_BRICK_GRID_X; bx++) {
@@ -323,7 +364,11 @@ static int rtrCheckScene(uint32_t sceneKind,
                     } else if (sceneKind == RTR_SCENE_KIND_FOREST &&
                                material == RTR_MATERIAL_STONE) {
                         embeddedStoneVoxels++;
-                    } else if (material != RTR_MATERIAL_GROUND) {
+                    } else if (sceneKind == RTR_SCENE_KIND_WORLD &&
+                               material != RTR_MATERIAL_STONE) {
+                        badFloorMaterials++;
+                    } else if (sceneKind != RTR_SCENE_KIND_WORLD &&
+                               material != RTR_MATERIAL_GROUND) {
                         badFloorMaterials++;
                     }
                 }
@@ -331,7 +376,8 @@ static int rtrCheckScene(uint32_t sceneKind,
         }
     }
 
-    if (sceneKind == RTR_SCENE_KIND_FOREST) {
+    if (sceneKind == RTR_SCENE_KIND_FOREST ||
+        sceneKind == RTR_SCENE_KIND_WORLD) {
         static const int32_t neighborOffsets[6][3] = {
             {1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
             {0, -1, 0}, {0, 0, 1}, {0, 0, -1},
@@ -436,7 +482,7 @@ static int rtrCheckScene(uint32_t sceneKind,
                     materialCounts[2], materialCounts[3]);
             failed = 1;
         }
-    } else {
+    } else if (sceneKind == RTR_SCENE_KIND_FOREST) {
         if (brickCount < 2300u || brickCount > 3000u ||
             occupiedVoxels < 40000u || occupiedVoxels > 65000u ||
             maxOccupiedY < 64u || maxOccupiedY > 74u ||
@@ -455,6 +501,25 @@ static int rtrCheckScene(uint32_t sceneKind,
                     isolatedFoliage);
             failed = 1;
         }
+    } else if (sceneKind == RTR_SCENE_KIND_WORLD) {
+        if (brickCount != 17821u || occupiedVoxels != 1029425u ||
+            maxOccupiedY != 41u ||
+            materialCounts[RTR_MATERIAL_GROUND] != 140544u ||
+            materialCounts[RTR_MATERIAL_WOOD] != 318u ||
+            materialCounts[RTR_MATERIAL_FOLIAGE] != 3700u ||
+            materialCounts[RTR_MATERIAL_STONE] != 884863u ||
+            isolatedFoliage) {
+            fprintf(stderr,
+                    "correctness: world design bricks=%u voxels=%u max_y=%u mats=%u/%u/%u/%u isolated=%u\n",
+                    brickCount, occupiedVoxels, maxOccupiedY,
+                    materialCounts[0], materialCounts[1],
+                    materialCounts[2], materialCounts[3],
+                    isolatedFoliage);
+            failed = 1;
+        }
+    } else {
+        fprintf(stderr, "correctness: unknown scene kind %u\n", sceneKind);
+        failed = 1;
     }
 
     *geometryHash = rtrCheckGeometryHash(words);
@@ -466,7 +531,8 @@ static int rtrCheckScene(uint32_t sceneKind,
 
     free(words);
     free(occupied);
-    free(occupiedList);
+    free(referenceDistance);
+    free(distanceQueue);
     return failed;
 }
 
@@ -507,6 +573,7 @@ int main(void)
     uint64_t forestHash = 0u;
     uint64_t castleHash = 0u;
     uint64_t city100kHash = 0u;
+    uint64_t worldHash = 0u;
     int failed = 0;
 
     failed |= rtrCheckHitPacking();
@@ -525,5 +592,10 @@ int main(void)
                                        "city100k", city100kHash);
     failed |= rtrCheckGeometryRegression("city100k", city100kHash,
                                          RTR_CHECK_CITY100K_HASH);
+    failed |= rtrCheckScene(RTR_SCENE_KIND_WORLD, "world", &worldHash);
+    failed |= rtrCheckSceneDeterminism(RTR_SCENE_KIND_WORLD,
+                                       "world", worldHash);
+    failed |= rtrCheckGeometryRegression("world", worldHash,
+                                         RTR_CHECK_WORLD_HASH);
     return failed ? 1 : 0;
 }

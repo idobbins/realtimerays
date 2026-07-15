@@ -30,6 +30,11 @@
 #define RTR_SCENE_DISTANCE_MAX 15u
 #define RTR_SCENE_VOXEL_SIZE 0.055f
 #define RTR_SCENE_FLOOR_Y -1.0f
+#define RTR_SCENE_CLASSIC_FLOOR_SIZE 160u
+#define RTR_SCENE_CLASSIC_FLOOR_OFFSET_X \
+    ((int32_t)(RTR_SCENE_VOXEL_GRID_X - RTR_SCENE_CLASSIC_FLOOR_SIZE) / 2)
+#define RTR_SCENE_CLASSIC_FLOOR_OFFSET_Z \
+    ((int32_t)(RTR_SCENE_VOXEL_GRID_Z - RTR_SCENE_CLASSIC_FLOOR_SIZE) / 2)
 #define RTR_SCENE_CASTLE_OFFSET_X \
     ((int32_t)(RTR_SCENE_VOXEL_GRID_X - 64u) / 2)
 #define RTR_SCENE_CASTLE_OFFSET_Z \
@@ -43,6 +48,8 @@
     ((int32_t)(RTR_SCENE_VOXEL_GRID_X - 128u) / 2)
 #define RTR_SCENE_FOREST_OFFSET_Z \
     ((int32_t)(RTR_SCENE_VOXEL_GRID_Z - 128u) / 2)
+#define RTR_SCENE_FOREST_REFERENCE_OFFSET \
+    ((int32_t)(RTR_SCENE_CLASSIC_FLOOR_SIZE - 128u) / 2)
 #define RTR_SCENE_ENVMAP_WIDTH RTR_LAYOUT_ENVMAP_WIDTH
 #define RTR_SCENE_ENVMAP_HEIGHT RTR_LAYOUT_ENVMAP_HEIGHT
 #define RTR_SCENE_ENVMAP_WORDS RTR_LAYOUT_ENVMAP_WORDS
@@ -284,16 +291,22 @@ static void rtrBuildCity100kScene(uint8_t *voxels)
 
     memset(voxels, 0, RTR_SCENE_VOXEL_COUNT);
     rtrFillBoxMaterial(voxels,
-                       0, 0, 0,
-                       (int32_t)RTR_SCENE_VOXEL_GRID_X - 1,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_X,
                        0,
-                       (int32_t)RTR_SCENE_VOXEL_GRID_Z - 1,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_Z,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_X +
+                           (int32_t)RTR_SCENE_CLASSIC_FLOOR_SIZE - 1,
+                       0,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_Z +
+                           (int32_t)RTR_SCENE_CLASSIC_FLOOR_SIZE - 1,
                        (uint8_t)RTR_CELL_GROUND);
 
     for (int32_t row = 0; row < 4; row++) {
         for (int32_t column = 0; column < 6; column++) {
-            const int32_t x0 = 12 + column * 24;
-            const int32_t z0 = 24 + row * 32;
+            const int32_t x0 = RTR_SCENE_CLASSIC_FLOOR_OFFSET_X +
+                12 + column * 24;
+            const int32_t z0 = RTR_SCENE_CLASSIC_FLOOR_OFFSET_Z +
+                24 + row * 32;
             const int32_t height = towerHeights[row][column];
 
             rtrFillBoxMaterial(voxels,
@@ -456,10 +469,14 @@ static void rtrStampEllipsoid(uint8_t *voxels,
 
                 if (distance > limit) continue;
                 if (cell == RTR_CELL_FOLIAGE) {
+                    const int32_t hashX = x - RTR_SCENE_FOREST_OFFSET_X +
+                        RTR_SCENE_FOREST_REFERENCE_OFFSET;
+                    const int32_t hashZ = z - RTR_SCENE_FOREST_OFFSET_Z +
+                        RTR_SCENE_FOREST_REFERENCE_OFFSET;
                     const uint32_t coarse =
-                        (uint32_t)(x >> 1) * 73856093u ^
+                        (uint32_t)(hashX >> 1) * 73856093u ^
                         (uint32_t)(y >> 1) * 19349663u ^
-                        (uint32_t)(z >> 1) * 83492791u ^ seed;
+                        (uint32_t)(hashZ >> 1) * 83492791u ^ seed;
                     if ((rtrSceneHash(coarse) & 15u) < 3u) continue;
                 }
                 rtrPutCell(voxels, x, y, z, cell);
@@ -682,10 +699,14 @@ static void rtrBuildForestScene(uint8_t *voxels)
 
     memset(voxels, 0, RTR_SCENE_VOXEL_COUNT);
     rtrFillBoxMaterial(voxels,
-                       0, 0, 0,
-                       (int32_t)RTR_SCENE_VOXEL_GRID_X - 1,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_X,
                        0,
-                       (int32_t)RTR_SCENE_VOXEL_GRID_Z - 1,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_Z,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_X +
+                           (int32_t)RTR_SCENE_CLASSIC_FLOOR_SIZE - 1,
+                       0,
+                       RTR_SCENE_CLASSIC_FLOOR_OFFSET_Z +
+                           (int32_t)RTR_SCENE_CLASSIC_FLOOR_SIZE - 1,
                        (uint8_t)RTR_CELL_GROUND);
 
     for (uint32_t i = 0u; i < sizeof(hummocks) / sizeof(hummocks[0]); i++) {
@@ -715,6 +736,168 @@ static void rtrBuildForestScene(uint8_t *voxels)
     rtrStampEllipsoid(voxels, 99 + ox, 2, 77 + oz, 4, 2, 3,
                       (uint8_t)RTR_CELL_STONE, 0u);
     rtrCullIsolatedFoliage(voxels);
+}
+
+static uint32_t rtrWorldSmoothCoordinate(uint32_t offset, uint32_t scale)
+{
+    const uint64_t t = offset;
+    const uint64_t s = scale;
+
+    return (uint32_t)((t * t * (3u * s - 2u * t) + s * s / 2u) /
+                      (s * s));
+}
+
+static uint32_t rtrWorldNoiseCorner(uint32_t x,
+                                    uint32_t z,
+                                    uint32_t seed)
+{
+    return rtrSceneHash(x * 0x9e3779b9u ^
+                        z * 0x85ebca6bu ^ seed) & 255u;
+}
+
+static uint32_t rtrWorldNoise2D(uint32_t x,
+                                uint32_t z,
+                                uint32_t scale,
+                                uint32_t seed)
+{
+    const uint32_t gx = x / scale;
+    const uint32_t gz = z / scale;
+    const uint32_t tx = rtrWorldSmoothCoordinate(x % scale, scale);
+    const uint32_t tz = rtrWorldSmoothCoordinate(z % scale, scale);
+    const uint32_t v00 = rtrWorldNoiseCorner(gx, gz, seed);
+    const uint32_t v10 = rtrWorldNoiseCorner(gx + 1u, gz, seed);
+    const uint32_t v01 = rtrWorldNoiseCorner(gx, gz + 1u, seed);
+    const uint32_t v11 = rtrWorldNoiseCorner(gx + 1u, gz + 1u, seed);
+    const uint32_t a =
+        (v00 * (scale - tx) + v10 * tx + scale / 2u) / scale;
+    const uint32_t b =
+        (v01 * (scale - tx) + v11 * tx + scale / 2u) / scale;
+
+    return (a * (scale - tz) + b * tz + scale / 2u) / scale;
+}
+
+static int32_t rtrWorldRiverDistance(int32_t x, int32_t z)
+{
+    const int32_t bend =
+        (int32_t)rtrWorldNoise2D((uint32_t)x, 17u, 48u,
+                                0x53a9d1e7u) - 128;
+    const int32_t center = (int32_t)RTR_SCENE_VOXEL_GRID_Z / 2 + bend / 5;
+
+    return abs(z - center);
+}
+
+static int32_t rtrWorldHeight(int32_t x, int32_t z)
+{
+    const uint32_t coarse =
+        rtrWorldNoise2D((uint32_t)x, (uint32_t)z, 48u, 0x61c88647u);
+    const uint32_t medium =
+        rtrWorldNoise2D((uint32_t)x, (uint32_t)z, 20u, 0xa511e9b3u);
+    const uint32_t detail =
+        rtrWorldNoise2D((uint32_t)x, (uint32_t)z, 8u, 0x7f4a7c15u);
+    const int32_t riverDistance = rtrWorldRiverDistance(x, z);
+    int32_t height = 15 + (int32_t)(coarse * 15u / 255u) +
+        (int32_t)(medium * 8u / 255u) +
+        (int32_t)(detail * 4u / 255u);
+
+    if (riverDistance < 7) {
+        const int32_t riverHeight = 11 + riverDistance;
+        if (height > riverHeight) height = riverHeight;
+    }
+    return height;
+}
+
+static void rtrStampWorldTree(uint8_t *voxels,
+                              int32_t x,
+                              int32_t groundY,
+                              int32_t z,
+                              int32_t trunkHeight)
+{
+    const int32_t crownY = groundY + trunkHeight;
+
+    for (int32_t y = groundY + 1; y <= crownY; y++)
+        rtrPutCell(voxels, x, y, z, (uint8_t)RTR_CELL_WOOD);
+
+    for (int32_t dy = -2; dy <= 1; dy++) {
+        const int32_t radius = dy == 1 ? 1 : 2;
+
+        for (int32_t dz = -radius; dz <= radius; dz++) {
+            for (int32_t dx = -radius; dx <= radius; dx++) {
+                if (radius == 2 && abs(dx) == 2 && abs(dz) == 2)
+                    continue;
+                rtrPutCell(voxels,
+                           x + dx, crownY + dy, z + dz,
+                           (uint8_t)RTR_CELL_FOLIAGE);
+            }
+        }
+    }
+    rtrPutCell(voxels, x, crownY + 2, z,
+               (uint8_t)RTR_CELL_FOLIAGE);
+    rtrPutCell(voxels, x - 1, crownY + 2, z,
+               (uint8_t)RTR_CELL_FOLIAGE);
+    rtrPutCell(voxels, x + 1, crownY + 2, z,
+               (uint8_t)RTR_CELL_FOLIAGE);
+    rtrPutCell(voxels, x, crownY + 2, z - 1,
+               (uint8_t)RTR_CELL_FOLIAGE);
+    rtrPutCell(voxels, x, crownY + 2, z + 1,
+               (uint8_t)RTR_CELL_FOLIAGE);
+}
+
+static void rtrBuildWorldScene(uint8_t *voxels)
+{
+    /* Solid stepped terrain combines three deterministic value-noise scales.
+     * A fourth low-frequency field bends the exposed stone riverbed. */
+    memset(voxels, 0, RTR_SCENE_VOXEL_COUNT);
+
+    for (int32_t z = 0; z < (int32_t)RTR_SCENE_VOXEL_GRID_Z; z++) {
+        for (int32_t x = 0; x < (int32_t)RTR_SCENE_VOXEL_GRID_X; x++) {
+            const int32_t height = rtrWorldHeight(x, z);
+            const uint8_t surfaceCell = rtrWorldRiverDistance(x, z) < 5 ?
+                (uint8_t)RTR_CELL_STONE : (uint8_t)RTR_CELL_GROUND;
+
+            rtrFillBoxMaterial(voxels,
+                               x, 0, z,
+                               x, height - 4, z,
+                               (uint8_t)RTR_CELL_STONE);
+            rtrFillBoxMaterial(voxels,
+                               x, height - 3, z,
+                               x, height, z,
+                               surfaceCell);
+        }
+    }
+
+    for (int32_t baseZ = 8;
+         baseZ + 8 < (int32_t)RTR_SCENE_VOXEL_GRID_Z;
+         baseZ += 14) {
+        for (int32_t baseX = 8;
+             baseX + 8 < (int32_t)RTR_SCENE_VOXEL_GRID_X;
+             baseX += 14) {
+            const uint32_t random = rtrSceneHash(
+                (uint32_t)baseX * 73856093u ^
+                (uint32_t)baseZ * 83492791u ^ 0x2c9277b5u);
+            const int32_t x = baseX + (int32_t)(random & 7u) - 3;
+            const int32_t z = baseZ + (int32_t)((random >> 3u) & 7u) - 3;
+            const int32_t height = rtrWorldHeight(x, z);
+            int32_t minHeight = height;
+            int32_t maxHeight = height;
+
+            if (((random >> 24u) & 7u) >= 3u ||
+                rtrWorldRiverDistance(x, z) < 10)
+                continue;
+
+            for (int32_t dz = -2; dz <= 2; dz += 4) {
+                for (int32_t dx = -2; dx <= 2; dx += 4) {
+                    const int32_t neighbor = rtrWorldHeight(x + dx, z + dz);
+                    if (neighbor < minHeight) minHeight = neighbor;
+                    if (neighbor > maxHeight) maxHeight = neighbor;
+                }
+            }
+            if (maxHeight - minHeight > 2) continue;
+
+            rtrStampWorldTree(voxels,
+                              x, height, z,
+                              5 + (int32_t)((random >> 12u) & 3u));
+        }
+    }
 }
 
 static uint32_t rtrF32ToF16Word(float value)
@@ -1028,7 +1211,8 @@ void rtrSceneBuild(uint32_t *words, uint32_t sceneKind)
     uint32_t brickCount = 0u;
 
     if (sceneKind != RTR_SCENE_KIND_CASTLE &&
-        sceneKind != RTR_SCENE_KIND_CITY100K)
+        sceneKind != RTR_SCENE_KIND_CITY100K &&
+        sceneKind != RTR_SCENE_KIND_WORLD)
         sceneKind = RTR_SCENE_KIND_FOREST;
     words[RTR_SCENE_BRICK_COUNT_WORD] = 0u;
     words[RTR_SCENE_BRICK_GRID_X_WORD] = RTR_SCENE_BRICK_GRID_X;
@@ -1048,6 +1232,8 @@ void rtrSceneBuild(uint32_t *words, uint32_t sceneKind)
         rtrBuildCastleScene(voxels);
     else if (sceneKind == RTR_SCENE_KIND_CITY100K)
         rtrBuildCity100kScene(voxels);
+    else if (sceneKind == RTR_SCENE_KIND_WORLD)
+        rtrBuildWorldScene(voxels);
     else
         rtrBuildForestScene(voxels);
     brickCount = rtrStoreVoxelBricks(words, voxels);
@@ -1064,6 +1250,9 @@ uint32_t rtrSceneKindFromName(const char *scene)
     if (scene && (strcmp(scene, "city100k") == 0 ||
                   strcmp(scene, "100k") == 0))
         return RTR_SCENE_KIND_CITY100K;
+    if (scene && (strcmp(scene, "world") == 0 ||
+                  strcmp(scene, "minecraft") == 0))
+        return RTR_SCENE_KIND_WORLD;
     return RTR_SCENE_KIND_FOREST;
 }
 

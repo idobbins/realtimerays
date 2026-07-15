@@ -124,6 +124,9 @@ int rtrInitWindow(uint32_t width, uint32_t height, const char *title)
     } else if (sceneKind == RTR_SCENE_KIND_CITY100K) {
         rtrCameraPitch = RTR_CAMERA_CITY100K_DEFAULT_PITCH;
         rtrCameraRadius = RTR_CAMERA_CITY100K_DEFAULT_RADIUS;
+    } else if (sceneKind == RTR_SCENE_KIND_WORLD) {
+        rtrCameraPitch = RTR_CAMERA_WORLD_DEFAULT_PITCH;
+        rtrCameraRadius = RTR_CAMERA_WORLD_DEFAULT_RADIUS;
     } else {
         rtrCameraPitch = RTR_CAMERA_FOREST_DEFAULT_PITCH;
         rtrCameraRadius = RTR_CAMERA_FOREST_DEFAULT_RADIUS;

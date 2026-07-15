@@ -212,6 +212,8 @@ static float rtrDefaultCameraPitch(void)
         return RTR_CAMERA_CASTLE_DEFAULT_PITCH;
     if (sceneKind == RTR_SCENE_KIND_CITY100K)
         return RTR_CAMERA_CITY100K_DEFAULT_PITCH;
+    if (sceneKind == RTR_SCENE_KIND_WORLD)
+        return RTR_CAMERA_WORLD_DEFAULT_PITCH;
     return RTR_CAMERA_FOREST_DEFAULT_PITCH;
 }
 
@@ -223,6 +225,8 @@ static float rtrDefaultCameraRadius(void)
         return RTR_CAMERA_CASTLE_DEFAULT_RADIUS;
     if (sceneKind == RTR_SCENE_KIND_CITY100K)
         return RTR_CAMERA_CITY100K_DEFAULT_RADIUS;
+    if (sceneKind == RTR_SCENE_KIND_WORLD)
+        return RTR_CAMERA_WORLD_DEFAULT_RADIUS;
     return RTR_CAMERA_FOREST_DEFAULT_RADIUS;
 }
 
@@ -444,7 +448,7 @@ static int rtrCreateMemoryBuffer(void)
 
     memset(rtrMemoryWords, 0, (size_t)rtrMemorySize);
     rtrMemoryWords[RTR_MEMORY_MAGIC_WORD] = RTR_MEMORY_MAGIC;
-    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 36u;
+    rtrMemoryWords[RTR_MEMORY_VERSION_WORD] = 37u;
     rtrMemoryWords[RTR_MEMORY_WIDTH_WORD] = rtrSwapExtent.width;
     rtrMemoryWords[RTR_MEMORY_HEIGHT_WORD] = rtrSwapExtent.height;
     rtrMemoryWords[RTR_MEMORY_SPP_WORD] = rtrEnvU32("RTR_SPP", RTR_DEFAULT_SPP);

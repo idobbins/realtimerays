@@ -6,9 +6,9 @@
 #define RTR_LAYOUT_MEMORY_HEADER_WORDS 32u
 
 #define RTR_LAYOUT_BRICK_SIZE 4u
-#define RTR_LAYOUT_BRICK_GRID_X 40u
-#define RTR_LAYOUT_BRICK_GRID_Y 20u
-#define RTR_LAYOUT_BRICK_GRID_Z 40u
+#define RTR_LAYOUT_BRICK_GRID_X 48u
+#define RTR_LAYOUT_BRICK_GRID_Y 24u
+#define RTR_LAYOUT_BRICK_GRID_Z 48u
 #define RTR_LAYOUT_VOXEL_GRID_X \
     (RTR_LAYOUT_BRICK_GRID_X * RTR_LAYOUT_BRICK_SIZE)
 #define RTR_LAYOUT_VOXEL_GRID_Y \
@@ -57,6 +57,7 @@
 #define RTR_SCENE_KIND_FOREST 0u
 #define RTR_SCENE_KIND_CASTLE 1u
 #define RTR_SCENE_KIND_CITY100K 2u
+#define RTR_SCENE_KIND_WORLD 3u
 
 /* Packed GPU material IDs. CPU staging cells use these values plus one so
  * zero can continue to mean empty. */
